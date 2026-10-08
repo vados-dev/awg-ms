@@ -34,7 +34,6 @@ os_supported() {
       ;;
     centos)
       [[ -z "$OS_VER" ]] && return 0
-      pkg_mgr="dnf"
       [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 9 )) && return 0
       echo "$OS_LABEL — нужен Centos 9 или новее"
       ;;
