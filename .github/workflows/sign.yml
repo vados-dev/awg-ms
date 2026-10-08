@@ -14,7 +14,7 @@ name: Подпись awg2.sh
 
 on:
   push:
-    branches: [main]
+    branches: [centos]
     paths: [awg2.sh]
   workflow_dispatch:
 
