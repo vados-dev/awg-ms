@@ -10,7 +10,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-OUT="${1:-dist/awg2.sh}"
+#OUT="${1:-dist/awg2.sh}"
+OUT="${1:-/usr/local/bin/awg2}"
 
 LIBS=(
   core const sys net conf module params mimicry server clients expire
