@@ -583,7 +583,12 @@ os_supported() {
       [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )) && return 0
       echo "$OS_LABEL — нужен Debian 12 или новее"
       ;;
-    *) echo "$OS_LABEL — поддерживаются только Ubuntu 24.04+ и Debian 12+" ;;
+    centos)
+      [[ -z "$OS_VER" ]] && return 0
+      [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 9 )) && return 0
+      echo "$OS_LABEL — нужен Centos 9 или новее"
+      ;;
+    *) echo "$OS_LABEL — поддерживаются только Centos 9+, Ubuntu 24.04+ и Debian 12+" ;;
   esac
   return 1
 }
@@ -627,9 +632,9 @@ need_cmds() {
 # у которых точный пакет уже убран из зеркала.
 headers_candidates() {
   local k="$1" arch flavor
+  os_detect
   echo "linux-headers-$k"
   arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
-  os_detect
   if [[ "$OS_ID" == debian ]]; then
     [[ "$k" == *-cloud-* ]] && echo "linux-headers-cloud-$arch"
     echo "linux-headers-$arch"
@@ -14993,5 +14998,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=30baba07044a213e
+_BUILD_SUM=b088de7a55bb8e64
 main "$@"
