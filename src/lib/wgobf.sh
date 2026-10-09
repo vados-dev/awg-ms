@@ -207,7 +207,7 @@ _wgobf_write_keenetic() {
   {
     echo "Keenetic + AWG Manager — клиент $name"
     echo ""
-    echo "Способ 1 — вкладка «Phobos», одной вставкой."
+    echo "Способ 1 — вкладка «Phobos», одной вставкой в НИЖНЕЕ поле."
     echo "AWG Manager → Новый туннель → «Phobos» → поле «Или конфиг .conf с секцией"
     echo "[instance] / ссылка phobos://» → ссылка из phobos-link.txt (или phobos.conf)."
     echo "Поле «Ссылка установки Phobos» — пустым. Во вкладке «Обфускатор» НЕ включать"
@@ -506,7 +506,7 @@ wgobf_install_opts() {
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; port="$v" ;;
       masking) [[ "$v" =~ ^(STUN|NONE)$ ]] || { err "masking: STUN | NONE"; return 1; }; mask="$v" ;;
       clean) [[ "$v" =~ ^[01]$ ]] || { err "clean: 0 | 1"; return 1; }; clean="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; dns="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; dns="$v" ;;
       endpoint) valid_ip "$v" || { err "endpoint: IPv4"; return 1; }; ep="$v" ;;
       client) [[ -z "$v" || "$v" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { err "Имя клиента недопустимо"; return 1; }; first="$v" ;;
       *) err "Неизвестный параметр: $k"; return 1 ;;

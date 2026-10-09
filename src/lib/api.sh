@@ -74,11 +74,12 @@ _api_status() {
   os_detect
   update_check_async || true
   upstream_refresh_async || true
+  country_refresh_async || true
   server_exists && n=$(clients_tsv | grep -c . || true)
   {
     _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"
     _kv channel "$UPDATE_CHANNEL"; _kv update "$(update_available || true)"
-    _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"
+    _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"; _kv country "$(server_country)"
     _kv uptime:n "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     _kv os "$OS_LABEL"; _kv kernel "$(uname -r)"
     _kv components.installed:b "$(_b command -v awg)"
@@ -284,7 +285,7 @@ _api_client_opts() {
                 (( _O_EXPIRE > $(date +%s) + 60 )) || { err "Срок уже прошёл: $v"; return 1; }
               fi ;;
       mimicry) _O_MIM="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }
            _O_MTU="$v" ;;
       *) err "Неизвестный параметр: ${kv%%=*}"; return 1 ;;
@@ -376,7 +377,7 @@ _api_mimicry() {
 
 # ── Трафик по дням ────────────────────────────────────────
 _api_traffic() {
-  local tr name="" days=30
+  local tr wtr name="" days=30
   case "${1:-}" in
     daily)
       # Два аргумента — всегда «ИМЯ|all ДНЕЙ»: имя клиента может быть числом
@@ -389,11 +390,14 @@ _api_traffic() {
       awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
       py traffic-daily "$SERVER_CONF" "$TRAFFIC_DB" "$tr" "$name" "$days" > "$API_DATA" ;;
     now)
-      # Счётчики прямо сейчас — панель считает по ним живую скорость
+      # Счётчики прямо сейчас — панель считает по ним живую скорость:
+      # клиенты awg0 и отдельно клиенты WG + обфускатора (wgobf0)
       server_exists || { err "Сервер не создан"; return 1; }
       mktmp tr || return 1
+      mktmp wtr || return 1
       awg show "$AWG_IF" transfer > "$tr" 2>/dev/null || true
-      py traffic-now "$SERVER_CONF" "$tr" > "$API_DATA" ;;
+      if wgobf_installed; then wg show "$WGOBF_IF" transfer > "$wtr" 2>/dev/null || true; fi
+      py traffic-now "$SERVER_CONF" "$tr" "$WGOBF_WG_CONF" "$wtr" > "$API_DATA" ;;
     *) _api_usage "traffic daily [ИМЯ|all] [ДНЕЙ] | now" ;;
   esac
 }
@@ -646,7 +650,7 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs
+  local a="${1:-}" name dir f dump now pub ip hs rx tx
   shift || true
   case "$a" in
     status)
@@ -665,10 +669,13 @@ _api_wgobf() {
       while IFS= read -r name; do
         pub=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^PublicKey = / {print $3; exit}' "$WGOBF_WG_CONF")
         ip=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^AllowedIPs = / {print $3; exit}' "$WGOBF_WG_CONF")
-        hs=$(awk -v k="$pub" '$1 == k {print $5; exit}' <<< "$dump")
-        [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
-        printf '%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs"
-      done < <(wgobf_clients) | api_rows name ip ago:n ;;
+        # Рукопожатие и трафик с подъёма wgobf0 (счётчики WireGuard)
+        hs="" rx="" tx=""          # у нового клиента строки в dump нет: прошлый не тянется
+        read -r hs rx tx < <(awk -v k="$pub" '$1 == k {print $5, $6, $7; exit}' <<< "$dump") || true
+        [[ "${hs:-}" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
+        [[ "${rx:-}" =~ ^[0-9]+$ ]] || rx=0; [[ "${tx:-}" =~ ^[0-9]+$ ]] || tx=0
+        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx"
+      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -696,7 +703,7 @@ _api_wgobf() {
 
 # ── Обновление, бот, удаление ─────────────────────────────
 _api_update() {
-  local a="${1:-}" v
+  local a="${1:-}" v c
   shift || true
   case "$a" in
     status)
@@ -720,7 +727,14 @@ _api_update() {
       ok "Канал: $(update_channel_label)" ;;
     changelog)
       update_changelog_fetch || { err "Список изменений недоступен ($UPDATE_REPO)"; return 1; }
-      py changelog-json "$VERSION" <<< "$UPDATE_CHANGELOG" > "$API_DATA" ;;
+      # В CHANGELOG канала версия новее, чем помнит кэш проверки (он живёт до
+      # часа), — спросить канал сейчас: иначе «Доступна» и кнопка показали бы
+      # прошлую версию, а обновление поставило бы новую
+      v=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' <<< "$UPDATE_CHANGELOG" | cut -c4-)
+      c=$(awk '{print $1; exit}' "$UPDATE_CACHE" 2>/dev/null)
+      [[ "$c" =~ ^v?[0-9]+\.[0-9]+ ]] || c="v0.0.0"
+      if [[ -n "$v" ]] && (( 10#$(ver_num "$v") > 10#$(ver_num "$c") )); then update_peek >/dev/null || true; fi
+      py changelog-json "$VERSION" "$(update_available || true)" <<< "$UPDATE_CHANGELOG" > "$API_DATA" ;;
     *) _api_usage "update status|check|install [force]|channel stable|beta|changelog" ;;
   esac
 }
@@ -816,6 +830,42 @@ _api_web() {
   esac
 }
 
+# ── Антисканер ────────────────────────────────────────────
+_api_antiscan_lists() {  # id<TAB>подпись<TAB>включён<TAB>записей
+  local id file label min n on f
+  while IFS=$'\t' read -r id file label min; do
+    f="$ANTISCAN_DIR/lists/$id.list" n=0 on=0
+    [[ -f "$f" ]] && n=$(( $(_antiscan_parse 4 < "$f" | wc -l) + $(_antiscan_parse 6 < "$f" | wc -l) ))
+    [[ " $(_antiscan_enabled_lists) " == *" $id "* ]] && on=1
+    printf '%s\t%s\t%s\t%s\n' "$id" "$label" "$on" "$n"
+  done < <(_antiscan_lists)
+}
+
+_api_antiscan() {
+  local a="${1:-status}" e on=0
+  shift || true
+  case "$a" in
+    status)
+      read -r -a e <<< "$(_antiscan_get ENTRIES)"
+      antiscan_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b antiscan_rules_ok || echo 0)"
+        _kv v4:n "${e[0]:-0}"; _kv v6:n "${e[1]:-0}"
+        _kv updated:n "$(_antiscan_get UPDATED)"; _kv error "$(_antiscan_get ERROR)"
+        _kv dropped:n "$( (( on )) && antiscan_dropped || echo 0)"
+        _kv lists:j "$(_api_antiscan_lists | py json-rows id name on:b entries:n)"
+        _kv top:j "$( (( on )) && antiscan_top 5 | py json-rows packets:n net org || echo '[]')"
+        _kv allow:j "$(_antiscan_allow_rows | py json-list)"
+        _kv ssh:j "$(_antiscan_ssh_peers | py json-list)"
+      } | api_obj ;;
+    on) antiscan_enable ;;
+    off) antiscan_disable ;;
+    update) antiscan_update ;;
+    lists) antiscan_lists_set "$@" ;;
+    allow) antiscan_allow "$@" ;;
+    *) _api_usage "antiscan status|on|off|update|lists scan,skipa,gov|allow add|del АДРЕС" ;;
+  esac
+}
+
 _api_uninstall() {
   local o
   for o in "$@"; do [[ "$o" =~ ^(bot|wgobf|web|self)$ ]] || { _api_usage "uninstall [bot] [wgobf] [web] [self]"; return; }; done
@@ -836,7 +886,8 @@ _api_log() {
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web [строк]"; return ;;
+    antiscan) file="$ANTISCAN_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -912,18 +963,23 @@ _api_job() {
 # Команды только для чтения идут мимо очереди: сводка не должна ждать,
 # пока задача собирает модуль.
 _api_readonly() {
-  case "$*" in
-    # Пишущие подкоманды «читающих» разделов — в очередь: bot webapp port и
-    # bot proxy set правят один /etc/awg-bot.conf, параллельно потеряли бы ключ.
-    "bot proxy set"*|"bot proxy clear"*|"bot webapp port"*|"server params set"*) return 1 ;;
-    "server params"|"server params check"*) return 0 ;;
+  local a="${1:-}" b="${2:-}" c="${3:-}"
+  # Разделы, где всё — чтение (задача job start сама идёт через замок, когда запустится)
+  case "$a" in status|version|help|mimicry|log|job|diag) return 0 ;; esac
+  # Дальше — точные команды по словам, а не маски по строке: лишнее слово в
+  # конце или слово с пробелом внутри («allow add X info») чтением не станут.
+  # Пишущие подкоманды «читающих» разделов (bot proxy set, bot webapp port,
+  # server params set — правят общие файлы) сюда не попадают — в очередь.
+  [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
+  case "$a $b $c" in
+    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get") return 0 ;;
   esac
-  case "$1 ${2:-}" in
-    "status "|"version "|"help "|"mimicry "|"log "*|"job "*|"diag "*) return 0 ;;
-    *" status"|*" info"|*" report"|*" tags"|*" backups"|*" list"|*" conf"|*" inspect") return 0 ;;
-    "clients "|"tunnels "|"tunnels clients"|"xray diag"|"cascade diag"|"wgobf clients"|\
-    "bot proxy"|"bot webapp"|"update check"|"update changelog"|"module check"|"cert "|"cert find"|\
-    "traffic daily"|"traffic now") return 0 ;;
+  case "$a $b" in
+    "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
+    "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
+    "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
+    "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status") return 0 ;;
   esac
   return 1
 }
@@ -967,12 +1023,13 @@ api_dispatch() {
     bot) _api_bot "$@" ;;
     cert) _api_cert "$@" ;;
     web) _api_web "$@" ;;
+    antiscan) _api_antiscan "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -1015,6 +1072,7 @@ api_main() {
   else
     helpers_refresh || true
     expire_watchdog || true
+    antiscan_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else

@@ -30,7 +30,7 @@ from .sections import wgobf
 # Команды awg2 api, открытые панели; первое слово — раздел
 ALLOWED = {"status", "version", "server", "module", "clients", "client", "mimicry", "diag", "backup",
            "tunnels", "warp", "xray", "t2s", "exits", "cascade", "dns", "wgobf", "update", "log", "bot",
-           "cert", "uninstall", "traffic"}
+           "cert", "uninstall", "traffic", "antiscan"}
 # backup create auto — ротация автобэкапов: «auto 1» стёр бы все, кроме одного;
 # log web — журнал входов веб-панели (адреса, введённые логины), как раздел «Веб-панель» в боте
 OWNER_ONLY = (("uninstall",), ("bot", "uninstall"), ("bot", "webapp", "port"), ("cert", "issue"),
@@ -149,7 +149,14 @@ def setup(app: web.Application, user_of: UserOf) -> None:
             timeout = 120.0
         timeout = min(timeout, TIMEOUT_MAX)
         stdin = body.get("stdin")
-        return _result(await api.call(*args, stdin=stdin if isinstance(stdin, str) else None, timeout=timeout))
+        # Адрес того, кто включает антисканер: если он внутри списков, awg2
+        # сохранит его в исключения. Только адрес соединения — заголовок
+        # X-Forwarded-For подделает кто угодно. Только включение и обновление
+        # списков: при «allow del» свой адрес иначе тут же вернулся бы обратно.
+        env = ({"AWG_CLIENT_IP": request.remote}
+               if tuple(args[:2]) in (("antiscan", "on"), ("antiscan", "update"), ("antiscan", "lists")) and request.remote
+               else None)
+        return _result(await api.call(*args, stdin=stdin if isinstance(stdin, str) else None, timeout=timeout, env=env))
 
     @route("/api/job")
     async def _job(request: web.Request, user: dict, body: dict) -> web.Response:
@@ -368,7 +375,13 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         png = media.qr_png(direct) if direct else None
         return web.json_response({"ok": True, "link": (r.data.get("phobos") or "").strip(),
                                   "conf": _read(files.get("phobos.conf", "")), "direct": direct,
-                                  "png": base64.b64encode(png).decode() if png else None})
+                                  "png": base64.b64encode(png).decode() if png else None,
+                                  "mon": store.monitored(store.WGOBF + body["name"])})
+
+    @route("/api/wgobf/mon")
+    async def _wgobf_mon(request: web.Request, user: dict, body: dict) -> web.Response:
+        store.set_monitored(store.WGOBF + _name(body), bool(body.get("on")))
+        return web.json_response({"ok": True})
 
     # ── Бот: админы, оформление, сервер панели ──
     @route("/api/bot/info")

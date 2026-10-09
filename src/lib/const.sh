@@ -28,6 +28,7 @@ MOD_LOG="/var/log/awg-mod-update.log"
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
+COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
@@ -186,8 +187,22 @@ CERT_SERVICE="awg2-cert.service"
 CERT_TIMER="awg2-cert.timer"
 CERT_TAG="awg2-cert"
 
+# ── Антисканер (сети сканеров РКН и госорганов — DROP новых входящих) ──
+ANTISCAN_DIR="$STATE_DIR/antiscan"          # списки, исключения, состояние
+ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf" # ON, LISTS, UPDATED, ERROR, ENTRIES, ADDRS
+ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"        # исключения: адрес или подсеть в строке
+ANTISCAN_SCRIPT="/usr/local/bin/awg2-antiscan"
+ANTISCAN_LOG="/var/log/awg2-antiscan.log"
+ANTISCAN_SET="awg2-antiscan" ANTISCAN_SET6="awg2-antiscan6" ANTISCAN_TAG="awg2-antiscan"
+ANTISCAN_UNIT="awg2-antiscan.service" ANTISCAN_TIMER="awg2-antiscan-update.timer"
+ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public"
+# Предел охвата одного списка. Настоящие: ~310 тыс. адресов IPv4 (самая широкая
+# запись /19) и ~20 сетей /32 IPv6. Подменённый источник с тысячами /12 прошёл бы
+# проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
+ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
+
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
-OWN_IFACES=" awg31ms warp0 xray0 tun0 wgcf wgobf0 "
+OWN_IFACES=" awg31ms awg3vds warp0 xray0 tun0 wgcf wgobf0 "
 # GitHub в части сетей режут — релизы качаются и через зеркала.
 GH_MIRRORS=("" "https://ghproxy.net/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/")

@@ -62,7 +62,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "awg_bot"))
 
 from awgbot import admins, api as botapi, bot as botmod, jobs, store, ui, webapp  # noqa: E402
 
-USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:")
+USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:")
 
 logging.getLogger("aiogram").setLevel(logging.WARNING)
 
@@ -383,6 +383,30 @@ async def run():
     sent = await press("cl:be:none")
     chk("имена через запятую — все созданы", "Создано клиентов: 3" in screen(sent)[0]
         and "Конфиги: 3" in (docs(sent)[0].caption if docs(sent) else ""), [n for n, _ in sent])
+    await press("cl:bnames")
+    await say("alice zed1\nzed2")
+    text, _ = screen(await press("cl:be:none"))
+    chk("имена через пробел и с новой строки — отдельные; занятое названо, итог «N из M»",
+        "Создано клиентов: 2 из 3" in text and "zed1, zed2" in text and "Имя уже занято: alice" in text, text)
+    real_call_b = botapi.call
+
+    async def subnet_full(*args, **kw):
+        if args[:2] == ("clients", "bulk"):
+            line = "━" * 20
+            return botapi.Result(True, data=["q-001", "q-002"],
+                                 log=f"  √ q-001 → 10.23.45.40\n  √ q-002 → 10.23.45.41\n  ▲ Подсеть заполнена — стоп\n"
+                                     f"{line}\n  Создано клиентов: 2 из 5\n{line}\n")
+        return await real_call_b(*args, **kw)
+    await press("cl:bpre")
+    await say("q")
+    await press("cl:bn:5")
+    botapi.call = subnet_full
+    try:
+        text, _ = screen(await press("cl:be:none"))
+    finally:
+        botapi.call = real_call_b
+    chk("подсеть заполнена: «2 из 5» и предупреждение awg2 в итоге",
+        "Создано клиентов: 2 из 5" in text and "▲ Подсеть заполнена — стоп" in text, text)
     await press("cl:bpre")
     await say("p")
     await press("cl:bn:ask")
@@ -405,6 +429,62 @@ async def run():
         and not os.path.exists(os.path.join(ROOT, "root", "e1_awg2.conf"))
         and not os.path.exists(os.path.join(ROOT, "root", "e2_awg2.conf")), text)
     no_hourglass("удаление нескольких")
+    await press("cl:dsel")
+    _, buttons = screen(await press("cl:dsp:1"))
+    mark_all = next((d for t, d in buttons if t == "☑️ Отметить всех"), "")
+    _, buttons = screen(await press(mark_all))
+    on_page2 = any(d.startswith("cl:ds:1|") for _, d in buttons) and ("◀️ Стр. 1", "cl:dsp:0") in buttons
+    clear = next((d for t, d in buttons if t == "⬜️ Снять все"), "")
+    _, buttons = screen(await press(clear))
+    chk("«Отметить всех» и «Снять все» оставляют открытую страницу",
+        on_page2 and any(d.startswith("cl:ds:1|") for _, d in buttons), [mark_all, clear, buttons[:3]])
+
+    # п.2: «Назад» с уровня мимикрии — к выбору профиля, а не в список клиентов
+    _, buttons = screen(await press("cl:mim:alice"))
+    lvl = next(d for _, d in buttons if d.startswith("cl:lvl:ms|"))
+    _, buttons = screen(await press(lvl))
+    chk("уровень мимикрии клиента: «Назад» — к его мимикрии", ("◀️ Назад", "cl:mim:alice") in buttons, buttons)
+    await press("cl:add")
+    await say("lvlback")
+    _, buttons = screen(await press("cl:ne:none"))
+    lvl = next(d for _, d in buttons if d.startswith("cl:lvl:nm|"))
+    _, buttons = screen(await press(lvl))
+    back_to = next((d for t, d in buttons if t == "◀️ Назад"), "")
+    text, buttons = screen(await press(back_to))
+    chk("уровень мимикрии нового клиента: «Назад» — к выбору профиля мастера",
+        back_to != "cl" and "lvlback" in text and "cl:nm:none" in [d for _, d in buttons], [back_to, text[:80]])
+    await press("cl")
+
+    # п.8: неверный формат и прошедшая дата — разные ответы, пример — через месяц
+    await press("cl:ex:alice|date")
+    text, _ = screen(await say("послезавтра"))
+    example = time.strftime("%Y-%m-%d", time.localtime(time.time() + 30 * 86400))
+    chk("дата не по формату — формат, пример через месяц и время сервера",
+        "ГГГГ-ММ-ДД ЧЧ:ММ" in text and example in text and "время сервера" in text and "прошла" not in text, text)
+    text, _ = screen(await say("2020-01-01 10:00"))
+    chk("прошедшая дата — «уже прошла», а не «нужен формат»", "уже прошла" in text and "Формат" not in text, text)
+    await press("cl:v:alice")
+
+    # п.4: «Трафик» при сотнях клиентов — по страницам, никто не теряется
+    real_call_a = botapi.call
+    many = [{"name": f"m{i:03d}", "ip": f"10.23.{i // 250}.{i % 250 + 2}", "rx": 1, "tx": 1} for i in range(253)]
+
+    async def many_clients(*args, **kw):
+        if args[:2] == ("clients", "list"):
+            return botapi.Result(True, data=many)
+        return await real_call_a(*args, **kw)
+    botapi.call = many_clients
+    try:
+        seen_names, data, pages = set(), "cl:activity", 0
+        while data and pages < 50:
+            text, buttons = screen(await press(data))
+            seen_names |= set(re.findall(r"<b>(m\d{3})</b>", text))
+            data = next((d for t, d in buttons if t.endswith("▶️")), "")
+            pages += 1
+    finally:
+        botapi.call = real_call_a
+    chk("«Трафик» при 253 клиентах — страницами, видны все", len(seen_names) == 253 and pages > 1,
+        (len(seen_names), pages))
     text, buttons = screen(await press("tc::warp"))
     datas = [d for _, d in buttons]
     chk("длинный список клиентов туннеля — по страницам", "tc:pg:warp|1" in datas and len(buttons) <= 25, len(buttons))
@@ -511,6 +591,22 @@ async def run():
     chk("мастер каскада добавляет правило", "✅" in text, text)
     text, _ = screen(await press("cas"))
     chk("правило в списке", "UDP 5555 → 5.6.7.8:5555" in text, text)
+    _, buttons = screen(await press("cas:del"))
+    rule = next(d for t, d in buttons if t == "UDP 5555")
+    text, buttons = screen(await press(rule))
+    still = screen(await press("cas"))[0]
+    chk("удаление правила каскада переспрашивает", "Удалить правило" in text
+        and ("🗑 Удалить", "cas:delok:udp|5555") in buttons and ("✖️ Отмена", "cas:del") in buttons
+        and "UDP 5555 → 5.6.7.8:5555" in still, [text, buttons, still[-80:]])
+    _, buttons = screen(await press("t2s"))
+    log_btn = next(d for t, d in buttons if t == "📜 Журнал")
+    text, buttons = screen(await press(log_btn))
+    chk("журнал из раздела: «Назад» — туда же, «Обновить» помнит откуда",
+        "tun2socks" in text and ("◀️ Назад", "t2s") in buttons and ("🔄 Обновить", log_btn) in buttons,
+        [log_btn, buttons])
+    _, buttons = screen(await press("diag:log:manager"))
+    chk("журнал из «Журналов» (и старые кнопки без «куда») — «Назад» в «Журналы»",
+        ("◀️ Назад", "diag:logs") in buttons, buttons)
     no_hourglass("мастер каскада")
 
     print("Маршрут клиента")
@@ -543,6 +639,11 @@ async def run():
     chk("exit-ноды → клиенты: у alice нода, у bob общий выход",
         any(t == "alice → n1" for t, _ in buttons) and any(t == "bob → общий" for t, _ in buttons),
         [t for t, _ in buttons][:4])
+    _, buttons = screen(await press("ex:del"))
+    node = next(d for t, d in buttons if t.endswith(" n1"))
+    text, buttons = screen(await press(node))
+    chk("удаление exit-ноды переспрашивает", "n1" in text and ("🗑 Удалить", "ex:delok:n1") in buttons
+        and os.path.exists(os.path.join(awg_dir, "awg-exit-n1.conf")), [text, buttons])
 
     print("Xray: свой выход клиенту")
     with open(LINKS) as f:
@@ -578,6 +679,13 @@ async def run():
     with open(os.path.join(ROOT, "xray.peers")) as f:
         peers = f.read().split()
     chk("обратно на выход по умолчанию", "🔘 По умолчанию" in [t for t, _ in buttons] and "10.23.45.2" in peers, peers)
+    _, buttons = screen(await press("xr:del"))
+    out = next(d for t, d in buttons if t == "nl")
+    text, buttons = screen(await press(out))
+    with open(os.path.join(ROOT, "etc/xray/config.json")) as f:
+        tags_now = [o.get("tag") for o in json.load(f)["outbounds"]]
+    chk("удаление выхода Xray переспрашивает", "nl" in text and any(d.startswith("xr:delok:") for _, d in buttons)
+        and ("✖️ Отмена", "xr:del") in buttons and "nl" in tags_now, [text, buttons, tags_now])
     with open(LINKS, "w") as f:
         f.write(links_saved)
     with open(ACTIVE, "w") as f:
@@ -747,9 +855,9 @@ async def run():
         and {"upd:go", "upd:notes", "mod:rebuild", "app"} <= set(btns), [sent, btns])
     upd_text = next(t for t in sent if "v1.2.1" in t)
     chk("о новой версии — одна строка для шторки: Тулза, канал, версия",
-        upd_text == "🚀 AWG Toolza бета обновилась: <b>v1.2.1</b>", upd_text)
+        upd_text == "🚀 AWG Toolza бета: есть обновление <b>v1.2.1</b>", upd_text)
     text = al.update_text({"version": "v1.2.0", "channel": "stable"}, "v1.2.5")
-    chk("стабильный канал — без «бета»", text == "🚀 AWG Toolza обновилась: <b>v1.2.5</b>", text)
+    chk("стабильный канал — без «бета»", text == "🚀 AWG Toolza: есть обновление <b>v1.2.5</b>", text)
     CL["sections"] = [{"version": "v1.2.1", "title": "2026-10-08",
                        "body": "**Быстрее панель, понятнее бот.**\n\n### Панель\n\n- Переходы — `сразу`."}]
     real_call_n = al.api.call
@@ -1017,6 +1125,56 @@ async def run():
     chk("архив для Linux — отдельной кнопкой", docs(sent) and docs(sent)[0].document.filename == "wgobf-clus.zip",
         [n for n, _ in sent])
 
+    # Трафик и мониторинг клиента обфускатора: dump wgobf0 — рукопожатие минуту назад
+    import time as _t
+    from awgbot import monitor as _mon
+
+    def wg_dump(ago):
+        with open(WG_DUMP, "w") as f:
+            f.write(f"SRVPRIV=\tSRVPUB=\t45888\toff\nCPUB=\tPSK=\t127.0.0.1:40000\t10.77.1.2/32\t"
+                    f"{int(_t.time()) - ago}\t1048576\t2097152\t25\n")
+    wg_dump(60)
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка клиента обфускатора: трафик с запуска и мониторинг выключен",
+        "↓ 1.0 МБ · ↑ 2.0 МБ" in text and "🔕 выкл" in text and ("🔔 Мониторинг", "wo:mon:clus") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:mon:clus"))
+    chk("мониторинг включается кнопкой — своя метка, не заметка AWG-клиента с тем же именем",
+        "🔔 вкл" in text and store.monitored("wgobf:clus") and not store.monitored("clus"), [text, store.notes()])
+    st = {}
+    await _mon.tick(BOT, st, True)
+    chk("клиент в сети — молчит, метка не стёрта чисткой AWG-заметок",
+        "wgobf:clus" not in st and store.monitored("wgobf:clus"), [st, store.notes()])
+    wg_dump(900)
+    mark = len(SESSION.sent)
+    await _mon.tick(BOT, st, True)
+    off = [m.text or "" for n, m in SESSION.sent[mark:] if n == "SendMessage"]
+    chk("пропал больше 5 минут — «офлайн» с пометкой обфускатора", any("офлайн" in t and "clus · WG + обфускатор" in t
+                                                                        for t in off) and "wgobf:clus" in st, [off, st])
+    wg_dump(5)
+    mark = len(SESSION.sent)
+    await _mon.tick(BOT, st, True)
+    back = [m.text or "" for n, m in SESSION.sent[mark:] if n == "SendMessage"]
+    chk("вернулся — «снова онлайн»", any("снова онлайн" in t and "clus" in t for t in back) and "wgobf:clus" not in st,
+        [back, st])
+    # awg2 не ответил по обфускатору: состояние офлайн-клиента остаётся, второго 🔴 после ответа нет
+    wg_dump(900)
+    await _mon.tick(BOT, st, True)
+    real_data = _mon.api.data
+
+    async def no_wgobf(*a, **kw):
+        return None if a[:2] == ("wgobf", "clients") else await real_data(*a, **kw)
+    _mon.api.data = no_wgobf
+    try:
+        await _mon.tick(BOT, st, True)
+    finally:
+        _mon.api.data = real_data
+    mark = len(SESSION.sent)
+    await _mon.tick(BOT, st, True)
+    again = [m.text or "" for n, m in SESSION.sent[mark:] if n == "SendMessage" and "офлайн" in (m.text or "")]
+    chk("нет ответа по обфускатору — офлайн-клиент не даёт второго «офлайн»", not again and "wgobf:clus" in st,
+        [again, st])
+    os.remove(WG_DUMP)
+
     text, buttons = screen(await press("wo:install"))
     chk("установка обфускатора: DNS по умолчанию Cloudflare", "DNS клиентов: Cloudflare" in text, text)
     text, buttons = screen(await press("wo:iopt:dns"))
@@ -1132,6 +1290,25 @@ async def run():
         chk("панель: команды вне белого списка — 403", st == 403, [st, body])
         st, body = await api_("/api/call", {"args": "status"})
         chk("панель: кривые аргументы — 400", st == 400, [st, body])
+        # Антисканер из панели: адрес соединения — в awg2 (AWG_CLIENT_IP), чтобы тот,
+        # кто включает, не отрезал себя; подставной X-Forwarded-For не в счёт
+        seen_env, real_call_e = [], botapi.call
+
+        async def env_call(*args, **kw):
+            seen_env.append((args, kw.get("env")))
+            return botapi.Result(True)
+        botapi.call = env_call
+        try:
+            for args in (["antiscan", "on"], ["antiscan", "allow", "del", "127.0.0.1"], ["status"]):
+                async with http.post(base + "/api/call", json={"args": args},
+                                     headers={"Authorization": "tma " + init_data(111), "X-Forwarded-For": "77.0.6.6"}) as r:
+                    await r.read()
+        finally:
+            botapi.call = real_call_e
+        chk("панель: включение антисканера получает адрес клиента панели (не X-Forwarded-For); "
+            "удаление исключения и другие команды — нет (свой адрес иначе вернулся бы в исключения)",
+            seen_env == [(("antiscan", "on"), {"AWG_CLIENT_IP": "127.0.0.1"}),
+                         (("antiscan", "allow", "del", "127.0.0.1"), None), (("status",), None)], seen_env)
         admins.add(333, 111)
         st, body = await api_("/api/call", {"args": ["uninstall"]}, uid=333)
         chk("приглашённому админу владельческое закрыто", st == 403 and "владелец" in body.get("error", ""), [st, body])
@@ -1388,7 +1565,7 @@ async def run():
     chk("«Сохранил» — тот же экран без пароля: адрес, логин, кнопка «Открыть»",
         SESSION.screen_id() == pw_msg and PW not in SESSION.text.get(pw_msg, "") and URL in text
         and ("🌐 Открыть", URL) in buttons and ("🔑 Новый пароль", "web:pw") in buttons
-        and ("📜 Журнал входов", "diag:log:web") in buttons, [text, buttons])
+        and ("📜 Журнал входов", "diag:log:web|web") in buttons, [text, buttons])
     text, buttons = screen(await press("web:pw"))
     chk("новый пароль — с подтверждением", "Прежний перестанет подходить" in text
         and ("🔑 Новый пароль", "web:pwok") in buttons and web_calls[-1] == "status", [text, buttons])
@@ -1398,6 +1575,76 @@ async def run():
     chk("остановка: статус и кнопка «Запустить», ссылки «Открыть» нет",
         "Остановлена" in text and ("▶️ Запустить", "web:start") in buttons
         and not any(d == URL for _, d in buttons), [text, buttons])
+    botapi.call = real_call_
+
+    print("Антисканер")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка «🛡 Антисканер»", ("🛡 Антисканер", "as") in buttons, buttons)
+    ASST = {"enabled": True, "active": True, "v4": 3100, "v6": 29, "updated": 1791500000, "error": "",
+            "dropped": 1234, "lists": [{"id": "scan", "name": "Сканеры", "on": True, "entries": 165},
+                                       {"id": "skipa", "name": "СКИПА — сканеры РКН", "on": True, "entries": 145},
+                                       {"id": "gov", "name": "Сети госорганов", "on": True, "entries": 2818}],
+            "top": [{"packets": 30, "net": "77.0.3.0/24", "org": "Org <MVD>"}],
+            "allow": ["77.0.7.7", "2a0c:a9c7:157::/48"], "ssh": ["77.0.7.7"]}
+    as_calls = []
+
+    async def as_call(*args, **kw):
+        if args[:1] != ("antiscan",):
+            return await real_call_(*args, **kw)
+        as_calls.append((args[1:], kw.get("timeout")))
+        if args[1] == "status":
+            return botapi.Result(True, data=json.loads(json.dumps(ASST)))
+        if args[1] == "on":
+            ASST["enabled"] = True
+        if args[1] == "off":
+            ASST["enabled"] = False
+        return botapi.Result(True)
+    botapi.call = as_call
+    text, buttons = screen(await press("as"))
+    chk("экран: включён, подсетей и отбито, кто стучался (организация экранирована), списки и исключения",
+        "🟢 Включён · подсетей 3 129" in text and "Отбито: 1 234" in text and "<code>77.0.3.0/24</code>" in text
+        and "Org &lt;MVD&gt;" in text and "✅ Сети госорганов — 2 818" in text and "Исключения: 2" in text
+        and "твой SSH не блокируется" in text, text)
+    chk("счётчик «Отбито» — с установки правила (обновление списков его не сбрасывает), а не «с последнего применения»",
+        "с установки правила" in text and "с последнего применения" not in text, text)
+    chk("кнопки: выключить, обновить, списки переключателями, исключения, журнал, назад в «Сервер»",
+        ("⏹ Выключить", "as:off") in buttons and ("🔄 Обновить списки", "as:upd") in buttons
+        and ("✅ Сети госорганов", "as:l:gov") in buttons and ("📝 Исключения", "as:al") in buttons
+        and ("📜 Журнал", "diag:log:antiscan|as") in buttons and ("◀️ Назад", "srv") in buttons, buttons)
+    await press("as:l:gov")
+    chk("снять список: остальные уходят в awg2, ждёт скачивания", (("lists", "scan,skipa"), 300) in as_calls,
+        as_calls[-3:])
+    ASST["lists"] = [dict(x, on=x["id"] == "gov") for x in ASST["lists"]]
+    n = len(as_calls)
+    sent = await press("as:l:gov")
+    chk("последний список не снимается", "хотя бы один" in " ".join(alerts(sent))
+        and not any(c[0][0] == "lists" for c in as_calls[n:]), [alerts(sent), as_calls[n:]])
+    text, buttons = screen(await press("as:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "as:offok") in buttons, buttons)
+    text, buttons = screen(await press("as:offok"))
+    chk("выключен: «Включить», без «Обновить списки»", "⚪️ Выключен" in text and ("✅ Включить", "as:on") in buttons
+        and not any(d == "as:upd" for _, d in buttons), [text, buttons])
+    n = len(as_calls)
+    text, buttons = screen(await press("as:on"))
+    chk("включение — с подтверждением и предупреждением (клиенты VPN и сам админ из сетей списков не войдут)",
+        ("✅ Включить", "as:onok") in buttons and ("✖️ Отмена", "as") in buttons and "клиенты VPN" in text
+        and "ты сам" in text and not any(c[0][0] == "on" for c in as_calls[n:]), [text, buttons, as_calls[n:]])
+    text, _ = screen(await press("as:onok"))
+    chk("включение: долгий вызов (списки качаются) и снова экран", as_calls[-2] == (("on",), 300)
+        and "✅ Включён" in text, [as_calls[-3:], text])
+    text, buttons = screen(await press("as:al"))
+    chk("исключения: список и кнопки «убрать» — и для IPv6 с двоеточиями",
+        "<code>2a0c:a9c7:157::/48</code>" in text and ("❌ 2a0c:a9c7:157::/48", "as:ad:2a0c:a9c7:157::/48") in buttons
+        and ("➕ Добавить", "as:aa") in buttons, [text, buttons])
+    await press("as:ad:2a0c:a9c7:157::/48")
+    chk("убрать IPv6-исключение — адрес целиком", (("allow", "del", "2a0c:a9c7:157::/48"), None) in as_calls, as_calls[-3:])
+    await press("as:aa")
+    sent = await say("abc")
+    chk("исключение: не адрес — переспрашивает", "⚠️" in screen(sent)[0] and not any(c[0][:2] == ("allow", "add")
+                                                                                   for c in as_calls), screen(sent))
+    await say("1.2.3.0/24")
+    chk("исключение: подсеть уходит в awg2", (("allow", "add", "1.2.3.0/24"), None) in as_calls, as_calls[-3:])
+    no_hourglass("антисканер")
     botapi.call = real_call_
 
     print("Ширина экрана")
