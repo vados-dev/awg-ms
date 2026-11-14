@@ -1,8 +1,0 @@
-# aiogram 3.31 — Bot API 10.3: events_isolation у Dispatcher, outer_middleware,
-# ErrorEvent и типовые исключения aiogram.exceptions. 4.x будет с ломающими
-# изменениями — отсюда верхняя граница.
-aiogram>=3.31,<4
-qrcode[pil]>=7.4
-# Нужен, когда BOT_PROXY указывает на socks5/socks4: без него aiogram не
-# умеет socks-схемы. Для http-прокси хватает самого aiohttp.
-aiohttp-socks>=0.9
