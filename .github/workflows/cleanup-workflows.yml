@@ -22,7 +22,7 @@ on:
 
 jobs:
   cleanup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Delete workflow runs
         env:
@@ -112,7 +112,6 @@ jobs:
           rm -f "${delete_file}"
 
           echo "Seen workflow runs: ${seen}"
-
           echo "Skipped workflow runs: ${skipped}"
           echo "Kept workflow runs: ${kept}"
           echo "Deleted workflow runs: ${deleted}"
