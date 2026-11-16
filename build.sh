@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Собирает awg2 из src/ в один файл, который ставится одной командой curl.
 #
 #   ./build.sh              → dist/awg2.sh
