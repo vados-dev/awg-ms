@@ -8,18 +8,19 @@ INSTALL_LOG="/var/log/awg2-install.log"
 
 # ── AmneziaWG ─────────────────────────────────────────────
 AWG_DIR="/etc/amnezia/amneziawg"
-SERVER_CONF="$AWG_DIR/awg0.conf"
-AWG_IF="awg0"
-CLIENT_DIR="/root"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
-AUTOSTART_DROPIN="/etc/systemd/system/awg-quick@awg0.service.d"
+AWG_IF="${AWG_IFACE:-awg31}"
+SERVER_CONF="$AWG_DIR/${AWG_IF}.conf"
+AWG_CONF_DIR="/etc/VPN/${AWG_IF}"
+CLIENT_DIR="${AWG_CONF_DIR}/clients"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
+AUTOSTART_DROPIN="/etc/systemd/system/awg31-quick@${AWG_IF}.service.d"
 MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
 SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
 
 # Компоненты собираются из исходников апстрима через git + DKMS.
-MOD_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
+MOD_REPO="https://github.com/vados-dev/amneziawg-linux-kernel-module-vds.git"
 TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
 MOD_NAME="amneziawg"
-MOD_DKMS_VER="1.0.0"               # апстрим держит 1.0.0 во всех тегах
+MOD_DKMS_VER="v3.1.20260906-vds"               # апстрим держит 1.0.0 во всех тегах
 MOD_SRC_DIR="/usr/src/${MOD_NAME}-${MOD_DKMS_VER}"
 MOD_TAG_FILE="$STATE_DIR/module_tag"
 TOOLS_TAG_FILE="$STATE_DIR/tools_tag"
@@ -28,11 +29,12 @@ MOD_LOG="/var/log/awg-mod-update.log"
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
+COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
-UPDATE_REPO_STABLE="pumbaX/awg-multi-script"
-UPDATE_REPO_BETA="genaRijoff/awg-multi-script"
+UPDATE_REPO_STABLE="vados-dev/awg-ms"
+UPDATE_REPO_BETA="vados-dev/awg-ms"
 UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
 # Проверка версии в канале (4 КБ файла): бета выходит по нескольку раз в день —
 # раз в 6 часов уведомление бота о новой версии запаздывало на полдня
@@ -68,9 +70,9 @@ EXITS_TABLE=202
 EXITS_TABLE_BASE=210
 EXITS_TABLE_MAX=249
 
-WARP_IF="warp0"
+WARP_IF="${WARP_IFACE:-warp0}"
 WARP_DIR="/etc/wgcf"
-WARP_CONF="/etc/wireguard/warp0.conf"
+WARP_CONF="/etc/wireguard/${WARP_IF}.conf"
 WARP_ACCOUNT="$WARP_DIR/wgcf-account.toml"
 WARP_PROFILE="$WARP_DIR/wgcf-profile.conf"
 WARP_STATE="$WARP_DIR/state"
@@ -163,7 +165,7 @@ WGOBF_TAG="awg-wgobf"
 WGOBF_MTU=1380
 
 # ── Telegram-бот ──────────────────────────────────────────
-BOT_CONF="/etc/awg-bot.conf"
+BOT_CONF="/etc/VPN/configs/${AWG_IF}/awg-bot.conf"
 BOT_ADMINS="/var/lib/awg-bot/admins.json"   # приглашённые админы (ведёт бот)
 BOT_DIR="/opt/awg-bot"
 BOT_UNIT="awg-bot.service"
@@ -186,9 +188,22 @@ CERT_SERVICE="awg2-cert.service"
 CERT_TIMER="awg2-cert.timer"
 CERT_TAG="awg2-cert"
 
+# ── Антисканер (сети сканеров РКН и госорганов — DROP новых входящих) ──
+ANTISCAN_DIR="$STATE_DIR/antiscan"          # списки, исключения, состояние
+ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf" # ON, LISTS, UPDATED, ERROR, ENTRIES, ADDRS
+ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"        # исключения: адрес или подсеть в строке
+ANTISCAN_SCRIPT="/usr/local/bin/awg2-antiscan"
+ANTISCAN_LOG="/var/log/awg2-antiscan.log"
+ANTISCAN_SET="awg2-antiscan" ANTISCAN_SET6="awg2-antiscan6" ANTISCAN_TAG="awg2-antiscan"
+ANTISCAN_UNIT="awg2-antiscan.service" ANTISCAN_TIMER="awg2-antiscan-update.timer"
+ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public"
+# Предел охвата одного списка. Настоящие: ~310 тыс. адресов IPv4 (самая широкая
+# запись /19) и ~20 сетей /32 IPv6. Подменённый источник с тысячами /12 прошёл бы
+# проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
+ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
+
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
-OWN_IFACES=" awg0 warp0 xray0 tun0 wgcf wgobf0 "
+OWN_IFACES=" ${AWG_IF} awg3vds ${WARP_IF} xray0 tun0 wgcf wgobf0 "
 # GitHub в части сетей режут — релизы качаются и через зеркала.
 GH_MIRRORS=("" "https://ghproxy.net/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/")
-
