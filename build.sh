@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # Собирает awg2 из src/ в один файл, который ставится одной командой curl.
 #
 #   ./build.sh              → dist/awg2.sh
@@ -15,9 +14,9 @@ OUT="${1:-dist/awg2.sh}"
 #OUT="${1:-/usr/local/bin/awg2}"
 
 LIBS=(
-  core const sys net conf module params mimicry server clients expire
+  core const sys net conf module params mimicry server clients entry expire speed
   tunnels warp dns cascade xray tun2socks exits wgobf cert
-  backup update bot web antiscan uninstall diag menu api cli
+  backup amnezia update bot web antiscan vkblock rudirect tunfail uninstall diag menu api cli
 )
 
 die() { echo "build: $*" >&2; exit 1; }
