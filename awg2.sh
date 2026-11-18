@@ -414,11 +414,11 @@ UPDATE_CHECK_TTL=3600 UPDATE_CHECK_TTL_BETA=1200
 # GitHub Actions). Ключ релизов вшит сюда — подменить сборку на зеркале
 # или по пути без закрытого ключа нельзя. Сборки старше UPDATE_SIG_SINCE
 # выходили без подписи.
-UPDATE_SIG_NS="awg-toolza"
+UPDATE_SIG_NS="vados-dev"
 UPDATE_SIGNER="awg-toolza-release"
 UPDATE_SIG_SINCE="v1.2.0"
 UPDATE_SIGNERS=(
-  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMSoLr9/XltV/DHvw8sMTsKqMkxxGQRezmGJgBKczeAk"   # awg-toolza-release, 2026-10
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHADSeu7b4UN3LpmJ3zIEV7xRCiSHMC4yipczB2Qrg8j"   # awg-toolza-release, 2026-11
 )
 
 # ── Бэкапы ────────────────────────────────────────────────
@@ -20815,5 +20815,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=3ec1ad3b56cdbbdb
+_BUILD_SUM=39f202d7d94ad076
 main "$@"
