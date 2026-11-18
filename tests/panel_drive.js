@@ -16,6 +16,11 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       showConfirm: (t, cb) => { window.__log.push("confirm:" + t); cb(true); },
       showAlert: (t) => { window.__log.push("alert:" + t); },
     } };
+    // Сценарий ниже — про «Классику» (нижняя панель разделов); «Карточки» — в конце
+    try {
+      const v = JSON.parse(localStorage.getItem("awg-look") || "null") || {};
+      if (!v.skin) { v.skin = "toolza"; localStorage.setItem("awg-look", JSON.stringify(v)); }
+    } catch (_) { /* без localStorage — как есть */ }
   }, { initData, theme });
   const page = await ctx.newPage();
   page.setDefaultTimeout(15000);
@@ -25,11 +30,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   page.on("console", (m) => { if (m.type() === "error" && !/telegram\.org|ERR_FAILED/.test(m.text()))
     errors.push("console: " + m.text() + ((m.location() || {}).url ? " " + m.location().url : "")); });
   const base = `https://127.0.0.1:${port}/`;
-  const shot = async (name) => { await page.waitForTimeout(500); await page.screenshot({ path: `${out}/${name}.png`, fullPage: true }); };
+  // Снимки — только когда их оставляют (AWG_PANEL_SHOTS): иначе это время впустую
+  const SHOTS = !!process.env.AWG_PANEL_SHOTS;
+  const shot = async (name) => { if (!SHOTS) return; await page.waitForTimeout(500); await page.screenshot({ path: `${out}/${name}.png`, fullPage: true }); };
+  // Сводки бот держит в кэше AWG_API_CACHE_TTL секунд: файлы поменяли мимо awg2 — ждём его
+  const CACHE_WAIT = Number(process.env.AWG_API_CACHE_TTL || 5) * 1000 + 500;
   const noNull = async () => {
     const bad = await page.evaluate(() => [...document.querySelectorAll("#app, #app *")].some((el) =>
-      [...el.childNodes].some((n) => n.nodeType === 3 && /^(null|undefined|false)$/.test(n.textContent.trim()))));
-    if (bad) throw new Error("на экране текст null/undefined");
+      [...el.childNodes].some((n) => n.nodeType === 3 && (/^(null|undefined|false)$/.test(n.textContent.trim())
+        || /\[object \w+\]/.test(n.textContent)))));
+    if (bad) throw new Error("на экране текст null/undefined/[object …]");
   };
   // Тот же адрес браузер навигацией не считает — тогда перезагружаем страницу
   const nav = async (hash, sel = "h1") => {
@@ -83,7 +93,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       : !/Страна не определена/.test(t) || !/сервер не создан/.test(t)) throw new Error("окно «О сервере»: " + t);
     // Лист снизу — снимок экрана, а не всей страницы
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${out}/01b-server-info.png` });
+    if (SHOTS) await page.screenshot({ path: `${out}/01b-server-info.png` });
     // Скрыть имя и адрес — тут же, окно остаётся открытым; и вернуть
     await page.click(`${box} button:has-text('Скрыть адрес')`);
     await page.waitForSelector(`${box} b.hid >> text=скрыто`);
@@ -194,12 +204,13 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
 
   await step("не запустилась — причина на экране, а не вечная «Загрузка…»", async () => {
     const p2 = await ctx.newPage();
-    await p2.route(/\/app\.js$/, (r) => r.abort());
+    await p2.route(/\/app\.js(\?|$)/, (r) => r.abort());
     await p2.goto(base, { waitUntil: "domcontentloaded" });
     await p2.waitForSelector(".boot-fail >> text=не загрузился app.js", { timeout: 5000 });
+    if (/\?v=/.test(await p2.textContent(".boot-fail"))) throw new Error("в причине — отпечаток версии из адреса скрипта");
     if (!await p2.locator(".boot-fail button:has-text('Повторить')").count()) throw new Error("нет кнопки «Повторить»");
-    await p2.unroute(/\/app\.js$/);
-    await p2.route(/\/app\.js$/, async (r) => { const res = await r.fetch(); r.fulfill({ response: res, body: "window.x = ;" }); });
+    await p2.unroute(/\/app\.js(\?|$)/);
+    await p2.route(/\/app\.js(\?|$)/, async (r) => { const res = await r.fetch(); r.fulfill({ response: res, body: "window.x = ;" }); });
     await p2.reload({ waitUntil: "domcontentloaded" });
     await p2.waitForSelector(".boot-fail >> text=/SyntaxError|Unexpected/", { timeout: 5000 });
     await p2.close();
@@ -220,6 +231,11 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       await page.click(".chip >> text=Мощный"); await page.waitForSelector(".chip >> text=Цепочка I1-I5");
       await page.waitForSelector("select >> nth=0");
       await shot("12-create-pro");
+      // У сервера есть IPv6 — переключатель «Клиенты — по IPv6»; включён — поля домена нет
+      await page.click(".card.item:has-text('Клиенты — по IPv6')");
+      await page.waitForSelector("text=Домен для конфигов", { state: "detached" });
+      await page.click(".card.item:has-text('Клиенты — по IPv6')");
+      await page.waitForSelector("text=Домен для конфигов");
       await page.click(".chip >> text=AmneziaVPN");
       await page.click(".chip >> text=Пакет I1 (DNS)");
       await page.fill("input[placeholder^='случайная']", "10.66.1.7/25");
@@ -332,6 +348,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (!/МБ|ГБ/.test(cap)) throw new Error("подпись дня без объёма: " + cap);
     await shot("03a-traffic");
   });
+  await step("пустые графики: уход указателя не вызывает ошибку", async () => {
+    const before = errors.length;
+    await page.evaluate(() => {
+      for (const box of [barChart([]), lineChart({ days: [], rx: [], tx: [] })]) {
+        box.querySelector("svg").dispatchEvent(new Event("pointerleave"));
+      }
+    });
+    await page.waitForTimeout(100);
+    if (errors.length !== before) throw new Error(errors.slice(before).join(" | "));
+  });
   await step("лимит трафика: готовый размер", async () => {
     await page.click(".actions button:has-text('Лимит')"); await page.waitForSelector(".sheet");
     await page.click(".sheet >> text=50 ГБ в месяц");
@@ -357,7 +383,67 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".sheet >> text=Снять лимит");
     await page.waitForSelector(".kv >> text=нет");
   });
+  await step("лимит трафика: исчерпал — замедлять (сразу, без «Сохранить»), в карточке видно", async () => {
+    await nav("/client/alice/limit", "#app:not(.reloading) input");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v=block]");
+    await page.click("[data-name=limit-mode] button[data-v='2']");
+    await page.waitForSelector(".toast >> text=замедлять до 2 Мбит/с");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v='2']");
+    await page.fill("#app input", "10G");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".kv >> text=/из 10.0 ГБ за месяц · исчерпал — 🐢 до 2 Мбит\\/с/");
+    await shot("03c-limit-slow");
+    await nav("/client/alice/limit", "#app:not(.reloading) input");
+    await page.click("[data-name=limit-mode] button[data-v=block]");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v=block]");
+    await nav("/client/alice", ".actions");
+    await page.click(".actions button:has-text('Лимит')"); await page.waitForSelector(".sheet");
+    await page.click(".sheet >> text=Снять лимит");
+    await page.waitForSelector(".kv >> text=нет");
+  });
+  await step("скорость: готовая из листа — в карточке строкой и меткой", async () => {
+    await page.waitForSelector(".kv >> text=без ограничения");
+    await page.click(".actions button:has-text('Скорость')"); await page.waitForSelector(".sheet");
+    await page.click(".sheet >> text=20 Мбит/с");
+    await page.waitForSelector(".kv >> text=20 Мбит/с");
+    await page.waitForSelector(".tag >> text=20 Мбит/с");
+    await shot("03d-speed");
+  });
+  await step("скорость: своя — проверка ввода, 35, «Без ограничения»", async () => {
+    await nav("/client/alice/speed", "#app:not(.reloading) input");
+    if (await page.inputValue("#app input") !== "20") throw new Error("поле без текущей скорости");
+    await expectAlert("целое число", async () => { await page.fill("#app input", "0.5"); await page.click("button:has-text('Сохранить')"); });
+    await page.fill("#app input", "35");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".kv >> text=35 Мбит/с");
+    await nav("/client/alice/speed", "#app:not(.reloading) input");
+    await page.click("button:has-text('Без ограничения')");
+    await page.waitForSelector(".kv >> text=без ограничения");
+  });
   await step("QR", async () => { await page.click("text=Конфиг и QR"); await page.waitForSelector("img.qr"); await shot("04-qr"); });
+  await step("ссылка на 5 минут: создаётся, открывается без входа (QR, текст, файл), отзывается", async () => {
+    await page.click("[data-name=share] button:has-text('Ссылка на 5 минут')");
+    await page.waitForSelector("[data-name=share] input");
+    const link = await page.inputValue("[data-name=share] input");
+    if (!new RegExp("^https://127\\.0\\.0\\.1:" + port + "/s/[A-Za-z0-9_-]{32}$").test(link)) throw new Error("ссылка: " + link);
+    await page.waitForSelector("[data-name=share] >> text=/действует ещё [45]:\\d\\d/");
+    await shot("04b-share");
+    // Получатель: без Telegram и без входа
+    const p2 = await ctx.newPage();
+    await p2.goto(link);
+    if (await p2.locator("text=PrivateKey").count()) throw new Error("конфиг на странице до нажатия");
+    await p2.click("#show");
+    await p2.waitForSelector("#box:not([hidden])");
+    if (!await p2.locator("#qr[src^='data:image/png']").count() && !await p2.locator("#noqr:not([hidden])").count()) throw new Error("ни QR, ни пояснения");
+    if (!/PrivateKey/.test(await p2.textContent("#text"))) throw new Error("нет текста конфига");
+    if (await p2.textContent("#fname") !== "alice.conf") throw new Error("имя файла: " + await p2.textContent("#fname"));
+    if (SHOTS) await p2.screenshot({ path: `${out}/04c-share-page.png`, fullPage: true });
+    await page.click("[data-name=share] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка отозвана");
+    await p2.reload();
+    await p2.waitForSelector("text=Ссылка недействительна");
+    await p2.close();
+  });
   await step("в чат (одна кнопка, без ZIP — он только в веб-панели)", async () => {
     if (await page.$(".confbtns") || await page.$("button:has-text('ZIP')")) throw new Error("в Mini App кнопка ZIP");
     await page.click("text=Отправить файл в чат"); await page.waitForSelector(".toast >> text=Файл и QR");
@@ -384,6 +470,17 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("новый клиент", async () => {
     await nav("/add", "input");
+    // Кнопка со случайным именем — одна иконка: подпись для чтения с экрана и всплывающая нужны
+    if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
+    // Случайное имя — 6 букв и цифра, каждый раз новое
+    const seen = new Set();
+    for (let i = 0; i < 5; i++) {
+      await page.click("button[aria-label='Случайное имя']");
+      const v = await page.inputValue("input");
+      if (!/^[a-z]{6}[0-9]$/.test(v)) throw new Error("случайное имя не по форме: " + v);
+      seen.add(v);
+    }
+    if (seen.size < 4) throw new Error("случайные имена повторяются: " + [...seen]);
     await page.fill("input", "carol");
     await page.selectOption("select", "+1d");
     await shot("06-add");
@@ -518,12 +615,180 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/server", "text=Endpoint");
     await page.waitForSelector("text=vpn.example.com");
   });
+  await step("точки входа (каскад)", async () => {
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.waitForSelector(".ecard >> text=Напрямую");
+    const nameIn = "input[placeholder='Каскад NL']", addrIn = "input[placeholder='203.0.113.5:443']", card = ".ecard[data-name='Каскад NL']";
+    await page.fill(nameIn, "Каскад NL");
+    await expectAlert("хост:порт", async () => { await page.fill(addrIn, "bad"); await page.click("button:has-text('Добавить')"); });
+    await page.fill(addrIn, "203.0.113.5:443");
+    await page.click("button:has-text('Добавить')");
+    await page.waitForSelector(`${card} >> text=работает`, { timeout: 30000 });
+    await shot("22b-entries");
+    // Вход клиенту — выбором в его карточке (прежний вид экрана сменяется свежим — ждём кнопку входа)
+    await nav("/client/alice", ".rchips button[data-v='Каскад NL']");
+    await page.click(".rchips button[data-v='Каскад NL']");
+    await page.waitForSelector(".toast >> text=Каскад NL", { timeout: 30000 });
+    await page.waitForSelector(".rchips button.on[data-v='Каскад NL']", { timeout: 15000 });
+    // Выбранным клиентам — отметкой: «Все», «Выдать», затем конфиги архивом
+    await nav("/server/entries/" + encodeURIComponent("Каскад NL") + "/clients", ".bar button:has-text('Все')");
+    await page.click(".bar button:has-text('Все')");
+    await page.waitForSelector(".ecard.sel");
+    await shot("22c-entry-clients");
+    await page.click(".bar button:has-text('Выдать')");
+    await page.waitForSelector("text=/Вход «Каскад NL»: \\d+/", { timeout: 30000 });
+    await page.waitForSelector("button:has-text('архивом')");
+    // Новый адрес проверку не проходит — выдача заперта
+    await nav("/server/entries/" + encodeURIComponent("Каскад NL"), "input[inputmode=url]");
+    await page.fill("input[inputmode=url]", "198.51.100.9:8443");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".toast", { timeout: 30000 });
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.waitForSelector(`${card} >> text=пакеты не доходят`, { timeout: 15000 });
+    await page.waitForSelector(`${card} button.locked:has-text('Выбрать')`);
+    await expectAlert("не прошёл проверку", async () => { await page.click(`${card} button:has-text('Всех сюда')`); });
+    await nav("/client/alice", ".rchips button.on[data-v='Каскад NL']");
+    await page.click(".rchips button[data-v='']");
+    await page.waitForSelector(".toast >> text=напрямую", { timeout: 30000 });
+    await page.waitForSelector(".rchips button.locked[data-v='Каскад NL']", { timeout: 15000 });
+    await expectAlert("не прошёл проверку", async () => { await page.click(".rchips button[data-v='Каскад NL']"); });
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.click(`${card} button:has-text('Удалить')`);
+    await page.waitForSelector(card, { state: "detached", timeout: 30000 });
+    await nav("/client/alice", ".a-acts");
+    await page.waitForSelector(".rchips button[data-v='Каскад NL']", { state: "detached", timeout: 15000 });
+    // IPv6 этого сервера — входом в одно нажатие; после добавления кнопки нет
+    await nav("/server/entries", "button:has-text('IPv6 этого сервера')");
+    await page.click("button:has-text('IPv6 этого сервера')");
+    await page.waitForSelector(".ecard[data-name=IPv6] >> text=работает", { timeout: 30000 });
+    await page.waitForSelector(".ecard[data-name=IPv6] >> text=[2a01:4f8:c0c:1234::1]:51820");
+    if (await page.locator("button:has-text('IPv6 этого сервера')").count()) throw new Error("кнопка IPv6 осталась после добавления");
+    await page.click(".ecard[data-name=IPv6] button:has-text('Удалить')");
+    await page.waitForSelector(".ecard[data-name=IPv6]", { state: "detached", timeout: 30000 });
+  });
   await step("модуль ядра", async () => {
     await nav("/server/module", "text=Ядро");
     await page.click("summary"); await page.waitForSelector("details[open] pre");
     await shot("23-module");
   });
+  await step("страна сервера: окно «О сервере» → выбор вручную, поиск, «Автоматически»", async () => {
+    const sent = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('"country"')) { sent.push(body); return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: {} }) }); }
+      return r.continue();
+    };
+    const st = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      Object.assign(d, { country: "NL", country_auto: "NL", country_manual: false, country_votes: "NL=4,DE=2" });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/status", st);
+    try {
+      await nav("/", "h1");
+      await page.evaluate(() => refreshStatus());
+      await page.evaluate(() => serverInfo(null));
+      await page.waitForSelector("[data-name=server-info] [data-name=country]");
+      await page.click("[data-name=server-info] [data-name=country]");
+      await page.waitForSelector("[data-name=country-pick]");
+      const txt = await page.textContent("[data-name=country-pick]");
+      if (!txt.includes("По геосервисам: Нидерланды") || !txt.includes("NL × 4")) throw new Error("сводка геосервисов: " + txt.slice(0, 200));
+      if (!(await page.locator("[data-name=country-pick] .cpi.on[data-cc=auto]").count())) throw new Error("не отмечено «Автоматически»");
+      await page.fill("[data-name=country-pick] input", "авст");
+      const vis = await page.locator("[data-name=country-pick] .cpi").evaluateAll((els) => els.map((e) => e.dataset.cc));
+      // По русскому названию: Австралия раньше Австрии
+      if (vis.join(",") !== "AU,AT") throw new Error("поиск «авст»: " + vis.join(","));
+      await page.click("[data-name=country-pick] .cpi[data-cc=AT]");
+      // Окно закрывается после ответа awg2 — ждём его, а не фиксированные 300 мс (под нагрузкой не успевает)
+      await page.waitForSelector("[data-name=country-pick]", { state: "detached", timeout: 5000 })
+        .catch(() => { throw new Error("окно выбора не закрылось"); });
+      if (!sent.some((b) => b.includes('"country","set","AT"'))) throw new Error("выбор не ушёл в awg2: " + sent.join(" | "));
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/status", st);
+    }
+  });
+  await step("ссылка на конфиг: «Открыть» — ссылка в новой вкладке", async () => {
+    const opened = [];
+    await page.exposeFunction("__opened", (u) => opened.push(u)).catch(() => {});
+    await page.evaluate(() => { window.open = (u) => { window.__opened(u); return null; };
+      if (window.Telegram && window.Telegram.WebApp) window.Telegram.WebApp.openLink = (u) => window.__opened(u); });
+    const fake = (r) => r.fulfill({ contentType: "application/json",
+      body: JSON.stringify({ ok: true, url: "https://198.51.100.7:8443/s/test-token", id: "abc123", exp: Math.round(Date.now() / 1000) + 300 }) });
+    await page.route("**/api/client/share", fake);
+    try {
+      await nav("/client/alice/qr", "text=Ссылка на 5 минут");
+      await page.click("button:has-text('Ссылка на 5 минут')");
+      await page.waitForSelector("[data-name=share-open]");
+      await page.click("[data-name=share-open]");
+      await page.waitForTimeout(200);
+      if (opened[0] !== "https://198.51.100.7:8443/s/test-token") throw new Error("открыто: " + JSON.stringify(opened));
+    } finally {
+      await page.unroute("**/api/client/share", fake);
+    }
+  });
+  await step("порт AWG и обфускатора: 443 (QUIC) или 1024-65535", async () => {
+    const r = await page.evaluate(() => ["443", "1024", "65535", "80", "1023", "65536", "44x"].map((v) => awgPortOk(v)));
+    if (r.join(",") !== "true,true,true,false,false,false,false") throw new Error(r.join(","));
+  });
   await step("журнал", async () => { await nav("/log/manager", "pre"); });
+  await step("перенос из Amnezia: пункт в «Сервере», предпросмотр клиентов, перенос задачей; перенесённый клиент — перевыпуск", async () => {
+    const AMZ = { container: "amnezia-awg2", running: true, migrated: false, proto: "3.1", port: 51888, net: "10.8.1.0/24",
+      clients: [{ name: "Petr", orig: "Пётр <b>x</b>", ip: "10.8.1.1" }, { name: "cat", orig: "cat", ip: "10.8.1.2" }],
+      errors: [], warnings: ["не переносится: PostUp"], blockers: [] };
+    const jobs = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('"amnezia","status"') || body.includes('"amnezia","scan"')) {
+        return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: AMZ }) });
+      }
+      return r.continue();
+    };
+    const job = (r) => { jobs.push(r.request().postData() || ""); return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: false, error: "тест: без задачи" }) }); };
+    const imp = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      (d.rows || []).forEach((c) => { if (c.name === "alice") c.amnezia = "Алиса"; });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/job", job);
+    try {
+      await nav("/server", "text=Перенос из Amnezia");
+      await nav("/server/amnezia", "text=Перенести");
+      const txt = await page.textContent("#app");
+      if (!txt.includes("Пётр <b>x</b>") || !txt.includes("AWG 3.1") || !txt.includes("51888/udp") || !txt.includes("не переносится: PostUp"))
+        throw new Error("предпросмотр: " + txt.slice(0, 400));
+      if (await page.locator("#app b >> text=x").count()) throw new Error("исходное имя выведено как HTML");
+      await page.click("#app button:has-text('Перенести')");
+      await page.waitForTimeout(300);
+      if (!jobs.some((b) => b.includes('"amnezia","migrate"'))) throw new Error("перенос не ушёл задачей: " + jobs.join(" | "));
+      AMZ.migrated = true;
+      await nav("/server/amnezia", "text=Вернуть Amnezia");
+      await page.waitForSelector("text=Удалить контейнер");
+      await nav("/server", "text=Перенос из Amnezia");
+      if (await page.locator(".item:has-text('Перенос из Amnezia') .ibox").count() !== 1
+        || (await page.textContent(".item:has-text('Перенос из Amnezia') .title")).includes("🐳"))
+        throw new Error("пункт «Перенос из Amnezia» — без значка, как у соседних");
+      await shot("23b-server-amnezia");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/job", job);
+    }
+    await page.route("**/api/clients", imp);
+    try {
+      await page.evaluate(() => { S.clients = null; });
+      await nav("/client/alice", "text=Перевыпустить конфиг");
+      if (await page.locator("#app button:has-text('Конфиг и QR')").count()) throw new Error("у перенесённого — «Конфиг и QR»");
+      if (await page.locator("#app button:has-text('Мимикрия')").count()) throw new Error("у перенесённого — «Мимикрия»");
+      await page.waitForSelector("text=«Алиса» · конфиг есть только у клиента");
+      await nav("/client/alice/qr", "text=Перенесён из Amnezia");
+      await page.waitForSelector("#app button:has-text('Перевыпустить конфиг')");
+    } finally {
+      await page.unroute("**/api/clients", imp);
+      await page.evaluate(() => { S.clients = null; });
+    }
+  });
   await step("антисканер: выключен, три списка, исключения, «Включить»", async () => {
     await nav("/server/antiscan", "text=Сети госорганов");
     const n = await page.locator(".card.list .item .check").count();
@@ -566,15 +831,201 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     } finally { await page.unroute(/\/api\/call$/); }
   });
 
+  await step("VK и Max мимо VPN: выключено, «Включить» — с вопросом про сервисы VK у клиентов", async () => {
+    await nav("/server", "text=VK и Max мимо VPN");
+    await page.click("text=VK и Max мимо VPN");
+    await page.waitForSelector("[data-name=vkblock-status] >> text=○ выключено");
+    if (await page.locator("button:has-text('Обновить список')").count()) throw new Error("«Обновить список» при выключенном");
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "vkblock" && b.args[1] === "on")
+        return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data: null }) });
+      if (b.args && b.args[0] === "vkblock" && b.args[1] === "status")
+        return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data: {
+          enabled: true, active: true, v4: 204, v6: 3, dropped: 4321, updated: 1790000000, error: "" } }) });
+      return route.continue();
+    });
+    try {
+      await page.click("button:has-text('Включить')");
+      await page.waitForSelector(".toast >> text=VK и Max мимо VPN включено");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Включить? ВКонтакте"));
+      if (!asked.length || !/мимо туннеля/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
+      await page.waitForSelector("[data-name=vkblock-status] >> text=● включено");
+      await page.waitForSelector("[data-name=vkblock-status] >> text=4 321 пакетов");
+      await page.waitForSelector("button:has-text('Обновить список')");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+
+
+  // ── РФ напрямую, если туннель упал, куда идёт адрес ──
+  const fake = (data) => ({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
+  await step("РФ напрямую: карточка в «Туннелях», выключено, свои списки, «Включить» — с вопросом; включено — счётчик и действия", async () => {
+    await nav("/tunnels", ".kcard");
+    await page.click(".ktabs button[data-tab=tun]");
+    await page.click("[data-name='РФ напрямую'] .kc-n");
+    await page.waitForSelector("[data-name=rudirect-status] >> text=○ выключено");
+    if (await page.locator("button:has-text('Обновить список')").count()) throw new Error("«Обновить список» при выключенном");
+    await page.waitForSelector("input[aria-label='Всегда напрямую']");
+    await page.waitForSelector("input[aria-label='Всегда через туннель']");
+    const ST = { enabled: true, active: true, ru: 8673, mine: 1, excl: 0, updated: 1790000000, src: "ipverse", error: "",
+      packets: 12345, bytes: 2048, direct: ["bank.example"], tunnel: [], xray_ru: true };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "on") return route.fulfill(fake(null));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(ST));
+      return route.continue();
+    });
+    try {
+      await page.click("button:has-text('Включить')");
+      await page.waitForSelector(".toast >> text=РФ напрямую включено");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:") && l.includes("Включить? Клиенты в туннеле"));
+      if (!asked.length || !/адреса сервера/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
+      await page.waitForSelector("[data-name=rudirect-status] >> text=● включено");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=8 673");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=12 345 пакетов");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=своё «РФ напрямую»");
+      await page.waitForSelector("button:has-text('Обновить список')");
+      await page.waitForSelector("button:has-text('Починить')");
+      await page.waitForSelector("[data-name=rud-direct] >> text=bank.example");
+      await shot("23c-rudirect");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую: свой адрес уходит в awg2, пробел — отказ; запись убирается с вопросом", async () => {
+    const seen = [];
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake({ enabled: true, active: true, ru: 8673,
+        direct: ["bank.example"], tunnel: [] }));
+      if (b.args && b.args[0] === "rudirect") { seen.push(b.args.join(" ")); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rud-direct]");
+      await expectAlert("Нужен один адрес", async () => {
+        await page.fill("input[aria-label='Всегда через туннель']", "77.88.8.0 /24");
+        await page.press("input[aria-label='Всегда через туннель']", "Enter");
+      });
+      await page.fill("input[aria-label='Всегда через туннель']", "77.88.8.0/24");
+      await page.press("input[aria-label='Всегда через туннель']", "Enter");
+      await page.waitForSelector(".toast >> text=Добавлено");
+      await page.click("[data-name=rud-direct] .item:has-text('bank.example')");
+      await page.waitForSelector(".toast >> text=Убрано");
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:Убрать bank.example"));
+      if (!asked) throw new Error("убрал без вопроса");
+      if (seen.join("|") !== "rudirect add tunnel 77.88.8.0/24|rudirect del direct bank.example") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую на сервере не в России: предупреждение в вопросе при включении и в статусе", async () => {
+    const st = { enabled: false, active: false, ru: 0, direct: [], tunnel: [], abroad: "NL" };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(st));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "on") { Object.assign(st, { enabled: true, active: true, ru: 8673 }); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rudirect-status]");
+      if (await page.locator("[data-name=rud-abroad]").count()) throw new Error("предупреждение у выключенного");
+      await page.click(".actions button:has-text('Включить')");
+      await page.waitForSelector("[data-name=rud-abroad] >> text=флагом в шапке");
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:⚠️ Сервер не в России (NL)"));
+      if (!asked) throw new Error("в вопросе нет предупреждения");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую: Telegram — через туннель или напрямую, переключение уходит в awg2", async () => {
+    const seen = [], st = { enabled: true, active: true, ru: 8673, direct: [], tunnel: [], tg: false };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(st));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "tg") { seen.push(b.args.join(" ")); st.tg = b.args[2] === "on"; return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rud-tg]");
+      await page.waitForSelector("text=висит на «Соединение…»");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=off]");
+      await page.click("[data-name=rud-tg] button[data-v=on]");
+      await page.waitForSelector(".toast >> text=Telegram напрямую");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=on]");
+      await page.click("[data-name=rud-tg] button[data-v=off]");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=off]");
+      if (seen.join("|") !== "rudirect tg on|rudirect tg off") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("если туннель упал: карточка, четыре туннеля с режимами, работающему — сразу, лежащему — с вопросом", async () => {
+    const seen = [];
+    const rows = [{ name: "warp", label: "WARP", mode: "direct", enabled: true, up: true, held: false },
+      { name: "xray", label: "Xray", mode: "block", enabled: true, up: false, held: true },
+      { name: "t2s", label: "tun2socks", mode: "direct", enabled: true, up: false, held: false },
+      { name: "exits", label: "Exit-ноды WG", mode: "direct", enabled: false, up: false, held: false }];
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "tunnels" && b.args[1] === "fail" && b.args[2] === "list") return route.fulfill(fake(rows));
+      if (b.args && b.args[0] === "tunnels" && b.args[1] === "fail") { seen.push(b.args.slice(2).join(" ")); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels", ".kcard");
+      await page.click(".ktabs button[data-tab=tun]");
+      await page.click("[data-name='Если туннель упал'] .kc-n");
+      await page.waitForSelector("[data-name=fail-xray] >> text=упал — клиенты ждут его без интернета");
+      await page.waitForSelector("[data-name=fail-warp] >> text=● работает");
+      await page.waitForSelector("[data-name=fail-exits] >> text=○ выключен");
+      await page.waitForSelector("[data-name=fail-xray] button.on[data-v=block]");
+      await shot("33b-tunfail");
+      await page.click("[data-name=fail-warp] button[data-v=block]");
+      await page.waitForSelector(".toast >> text=WARP: блокировать");
+      let asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:") && l.includes("сразу останутся"));
+      if (asked.length) throw new Error("работающему — с вопросом");
+      await page.click("[data-name=fail-t2s] button[data-v=block]");
+      await page.waitForSelector(".toast >> text=tun2socks: блокировать");
+      asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:tun2socks сейчас не работает"));
+      if (!asked.length) throw new Error("лежащему — без вопроса");
+      await page.click("button:has-text('Всем напрямую')");
+      await page.waitForSelector(".toast >> text=Все туннели: напрямую");
+      if (seen.join("|") !== "set warp block|set t2s block|set all direct") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("куда идёт адрес: из карточки клиента, адрес — итог с видом каждого IP и подсказкой", async () => {
+    await page.evaluate(() => { S.clients = null; });
+    await nav("/client/alice", "text=Куда идёт адрес");
+    await page.click("text=🧭 Куда идёт адрес →");
+    await page.waitForSelector("select[aria-label='Клиент']");
+    if (await page.inputValue("select[aria-label='Клиент']") !== "alice") throw new Error("клиент не выбран");
+    let asked = null;
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "diag" && b.args[1] === "route") {
+        asked = b.args.join(" ");
+        return route.fulfill(fake({ client: "alice", input: b.args[3], ip: "10.8.1.2", rows: [
+          { ip: "1.1.1.1", kind: "held", dev: "", note: "туннель лежит, режим «блокировать»" },
+          { ip: "77.88.8.8", kind: "rudirect", dev: "eth0", note: "напрямую с сервера — сеть России («РФ напрямую»)" }] }));
+      }
+      return route.continue();
+    });
+    try {
+      await page.fill("input[aria-label='Адрес']", "https://ya.ru/x");
+      await page.press("input[aria-label='Адрес']", "Enter");
+      await page.waitForSelector("[data-name=route-result] [data-kind=held] >> text=1.1.1.1");
+      await page.waitForSelector("[data-name=route-result] [data-kind=rudirect] >> text=сеть России");
+      await page.waitForSelector("[data-name=route-result] button:has-text('Если туннель упал')");
+      if (asked !== "diag route alice https://ya.ru/x") throw new Error("вызов: " + asked);
+      await shot("44b-diag-route");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+
   // ── Туннели и DNS ──
   await step("туннели", async () => {
-    await nav("/tunnels", ".ecard");
-    const n = await page.locator(".ecard").count();
-    if (n !== 6) throw new Error("ждали 6 карточек (4 туннеля, каскад, DNS), есть " + n);
-    await page.waitForSelector(".sgrid >> text=Exit-ноды");
+    // Экран туннелей — карточками и в «Классике»
+    await nav("/tunnels", ".kcard");
+    await page.click(".ktabs button[data-tab=tun]");
+    const n = await page.locator(".kcard").count();
+    if (n !== 8) throw new Error("ждали 8 карточек (4 туннеля, каскад, DNS, РФ напрямую, если упал), есть " + n);
+    await page.waitForSelector(".kstats >> text=Exit-ноды");
+    if (await page.evaluate(() => document.documentElement.dataset.skin) !== "toolza") throw new Error("по умолчанию не «Классика»");
     await shot("30-tunnels");
   });
-  await step("WARP", async () => { await page.click("[data-name=WARP] .name"); await page.waitForSelector("text=Бэкенд"); await shot("31-warp"); });
+  await step("WARP", async () => { await page.click("[data-name=WARP] .kc-n"); await page.waitForSelector("text=Бэкенд"); await shot("31-warp"); });
   await step("клиенты в WARP", async () => {
     await nav("/tunnels/warp/clients", ".item");
     await page.click(".item >> text=alice");
@@ -597,6 +1048,60 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (await page.textContent(sel + " .sub") !== now) throw new Error("на сервере другое: " + await page.textContent(sel + " .sub"));
   });
   await step("Xray", async () => { await nav("/tunnels/xray", "text=Установить"); await shot("33-xray"); });
+  await step("WARP: «Обновить скаут» — справа от «Удалить», запускает обновление warpscout", async () => {
+    const R = "#app:not(.reloading) ", sent = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('["warp","status"]')) return r.fulfill({ contentType: "application/json", body: JSON.stringify({
+        ok: true, rc: 0, data: { backend: "wg", configured: true, up: true, scout: "0.13.2" }, log: "  Туннель : ● WARP FRA\n" }) });
+      if (body.includes('"scout-update"')) sent.push(body);
+      return r.continue();
+    };
+    await page.route("**/api/**", fake);
+    try {
+      await nav("/tunnels/warp", R + "button:has-text('Обновить скаут')");
+      // Порядок кнопок: «Обновить скаут» — сразу за «Удалить» (в сетке — справа от неё)
+      const order = await page.$$eval(".actions button", (bs) => bs.map((b) => b.textContent.trim()));
+      const del = order.findIndex((t) => /Удалить/.test(t));
+      if (del < 0 || !/Обновить скаут/.test(order[del + 1] || "")) throw new Error("кнопки: " + order.join(" | "));
+      await page.waitForSelector("text=сейчас 0.13.2");
+      await shot("31b-warp-scout");
+      await page.click("button:has-text('Обновить скаут')");
+      await page.waitForFunction(() => /Обновление warpscout/.test(document.body.textContent));
+      if (!sent.length) throw new Error("обновление не ушло в awg2");
+    } finally {
+      await page.unroute("**/api/**", fake);
+    }
+  });
+  await step("Xray: через выход трафик не идёт — что делать, на экране Xray и на главной", async () => {
+    const R = "#app:not(.reloading) ";
+    const fake = async (r) => {
+      if ((r.request().postData() || "").includes('["xray","status"]')) return r.fulfill({ contentType: "application/json", body: JSON.stringify({
+        ok: true, rc: 0, data: { installed: true, up: true, tags: ["vl1"], main: "vl1", fail: "notraffic" },
+        log: "  Туннель   : ▲ включён, но через выход трафик не идёт — клиенты Xray не в туннеле\n" }) });
+      return r.continue();
+    };
+    const st = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      d.tunnels = Object.assign(d.tunnels || {}, { xray_fail: "notraffic" });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/status", st);
+    try {
+      await nav("/tunnels/xray", R + "[data-name=xray-fail]");
+      const t = await page.textContent("[data-name=xray-fail]");
+      if (!/Через выход трафик не идёт/.test(t) || !/устареть/.test(t) || !/Диагностика/.test(t) || !/Журнал/.test(t))
+        throw new Error("предупреждение: " + t);
+      await shot("33b-xray-fail");
+      await nav("/", "h1");
+      await page.evaluate(() => refreshStatus());
+      await page.waitForSelector(R + "[data-name=alerts] >> text=Xray: через выход трафик не идёт");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/status", st);
+    }
+  });
   await step("tun2socks", async () => {
     await nav("/tunnels/tun2socks", "input");
     await expectAlert("IP:ПОРТ", async () => { await page.fill("input", "нет"); await page.click("text=Включить"); });
@@ -607,6 +1112,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".item >> text=n1");
     await page.waitForSelector("[data-tunnel=on] .switch.on");
     await page.waitForSelector("[data-tunnel=on] >> text=включён · все клиенты");
+    // Проверка выхода в интернет через ноду — следом, в журнал на том же экране
+    await page.waitForSelector(".card >> text=выхода в интернет нет");
     await shot("35-exits");
     await page.click(".exmode button:has-text('Выбранные')");
     await page.waitForSelector(".exl .item[data-name=alice]");
@@ -647,6 +1154,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".exmode button:has-text('Все клиенты')");
     await page.waitForSelector("[data-tunnel=on] >> text=включён · все клиенты");
   });
+  await step("exit-ноды: порядок нод и упавшая нода", async () => {
+    const fs = require("fs"), R = "#app:not(.reloading) ", awg = `${sandboxRoot}/etc/amnezia/amneziawg`,
+      hdir = `${sandboxRoot}/run/exits-health`;
+    fs.writeFileSync(`${awg}/awg-exit-n2.conf`, "[Interface]\nPrivateKey = X\nTable = off\n\n[Peer]\nEndpoint = 1.2.3.5:51820\n");
+    fs.mkdirSync(hdir, { recursive: true });
+    fs.writeFileSync(`${hdir}/n1`, `down 3 0 ${Math.floor(Date.now() / 1000)} nonet\n`);
+    try {
+      // Сводку бот держит в кэше — нода и её здоровье появились мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
+      await nav("/tunnels/exits", R + "[data-name=ex-nodes] [data-node=n2]");
+      await page.waitForSelector("[data-node=n1] >> text=основная");
+      await page.waitForSelector("[data-node=n1] >> text=на связи, но выхода в интернет нет");
+      await page.waitForSelector("[data-node=n1] >> text=выпала из общего выхода");
+      await page.waitForSelector("[data-node=n2] >> text=запасная 1");
+      if (await page.$("[data-node=n1] button[aria-label^='Выше']")) throw new Error("у основной ноды есть ⬆");
+      await shot("36b-exit-order");
+      await page.click("[data-node=n2] button[aria-label='Выше: n2']");
+      await page.waitForSelector(".toast >> text=Порядок общего выхода: n2 → n1");
+      await page.waitForSelector(R + "[data-node=n2] >> text=основная");
+      const first = await page.$eval("[data-name=ex-nodes] .item", (e) => e.dataset.node);
+      if (first !== "n2") throw new Error("после ⬆ первой должна быть n2, а не " + first);
+      await page.click("[data-node=n1] button[aria-label='Выше: n1']");
+      await page.waitForSelector(".toast >> text=Порядок общего выхода: n1 → n2");
+    } finally {
+      fs.unlinkSync(`${awg}/awg-exit-n2.conf`);
+      fs.rmSync(`${hdir}/n1`, { force: true });
+    }
+  });
   await step("каскад: добавить", async () => {
     await nav("/tunnels/cascade/add", "input");
     await page.fill("input[placeholder='51820']", "5555");
@@ -664,8 +1199,36 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector("text=Правил нет");
   });
   await step("DNS", async () => { await nav("/tunnels/dns", "text=Включить"); await shot("39-dns"); });
+  await step("DNS: свои резолверы — отмечено «Вручную», подсказка популярных добавляет и убирает имя", async () => {
+    const D = { installed: true, running: true, intercept: true, upstream: "adguard-dns-doh dns.sb",
+      presets: [{ names: "cloudflare google cisco-doh", label: "Cloudflare + Google + Cisco" }, { names: "cloudflare", label: "Только Cloudflare" }],
+      popular: [{ name: "cloudflare", label: "Cloudflare 1.1.1.1" }, { name: "quad9-doh-ip4-port443-nofilter-pri", label: "Quad9 без фильтра" },
+        { name: "dns.sb", label: "DNS.SB" }] };
+    const fake = (r) => ((r.request().postData() || "").includes('"dns","status"')
+      ? r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: D }) }) : r.continue());
+    await page.route("**/api/call", fake);
+    try {
+      await nav("/tunnels/dns", "text=Вручную");
+      const manual = page.locator(".item:has-text('Вручную')");
+      if (!(await manual.locator(".radio.on").count()) || !(await manual.textContent()).includes("adguard-dns-doh dns.sb"))
+        throw new Error("свои резолверы — без отметки «Вручную»: " + (await manual.textContent()));
+      if (await page.locator(".item:not(:has-text('Вручную')) .radio.on").count()) throw new Error("отмечен и пресет");
+      await nav("/tunnels/dns/manual", "text=Популярные резолверы");
+      const input = page.locator("#app input");
+      if ((await input.inputValue()) !== "adguard-dns-doh, dns.sb") throw new Error("поле: " + (await input.inputValue()));
+      await page.click("summary:has-text('Популярные')");
+      if (!(await page.locator(".item:has-text('dns.sb') .check.on").count())) throw new Error("dns.sb из поля — без отметки");
+      await page.click(".item:has-text('quad9-doh-ip4-port443-nofilter-pri')");
+      await page.click(".item:has-text('dns.sb')");
+      if ((await input.inputValue()) !== "adguard-dns-doh, quad9-doh-ip4-port443-nofilter-pri")
+        throw new Error("после нажатий: " + (await input.inputValue()));
+      await shot("39b-dns-manual");
+    } finally {
+      await page.unroute("**/api/call", fake);
+    }
+  });
   await step("всё напрямую", async () => {
-    await nav("/tunnels", ".ecard");
+    await nav("/tunnels", ".kcard");
     await page.click("text=Всё напрямую");
     await page.waitForSelector(".toast >> text=клиенты идут напрямую");
   });
@@ -794,6 +1357,30 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click("[data-name=traffic] .chips button >> text=Все");
     await page.waitForSelector("[data-name=traffic] .chart .bar");
   });
+  await step("обзор: опоздавший график дорисовывается без новых запросов сводки и клиентов", async () => {
+    await nav("/clients", "[data-name]");
+    const seen = { status: 0, clients: 0 };
+    const onReq = (r) => { const m = /\/api\/(status|clients)$/.exec(r.url()); if (m) seen[m[1]]++; };
+    let release;
+    const gate = new Promise((ok) => { release = ok; });
+    const slow = async (r) => { if ((r.request().postData() || "").includes('"traffic","daily"')) await gate; await r.continue(); };
+    page.on("request", onReq);
+    await page.route("**/api/call", slow);
+    try {
+      await page.evaluate(() => { location.hash = "/"; });
+      await page.waitForFunction(() => { const a = document.getElementById("app"); return !a.querySelector(".spin") && !a.classList.contains("reloading"); });
+      await page.waitForTimeout(500);
+      if (await page.locator("[data-name=traffic] .chart").count()) throw new Error("график ещё не пришёл, а он на экране");
+      release();
+      await page.waitForSelector("[data-name=traffic] .chart");
+      await page.waitForTimeout(300);
+      if (seen.status !== 1 || seen.clients !== 1) throw new Error("дорисовка запросила заново: " + JSON.stringify(seen));
+    } finally {
+      release();
+      page.off("request", onReq);
+      await page.unroute("**/api/call", slow);
+    }
+  });
   await step("диагностика", async () => { await nav("/diag", "text=Система"); await shot("40-diag"); });
   await step("домены мимикрии", async () => {
     await page.click("text=Домены мимикрии: мир");
@@ -806,12 +1393,12 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.route(/\/api\/job\/status$/, (r) => r.abort());
     try {
       await page.click("text=Домены мимикрии: мир");
-      await page.waitForSelector("h1 .pill:has-text('нет связи')", { timeout: 20000 });
+      await page.waitForSelector(".jobhead .pill:has-text('нет связи')", { timeout: 20000 });
       await page.waitForSelector("text=задача могла продолжиться на сервере");
       await page.waitForSelector("button:has-text('Назад')");
     } finally { await page.unroute(/\/api\/job\/status$/); await page.evaluate(() => { delete window.AWG_JOB_LOST_MS; }); }
     await page.click("button:has-text('Повторить проверку')");
-    await page.waitForFunction(() => /готово|ошибка/.test((document.querySelector("#app h1 .pill") || {}).textContent || ""),
+    await page.waitForFunction(() => /готово|ошибка/.test((document.querySelector("#app .jobhead .pill") || {}).textContent || ""),
       null, { timeout: 90000 });
   });
   await step("задача: ушли с экрана — итог подсказкой", async () => {
@@ -820,7 +1407,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.route(/\/api\/job\/status$/, async (r) => { await new Promise((ok) => setTimeout(ok, 2500)); r.continue().catch(() => {}); });
     try {
       await page.click("text=Домены мимикрии: мир");
-      await page.waitForSelector("h1 .pill:has-text('идёт')");
+      await page.waitForSelector(".jobhead .pill:has-text('идёт')");
       await page.evaluate(() => { location.hash = "/server"; });
       await page.waitForSelector("text=Endpoint");
       await page.waitForSelector(".toast >> text=/Домены мимикрии \\(мир\\): (готово|ошибка)/", { timeout: 90000 });
@@ -874,7 +1461,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("восстановление", async () => {
     await page.click("button:has-text('Восстановить')");
-    await page.waitForSelector("h1:has-text('Восстановление из бэкапа') .pill.ok", { timeout: 90000 });
+    await page.waitForSelector("h1:has-text('Восстановление из бэкапа') + .jobhead .pill.ok", { timeout: 90000 });
     await shot("46-restored");
   });
   await step("не бэкап — понятная ошибка", async () => {
@@ -900,6 +1487,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".chlog li >> text=со второй строкой");
     if (await page.locator(".chlog-v >> text=v1.1.1").count()) throw new Error("в списке изменений — уже установленная версия");
     await shot("48-update-available");
+  });
+  await step("обновление: шкала по этапам журнала, в конце — 100% и зелёная", async () => {
+    // Задача подставная: настоящее обновление заменило бы awg2 стенда
+    const ver = await page.evaluate(() => S.version);
+    const steps = [["running", "→ Канал: стабильный\n"], ["running", "→ Прежняя версия: /usr/local/bin/awg2.bak\n"],
+      ["done", "√ Установлено: " + ver + "\n"]];
+    let i = 0;
+    await page.route("**/api/job", (r) => r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: { id: "fake1" } }) }));
+    await page.route("**/api/job/status", (r) => {
+      const [state, log] = steps[Math.min(i, steps.length - 1)]; i++;
+      r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data:
+        { state, log, offset: i, ok: state === "done", data: { version: ver } } }) });
+    });
+    try {
+      await page.click("button:has-text('Обновить до v9.9.9')");
+      await page.waitForSelector(".jobhead .jbar");
+      await page.waitForFunction(() => +document.querySelector(".jbar").getAttribute("aria-valuenow") >= 75, null, { timeout: 15000 });
+      await page.waitForSelector(".jobhead .jbar.ok[aria-valuenow='100']", { timeout: 15000 });
+      await page.waitForSelector(".jobhead .jt >> text=/^100% · /");
+      await shot("48a-update-bar");
+    } finally {
+      // Подмена задач — только для этого шага: иначе следующие задачи получили бы её ответы
+      await page.unroute("**/api/job"); await page.unroute("**/api/job/status");
+    }
+    const r = await page.evaluate(() => [jobReached(JOB_STAGES["bot update"], "Скачиваю код бота\nЗависимости Python..."),
+      jobReached(JOB_STAGES["bot update"], "")]);
+    if (JSON.stringify(r) !== "[[30,75],[0,5]]") throw new Error("этапы обновления бота: " + JSON.stringify(r));
+    await nav("/update", "text=Канал");
   });
   await step("стрелка ↑ у версии в шапке", async () => {
     await page.waitForSelector(".top .lockup text >> text=↑");
@@ -947,7 +1562,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
           over: document.documentElement.scrollWidth - document.documentElement.clientWidth };
       });
       if (r.lockR > r.flagL || r.flagR > r.kbarL || r.topR > width || r.over > 0) throw new Error(`шапка на ${width}px: ` + JSON.stringify(r));
-      if (width === 360) await page.screenshot({ path: `${out}/48d-beta-360.png` });
+      if (SHOTS && width === 360) await page.screenshot({ path: `${out}/48d-beta-360.png` });
     }
     // Поворот телефона / окно Telegram Desktop: название выбирает размер при отрисовке,
     // а шапку никто не вызывал — после широкого окна оно оставалось крупным и теснило флаг
@@ -976,8 +1591,95 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".seg button:has-text('NONE')");
     await page.waitForSelector(".toast >> text=NONE");
   });
+  await step("обзор: «нужна перезагрузка» — коротко, убирается крестиком до нового ядра", async () => {
+    const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ";
+    fs.writeFileSync(f, "новое ядро 6.8.0-146 — нужна перезагрузка\n");
+    try {
+      // Сводку бот держит в кэше — повод появился мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
+      await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146 — нужна перезагрузка");
+      await shot("04-reboot-alert");
+      await nav("/server", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146");
+      await page.click("[data-name=alerts] .row:has-text('новое ядро') button[aria-label=Убрать]");
+      await page.waitForSelector("text=новое ядро 6.8.0-146", { state: "detached" });
+      await nav("/", R + "[data-name=routes]");
+      if (await page.$("text=новое ядро 6.8.0-146")) throw new Error("на обзоре убранное замечание вернулось");
+      // Ещё более новое ядро — другой текст: замечание снова на месте
+      fs.writeFileSync(f, "новое ядро 6.8.0-150 — нужна перезагрузка\n");
+      await page.waitForTimeout(CACHE_WAIT);
+      await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-150 — нужна перезагрузка");
+    } finally {
+      fs.unlinkSync(f);
+      await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts"));
+    }
+  });
+  await step("обзор: убранное «обновлены пакеты» забывается, когда повод сменился или пропал, — такой же позже покажется", async () => {
+    const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ", t = "обновлены пакеты — нужна перезагрузка";
+    fs.writeFileSync(f, t + "\n");
+    try {
+      await page.waitForTimeout(CACHE_WAIT);
+      await nav("/", R + `[data-name=alerts] >> text=${t}`);
+      await page.click("[data-name=alerts] .row:has-text('обновлены пакеты') button[aria-label=Убрать]");
+      await page.waitForSelector(`text=${t}`, { state: "detached" });
+    } finally { fs.unlinkSync(f); }
+    // Перезагрузились — повод другой (в песочнице — «модуль не загружен»); потом пакеты обновились снова: текст тот же, замечание должно вернуться
+    await page.waitForTimeout(CACHE_WAIT);
+    await nav("/", R + "[data-name=routes]");
+    fs.writeFileSync(f, t + "\n");
+    try {
+      await page.waitForTimeout(CACHE_WAIT);
+      await nav("/", R + `[data-name=alerts] >> text=${t}`);
+    } finally { fs.unlinkSync(f); await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts")); }
+  });
+  await step("обзор: испорченный список убранных замечаний (не массив) не роняет экран", async () => {
+    await page.evaluate(() => localStorage.setItem("awg-hidden-alerts", "{}"));
+    try {
+      await nav("/", "#app:not(.reloading) [data-name=routes]");
+    } finally { await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts")); }
+  });
+  await step("обфускатор: выход клиентов — напрямую или через туннель, всем и своему", async () => {
+    const R = "#app:not(.reloading) ";
+    await nav("/wgobf", "[data-name=wgobf-route]");
+    // На выбор — только настроенные туннели: работают exit-ноды, WARP не настроен
+    await page.waitForSelector(".rchips button[data-v=direct].on");
+    await page.waitForSelector(".rchips button[data-v=exits]");
+    if (await page.$(".rchips button[data-v=warp]")) throw new Error("WARP не настроен, а на выбор есть");
+    // Профиль WARP есть, но туннель не поднят: выход сохраняется, клиенты пока напрямую
+    const fs = require("fs"), warpConf = `${sandboxRoot}/etc/wireguard/warp0.conf`;
+    fs.writeFileSync(warpConf, "[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n");
+    try {
+      // Сводку обфускатора бот держит в кэше — профиль WARP появился мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
+      await nav("/wgobf", R + ".rchips button[data-v=warp]");
+      await page.click(".rchips button[data-v=warp]");
+      await page.waitForSelector(".toast >> text=через WARP");
+      await page.waitForSelector(R + ".rchips button[data-v=warp].on");
+      await page.waitForSelector("text=WARP выключен — клиенты пока идут напрямую");
+      await page.waitForSelector("[data-name=ob1] >> text=через WARP");
+      await nav("/wgobf/client/ob1", "[data-name=wgobf-status]");
+      await page.waitForSelector("[data-name=wgobf-status] >> text=WARP выключен — пока напрямую");
+      await nav("/", R + "[data-name=routes] .ptabs");
+      await page.waitForFunction(() => /WARP выключен — пока напрямую/.test(document.querySelector("[data-name=wgobf-routes]").textContent));
+      // Своему клиенту — через работающие exit-ноды: в карточке, на обзоре — «идут через Exit WG»
+      await nav("/wgobf/client/ob1", R + "[data-name=wgobf-client-route] button[data-v=warp].on");
+      await page.waitForSelector("[data-name=wgobf-client-route] >> text=WARP выключен — клиент пока идёт напрямую");
+      await page.click("[data-name=wgobf-client-route] button[data-v=exits]");
+      await page.waitForSelector(".toast >> text=Выход ob1: через exit-ноды");
+      await page.waitForSelector(R + "[data-name=wgobf-client-route] button[data-v=exits].on");
+      await page.waitForSelector("[data-name=wgobf-status] >> text=через exit-ноды");
+      await shot("50-wgobf-client-route");
+      await nav("/", R + "[data-name=routes] .ptabs");
+      await page.waitForFunction(() => /идут через Exit WG/.test(document.querySelector("[data-name=wgobf-routes]").textContent));
+      await nav("/wgobf", R + ".rchips button[data-v=warp].on");
+      await page.click(".rchips button[data-v=direct]");
+      await page.waitForSelector(".toast >> text=напрямую");
+      await page.waitForSelector(R + ".rchips button[data-v=direct].on");
+      await nav("/wgobf/client/ob1", R + "[data-name=wgobf-client-route] button[data-v=direct].on");
+    } finally { fs.unlinkSync(warpConf); }
+  });
   await step("обфускатор: клиент и комплект", async () => {
     await nav("/wgobf/add", "input");
+    if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
     await page.fill("input", "kn1");
     await page.click("button:has-text('Создать')");
     await page.waitForURL(/#\/wgobf\/client\/kn1$/);
@@ -994,6 +1696,22 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".card.item:has-text('Мониторинг') .switch.on");
     await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
     await page.waitForSelector(".card.item:has-text('Мониторинг') .switch.on");
+  });
+  await step("обфускатор: переименовать клиента — карточка под новым именем, мониторинг переехал", async () => {
+    const rename = async (from, to) => {
+      await nav("/wgobf/client/" + from, "text=Ссылка для Keenetic");
+      await page.click("button:has-text('Переименовать')");
+      await page.waitForURL(new RegExp("#/wgobf/client/" + from + "/rename$"));
+      await page.fill("[data-name=wgobf-rename-input]", to);
+      await page.click("[data-name=wgobf-rename-save]");
+      await page.waitForURL(new RegExp("#/wgobf/client/" + to + "$"));
+      await page.waitForSelector("text=Ссылка для Keenetic");
+      await page.waitForSelector(".card.item:has-text('Мониторинг') .switch.on");
+    };
+    await rename("kn1", "kn2");
+    await nav("/wgobf", "[data-name=kn2]");
+    if (await page.locator("[data-name=kn1]").count()) throw new Error("старое имя осталось в списке");
+    await rename("kn2", "kn1");
   });
   await step("обфускатор: удалить клиента", async () => {
     await page.click("button:has-text('Удалить клиента')");
@@ -1095,11 +1813,15 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 6) throw new Error("ждали 6 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 10) throw new Error("ждали 10 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('Xray: через выход трафик не идёт и снова работает')");
+    await page.waitForSelector(".card.item:has-text('Exit-нода не отвечает и снова работает')");
+    await page.waitForSelector(".card.item:has-text('WARP упал или не отвечает и снова работает')");
+    await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 5);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 9);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 5) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 9) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {
@@ -1139,7 +1861,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot/app", "text=Сервер панели");
     await shot("56-app");
     await page.click("button:has-text('На IP')");
-    await page.waitForSelector("h1:has-text('Сертификат на IP') .pill.ok", { timeout: 60000 });
+    await page.waitForSelector("h1:has-text('Сертификат на IP') + .jobhead .pill.ok", { timeout: 60000 });
     // Сервер Mini App перезапускается через секунду после выпуска — дальше идём, когда он снова на месте
     await page.waitForTimeout(3000);
   });
@@ -1150,6 +1872,173 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (!labels.some((l) => l.startsWith(t))) throw new Error("нет раздела " + t + ": " + labels.join(", "));
     }
   });
+
+  // ── Стиль «Карточки»: включается в «Теме», меню в шапке, туннели и клиенты карточками ──
+  await step("«Карточки»: включаются в «Теме», шрифт Plex, меню в шапке вместо нижней панели", async () => {
+    await nav("/", "h1");
+    await page.click(".top button[aria-label='Тема']");
+    await page.click(".drawer.on [data-name=skin] button:has-text('Карточки')");
+    await page.waitForSelector(".drawer.on [data-name=skin] button.on:has-text('Карточки')");
+    await page.click(".drawer.on button:has-text('Готово')");
+    const st = await page.evaluate(() => ({ skin: document.documentElement.dataset.skin, rb: document.documentElement.style.getPropertyValue("--rb").trim(),
+      font: getComputedStyle(document.body).fontFamily, tabs: getComputedStyle(document.getElementById("tabbar")).display }));
+    if (st.skin !== "cards" || st.rb !== "20px" || !/IBM Plex Sans/.test(st.font) || st.tabs !== "none") throw new Error(JSON.stringify(st));
+    await page.waitForFunction(() => [...document.fonts].some((f) => f.family.indexOf("IBM Plex Sans") >= 0 && f.status === "loaded"), null, { timeout: 5000 })
+      .catch(() => { throw new Error("шрифт Plex не загрузился"); });
+    await page.click(".top .kburger");
+    await page.waitForSelector("#more.on .kmenu a:has-text('Бэкапы')");
+    if (await page.getAttribute(".top .kburger", "aria-expanded") !== "true") throw new Error("aria-expanded у меню");
+    await shot("80-cards-menu");
+    await page.click("#more .kmenu a:has-text('Бэкапы')");
+    await page.waitForURL(/#\/backup$/);
+    if (await page.locator("#more.on").count()) throw new Error("меню не закрылось");
+  });
+  await step("«Карточки»: туннели — вкладки, сводка, карточки, вид, скрытый адрес ноды", async () => {
+    await nav("/tunnels", ".kstats");
+    if (await page.locator(".ktabs button").count() !== 3 || await page.locator(".kstats > div").count() !== 4) throw new Error("вкладки/сводка");
+    for (const t of ["WARP", "Xray", "tun2socks", "Exit-ноды WG"]) await page.waitForSelector(`.kcard[data-name='${t}']`);
+    await page.waitForSelector(".kcard[data-name='Шифрованный DNS']");
+    await shot("81-cards-tunnels");
+    // Вид «Список» — без подробностей, запоминается
+    await page.click(".ktools .seg button[aria-label='Список']");
+    if (await page.locator(".kcard .kc-kv").count()) throw new Error("в списке — подробности");
+    await nav("/tunnels", ".kstats");
+    if (await page.locator(".ktools .seg button.on[aria-label='Список']").count() !== 1) throw new Error("вид не запомнился");
+    await page.click(".ktools .seg button[aria-label='Сетка']");
+    await page.waitForSelector(".kcard .kc-kv.g2", { state: "attached" }).catch(() => {});
+    await page.click(".ktools .seg button[aria-label='Подробно']");
+    // Поиск по карточкам
+    await page.fill(".ktools input[type=search]", "warp");
+    if (await page.locator(".klist .kcard").count() !== 1) throw new Error("поиск: " + await page.locator(".klist .kcard").count());
+    await page.fill(".ktools input[type=search]", "");
+    if (profile !== "none") {
+      await page.waitForSelector(".kcard.on[data-tunnel=exits] .kswitch[aria-checked=true]");
+      await page.click(".ktabs button[data-tab=nodes]");
+      const node = page.locator(".kcard[data-name=node-n1]");
+      await node.waitFor();
+      if ((await node.textContent()).includes("1.2.3.4")) throw new Error("адрес ноды не скрыт");
+      await node.locator(".eyeb").click();
+      await node.locator("text=1.2.3.4:51820").waitFor();
+      await shot("82-cards-nodes");
+      await page.click(".ktabs button[data-tab=xray]");
+      await page.waitForSelector(".kempty button:has-text('Установить Xray')");
+      await page.click(".ktabs button[data-tab=tun]");
+    }
+  });
+  await step("«Карточки»: клиенты — сводка, карточка с графиком, окно графика, выбор", async () => {
+    await nav("/clients", ".kstats");
+    if (await page.locator(".ktabs button").count() !== 4) throw new Error("вкладки фильтров");
+    const first = page.locator(".klist .kcard").first();
+    if (!await first.count()) { await page.waitForSelector(".kempty"); return; }
+    await first.locator(".kc-ch svg path.ln").waitFor({ timeout: 10000 });
+    await page.waitForSelector(".kstats .lb >> text=За 14 дней");
+    await shot("83-cards-clients");
+    await first.locator(".kc-ch").click();
+    await page.waitForSelector(".kchs .chart svg");
+    await page.click(".kchs .kpills button:has-text('7 дн.')");
+    await page.waitForSelector(".kchs .kpills button.on:has-text('7 дн.')");
+    await page.waitForFunction(() => /последние 7/.test(document.querySelector(".kchs").textContent));
+    await shot("84-cards-chart");
+    await page.keyboard.press("Escape");
+    await page.click(".kline button[aria-label='Выбрать несколько']");
+    await first.locator(".kc-h").click();
+    await page.waitForSelector(".klist .kcard.sel");
+    await page.waitForSelector(".bar button:has-text('Удалить 1')");
+    await page.click(".bar button:has-text('Отмена')");
+    if (await page.locator(".klist .kcard.sel").count()) throw new Error("выбор не снялся");
+  });
+  await step("«Карточки» в старом движке (Edge 18): туннели, клиенты, меню — без ошибок", async () => {
+    const p4 = await ctx.newPage();
+    const errs = [];
+    p4.on("pageerror", (e) => errs.push(String(e)));
+    await p4.addInitScript(() => {
+      window.AWG_FORCE_NOGAP = true;
+      delete Array.prototype.flat; delete Object.fromEntries; delete String.prototype.trimStart;
+      [Element, Document, DocumentFragment].forEach((C) => { delete C.prototype.replaceChildren; });
+      try { Object.defineProperty(document, "fonts", { get: () => undefined }); } catch (_) { /* нет — так нет */ }
+    });
+    await p4.goto(base + "#/tunnels", { waitUntil: "domcontentloaded" });
+    await p4.waitForSelector(".kstats .lb");
+    if (await p4.locator(".boot-fail").count()) throw new Error(await p4.textContent(".boot-fail"));
+    if (!await p4.locator(".kcard [data-gapm], .ktabs [data-gapm]").count()) throw new Error("обход gap у flex в карточках не сработал");
+    await p4.click(".ktabs button[data-tab=nodes]");
+    await p4.evaluate(() => { location.hash = "#/clients"; });
+    await p4.waitForSelector(".kstats .lb");
+    await p4.click(".top .kburger");
+    await p4.waitForSelector("#more.on .kmenu a");
+    if (errs.length) throw new Error(errs.join(" | "));
+    await p4.close();
+  });
+  if (profile !== "none") {
+    await step("«Карточки»: переключатель выключает туннель (с вопросом), awg2 отвечает", async () => {
+      await nav("/tunnels", ".kstats");
+      await page.click(".ktabs button[data-tab=tun]");          // вкладка запоминается — прошлый шаг мог оставить другую
+      // systemctl песочницы — заглушка: служба «работает» и после остановки, поэтому
+      // проверяем вопрос и ответ awg2 на exits down, а не состояние после
+      await page.click(".kcard[data-tunnel=exits] .kswitch");
+      await page.waitForSelector(".toast >> text=Exit-ноды выключены", { timeout: 30000 });
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:Выключить Exit-ноды WG?"));
+      if (!asked) throw new Error("не спросил");
+      await page.waitForSelector(".kstats");                     // экран перерисован после действия
+    });
+  }
+
+  // ── Все экраны: низ содержимого не под нижней панелью и плашкой действий, страница не шире экрана ──
+  if (profile === "lite") {
+    await step("все экраны: ничего не уходит под нижнюю панель и плашку действий, нет прокрутки вбок", async () => {
+      const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
+        + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
+        + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
+        + "/server/vkblock /server/entries /tunnels/rudirect /tunnels/fail /diag/route /diag/route/alice "
+        + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
+        + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
+        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");
+      const bad = [];
+      for (const [skin, w, hgt] of [["toolza", 390, 844], ["cards", 390, 844], ["toolza", 320, 640]]) {
+        const c = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt } });
+        await c.route(/telegram\.org/, (r) => r.abort());
+        await c.addInitScript(({ initData, theme, skin }) => {
+          const noop = () => {};
+          window.Telegram = { WebApp: { initData, colorScheme: theme, ready: noop, expand: noop, onEvent: noop, close: noop,
+            BackButton: { show: noop, hide: noop, onClick: noop }, HapticFeedback: { notificationOccurred: noop },
+            showConfirm: (t, cb) => cb(false), showAlert: noop } };
+          try { localStorage.setItem("awg-look", JSON.stringify({ skin })); } catch (_) { /* без localStorage — как есть */ }
+        }, { initData, theme, skin });
+        const p = await c.newPage();
+        p.on("pageerror", (e) => bad.push(`${skin} ${w} ${p.url().split("#")[1]}: ${e}`));
+        for (const r of routes) {
+          await p.goto(base + "#" + r, { waitUntil: "domcontentloaded" });
+          await p.waitForFunction(() => { const a = document.getElementById("app"); return a && a.childElementCount && !a.querySelector(":scope > .spin"); },
+            null, { timeout: 15000 }).catch(() => {});
+          await p.waitForTimeout(700);
+          await p.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+          await p.waitForTimeout(300);
+          const m = await p.evaluate(() => {
+            const vis = (el) => { const cs = getComputedStyle(el); return cs.display !== "none" && cs.visibility !== "hidden"; };
+            const pinned = (el) => { for (let x = el; x && x !== document.body; x = x.parentElement) {
+              const pos = getComputedStyle(x).position; if (pos === "fixed" || pos === "sticky") return true; } return false; };
+            let bottom = 0, who = "";
+            document.querySelectorAll("#app *").forEach((el) => {
+              if (!vis(el) || pinned(el) || el instanceof SVGElement && el.tagName !== "svg") return;
+              if (el.closest("details:not([open]) > :not(summary)")) return;   // свёрнутое — не на экране
+              const b = el.getBoundingClientRect();
+              if (b.width > 0 && b.height > 0 && b.bottom > bottom) { bottom = b.bottom; who = el.tagName.toLowerCase() + "." + String(el.className).split(" ")[0]; }
+            });
+            // Нижняя панель разделов и плашка «Сбросить / Применить» стоят поверх страницы
+            let top = innerHeight;
+            const tb = document.getElementById("tabbar");
+            if (tb && vis(tb) && tb.childElementCount) top = Math.min(top, tb.getBoundingClientRect().top);
+            document.querySelectorAll("#app > .bar").forEach((b) => { if (vis(b)) top = Math.min(top, b.getBoundingClientRect().top); });
+            return { over: Math.round(bottom - top), who, wide: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+          });
+          if (m.over > 0) bad.push(`${skin} ${w} ${r}: ${m.who} под панелью на ${m.over}px`);
+          if (m.wide > 0) bad.push(`${skin} ${w} ${r}: шире экрана на ${m.wide}px`);
+        }
+        await c.close();
+      }
+      if (bad.length) throw new Error(bad.join("; "));
+    });
+  }
 
   const log = await page.evaluate(() => window.__log);
   say("ALERTS", JSON.stringify(log.filter((l) => l.startsWith("alert:"))));

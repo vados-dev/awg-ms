@@ -8,6 +8,7 @@ cookie сессии, CSRF, заголовки, скачивание файлов
 
 Запуск:  python3 tests/test_web.py [путь/к/dist/awg2.sh]   (python с aiogram)
 """
+import gzip
 import http.cookiejar
 import io
 import json
@@ -109,6 +110,28 @@ try:
         and hd.get("X-Content-Type-Options") == "nosniff", hd)
     st, _, js = c.req(BASE + "web.js")
     chk("web.js: базовый путь для запросов", st == 200 and BASE.encode() in js, js)
+    st, hd, font = c.req(BASE + "fonts/plex-sans-cyrillic-400.woff2")
+    chk("шрифт «Карточек»: woff2, кэш на неделю, без входа (страница входа — тем же шрифтом)",
+        st == 200 and font[:4] == b"wOF2" and hd.get("Content-Type") == "font/woff2"
+        and hd.get("Cache-Control") == "public, max-age=604800" and "script-src 'self'" in hd.get("Content-Security-Policy", ""),
+        [st, hd.get("Content-Type"), hd.get("Cache-Control")])
+    st = [c.req(BASE + p)[0] for p in ("fonts/nope.woff2", "fonts/OFL.txt", "fonts/..%2fapp.js", "fonts/plex-sans-latin-400.woff")]
+    chk("шрифты: только существующие .woff2 из каталога шрифтов", st == [404, 404, 404, 404], st)
+    chk("остальное по-прежнему без кэша", c.req(BASE + "web.js")[1].get("Cache-Control") == "no-store")
+    st, hd, gz = c.req(BASE, headers={"Accept-Encoding": "gzip"})
+    page = gzip.decompress(gz) if hd.get("Content-Encoding") == "gzip" else gz
+    m = re.search(rb'src="app\.js\?v=([0-9a-f]{16})"', page)
+    chk("страница: сжата gzip, скрипты — с отпечатком версии, сама — со сверкой (ETag)",
+        st == 200 and hd.get("Content-Encoding") == "gzip" and m is not None and b'src="web.js"' in page
+        and hd.get("Cache-Control") == "no-cache" and hd.get("ETag"), [st, hd])
+    chk("повторное открытие — 304 без тела", c.req(BASE, headers={"If-None-Match": hd.get("ETag", "")})[0] == 304)
+    st, hd, gz = c.req(BASE + "app.js?v=" + (m.group(1).decode() if m else ""), headers={"Accept-Encoding": "gzip"})
+    chk("app.js с отпечатком: сжат (в 3+ раза меньше), хранится браузером до новой версии",
+        st == 200 and hd.get("Content-Encoding") == "gzip" and "immutable" in hd.get("Cache-Control", "")
+        and len(gz) * 3 < len(gzip.decompress(gz)) and b"runJob" in gzip.decompress(gz), [st, hd])
+    st, hd, raw = c.req(BASE + "app.js")
+    chk("без отпечатка и без gzip у браузера — несжатый, со сверкой", st == 200 and "Content-Encoding" not in hd
+        and hd.get("Cache-Control") == "no-cache" and b"runJob" in raw, [st, hd])
 
     print("Без входа")
     for path in ("api/me", "api/status", "api/call", "api/clients", "api/download", "api/web/account", "api/backup/upload"):
@@ -173,6 +196,159 @@ try:
     st, d = c.api("api/download", {"what": "conf", "name": "../../etc/passwd"})
     chk("имя клиента с путём — отказ", st == 400, [st, d])
 
+    print("Ссылка на конфиг")
+    st, d = c.api("api/client/share", {"name": "alice"})
+    surl = d.get("url") or ""
+    path = surl.split(str(PORT), 1)[-1]
+    chk("ссылка из веб-панели: её адрес, без секретного пути панели",
+        st == 200 and surl.startswith(f"https://127.0.0.1:{PORT}/s/") and BASE.strip("/") not in surl
+        and re.fullmatch(r"/s/[A-Za-z0-9_-]{32}", path) is not None, d)
+    st, hd, page = c.req(path)
+    chk("страница ссылки отдаётся веб-панелью, со своими строгими заголовками",
+        st == 200 and b"PrivateKey" not in page and "default-src 'none'" in hd.get("Content-Security-Policy", "")
+        and hd.get("Cache-Control") == "no-store", [st, hd])
+    # При no-referrer браузер шлёт форму «Скачать» с Origin: null — панель отвечает 403;
+    # same-origin: Origin свой, а чужим адресам (Telegram, «Поддержать») referrer не уходит
+    chk("страница ссылки: Referrer-Policy same-origin (форма «Скачать» — со своим Origin)",
+        hd.get("Referrer-Policy") == "same-origin", hd.get("Referrer-Policy"))
+    for what, h in (("чужой Origin", {"Origin": "https://evil.example"}), ("Origin: null", {"Origin": "null"}),
+                    ("без Origin, Sec-Fetch-Site: cross-site", {"Sec-Fetch-Site": "cross-site"})):
+        codes = [c.req(path + p, b"{}", raw=True, method="POST", headers=dict(h, **{"Content-Type": "application/json"}))[0]
+                 for p in ("/data", "/file")]
+        chk(f"ссылка: POST /data и /file, {what} — 403", codes == [403, 403], codes)
+    st, hd, data = c.req(path + "/file", b"", raw=True, method="POST", headers={"Origin": f"https://127.0.0.1:{PORT}"})
+    chk("файл по ссылке — alice.conf", st == 200 and b"[Interface]" in data
+        and hd.get("Content-Disposition") == 'attachment; filename="alice.conf"', [st, hd])
+    st, hd, data = c.req(path + "/file", b"", raw=True, method="POST", headers={"Origin": "https://evil.example"})
+    chk("POST по ссылке с чужого сайта — отказ (как у всей панели)", st == 403, st)
+    st, d2 = c.api("api/client/share/revoke", {"id": d.get("id")})
+    chk("отзыв из веб-панели", st == 200 and d2.get("ok") is True and c.req(path)[0] == 404, [st, d2])
+    codes = [c.req(path + p, b"{}", raw=True, method="POST",
+                   headers={"Origin": f"https://127.0.0.1:{PORT}", "Content-Type": "application/json"})[0]
+             for p in ("/data", "/file")]
+    chk("после отзыва: POST /data и /file со своим Origin — 404", codes == [404, 404], codes)
+    st, d = Client().api("api/client/share", {"name": "alice"})
+    chk("без входа ссылку не создать", st == 401, [st, d])
+
+    print("Доступ: по адресам и только через VPN")
+    nets_file = os.path.join(ROOT, "..", "web", "access.nets")
+    wconf = os.path.join(ROOT, "..", "web", "awg-web.conf")
+    st, d = c.api("api/web/account")
+    a = d.get("access") or {}
+    chk("аккаунт: доступ «для всех», мой адрес, адрес панели изнутри VPN (адрес awg0)",
+        st == 200 and a.get("mode") == "all" and a.get("me") == "127.0.0.1" and not a.get("me_vpn") and a.get("me_self")
+        and re.match(r"https://10\.\d+\.\d+\.\d+:" + PORT + "/s3cr3tPath/$", a.get("vpn_url", "")), a)
+    st, d = c.api("api/web/access", {"mode": "ip", "allow": ["300.1.1.1", "198.51.100.7"]})
+    chk("неверный адрес — 400 с понятной ошибкой, режим не сменился",
+        st == 400 and "300.1.1.1" in d.get("error", "") and "WEB_ACCESS=" not in open(wconf).read(), d)
+    st, d = c.api("api/web/access", {"mode": "ip", "allow": []})
+    chk("«по адресам» с пустым списком — отказ", st == 400 and d.get("error"), d)
+    st, d = c.api("api/web/access", {"mode": "root", "allow": []})
+    st2, d2 = c.api("api/web/access", {"mode": "ip", "allow": "198.51.100.7"})
+    chk("неизвестный режим, список не списком — 400", st == 400 and st2 == 400, [d, d2])
+    st, d = c.api("api/web/access", {"mode": "ip", "allow": ["198.51.100.7", "203.0.113.0/24", "2001:db8::/32"]})
+    nets = open(nets_file).read().split() if os.path.exists(nets_file) else []
+    st2, acc = c.api("api/web/account")
+    a = acc.get("access") or {}
+    chk("«по адресам»: принят; в списке панели — адреса и подсеть VPN; с самого сервера панель открывается",
+        st == 200 and {"198.51.100.7/32", "203.0.113.0/24", "2001:db8::/32"} <= set(nets)
+        and any(n.startswith("10.") for n in nets) and a.get("mode") == "ip"
+        and a.get("allow") == ["198.51.100.7/32", "203.0.113.0/24", "2001:db8::/32"] and c.api("api/me")[0] == 200,
+        [st, d, nets, a])
+    st, d = c.api("api/web/access", {"mode": "vpn"})
+    nets = open(nets_file).read().split() if os.path.exists(nets_file) else []
+    conf_now = open(wconf).read()
+    chk("«только через VPN»: в списке только подсеть VPN; список адресов сохранён для возврата",
+        st == 200 and nets and all(n.startswith("10.") for n in nets) and "WEB_ACCESS=vpn" in conf_now
+        and "WEB_ALLOW=198.51.100.7/32,203.0.113.0/24,2001:db8::/32" in conf_now and c.api("api/me")[0] == 200,
+        [st, d, nets, conf_now])
+    st, d = c.api("api/web/access", {"mode": "all"})
+    chk("«для всех»: список панели убран", st == 200 and not os.path.exists(nets_file)
+        and "WEB_ACCESS=all" in open(wconf).read(), [st, d])
+    wlog = open(os.path.join(ROOT, "..", "web", "awg-web.log")).read()
+    chk("смены доступа — в журнале", wlog.count(" ACCESS 127.0.0.1 ") == 3 and " ACCESS 127.0.0.1 ip 198.51.100.7" in wlog,
+        wlog[-500:])
+
+    # Проверка адреса самой панелью: чужой адрес — 404 до входа и до API
+    code = r"""
+import asyncio, ipaddress, json, os, sys
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+from aiohttp import web as aw
+from aiohttp.test_utils import make_mocked_request
+from awgbot import web
+d = sys.argv[2]
+open(web.CONF, "w").write("WEB_PORT=1\nWEB_PATH=p\nWEB_ACCESS=ip\n")
+out = {}
+acc = web.Access()
+out["no_file"] = [acc.allowed("198.51.100.7"), acc.allowed("127.0.0.1"), acc.allowed("::1")]
+open(web.NETS_FILE, "w").write("198.51.100.0/24\n10.8.0.0/24\n2001:db8::/32\nмусор\n")
+out["ip"] = [acc.allowed(x) for x in ("198.51.100.7", "::ffff:198.51.100.9", "10.8.0.5", "2001:db8::5",
+                                      "203.0.113.1", "2001:db9::1", "", None, "fe80::1%eth0", "127.0.0.1")]
+open(web.CONF, "w").write("WEB_PORT=1\nWEB_PATH=p\nWEB_ACCESS=all\n")
+out["all"] = acc.allowed("203.0.113.1")
+open(web.CONF, "w").write("WEB_PORT=1\nWEB_PATH=p\nWEB_ACCESS=vpn\n")
+out["vpn"] = [acc.allowed("10.8.0.5"), acc.allowed("203.0.113.1")]
+
+async def go(remote, local="203.0.113.50"):
+    srv = web.WebPanel()
+    tr = mock.Mock()
+    tr.get_extra_info.side_effect = lambda k, default=None: ((remote, 1234) if k == "peername"
+                                                             else (local, 443) if k == "sockname" else default)
+    req = make_mocked_request("GET", "/p/", transport=tr)
+    async def handler(r):
+        return aw.Response(text="panel")
+    try:
+        r = await srv.guard_mw(req, handler)
+        return r.status
+    except aw.HTTPException as e:
+        return e.status
+out["mw"] = [asyncio.run(go("203.0.113.1")), asyncio.run(go("10.8.0.5")), asyncio.run(go("203.0.113.50")),
+             asyncio.run(go("::ffff:203.0.113.50")), asyncio.run(go("2001:db9::7", "2001:db9::7"))]
+print(json.dumps(out))
+"""
+    ud = os.path.join(ROOT, "..", "acc-unit")
+    os.makedirs(ud, exist_ok=True)
+    uenv = dict(os.environ, AWG_WEB_CONF=os.path.join(ud, "w.conf"), AWG_WEB_NETS=os.path.join(ud, "nets"),
+                AWG_WEB_LOG=os.path.join(ud, "w.log"), AWG_WEB_DIR=os.path.join(ud, "self"),
+                AWG_BOT_CONF=os.path.join(ud, "none.conf"))
+    r = subprocess.run([sys.executable, "-c", code, os.path.join(HERE, "..", "awg_bot"), ud],
+                       env=uenv, capture_output=True, text=True, timeout=120)
+    try:
+        u = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        u = {}
+    chk("панель сама: режим ограничен, а списка нет — никого, кроме самого сервера",
+        u.get("no_file") == [False, True, True], [u, r.stderr[-800:]])
+    chk("панель сама: адреса и подсети из списка (и IPv4 в виде ::ffff:), чужие — нет; мусор в файле не мешает",
+        u.get("ip") == [True, True, True, True, False, False, False, False, False, True], u)
+    chk("панель сама: «для всех» — все; «через VPN» — только свой VPN", u.get("all") is True
+        and u.get("vpn") == [True, False], u)
+    chk("панель сама: чужой адрес — 404 до входа и API, свой — дальше", u.get("mw", [])[:2] == [404, 200], u)
+    chk("панель сама: с адреса сервера на него же (прокси на сервере, 3x-ui и т. п.) — как чужой адрес, 404",
+        u.get("mw", [])[2:] == [404, 404, 404], u)
+    # Возврат правила: любой сбой одного круга (здесь — не-UTF-8 в stderr apply) не останавливает задачу
+    fw = os.path.join(ud, "fw.sh")
+    open(fw, "w").write("#!/bin/bash\necho \"$1\" >> \"$(dirname \"$0\")/fw.calls\"\n"
+                        "[[ $1 == check ]] && exit 1\nprintf 'bad \\xff\\xfe\\n' >&2\nexit 1\n")
+    os.chmod(fw, 0o755)
+    try:
+        os.remove(os.path.join(ud, "fw.calls"))
+    except OSError:
+        pass
+    code2 = ("import asyncio, sys\nsys.path.insert(0, sys.argv[1])\nfrom awgbot import web\n"
+             "web.FW_SCRIPT, web.FW_EVERY = sys.argv[2], 0.2\n"
+             "async def go():\n    srv = web.WebPanel()\n    t = asyncio.create_task(srv.watch_fw())\n"
+             "    await asyncio.sleep(2)\n    t.cancel()\n    print('alive' if not t.done() or t.cancelled() else 'dead')\n"
+             "asyncio.run(go())\n")
+    r = subprocess.run([sys.executable, "-c", code2, os.path.join(HERE, "..", "awg_bot"), fw],
+                       env=uenv, capture_output=True, text=True, timeout=60)
+    try:
+        calls = open(os.path.join(ud, "fw.calls")).read().split()
+    except OSError:
+        calls = []
+    chk("правило доступа: фоновая задача переживает сбой круга и проверяет дальше",
+        r.stdout.strip().endswith("alive") and calls.count("apply") >= 2, [r.stdout[-200:], r.stderr[-300:], calls])
     print("Смена пароля и сессии")
     c2 = Client()
     c2.login()

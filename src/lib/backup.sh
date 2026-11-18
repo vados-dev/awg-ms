@@ -8,8 +8,8 @@ _BACKUP_TUNNEL_PATHS=()
 _backup_tunnel_paths() {
   local p
   _BACKUP_TUNNEL_PATHS=()
-  for p in "$XRAY_DIR" "$EXITS_STATE" "$EXITS_PEERS" "$CASCADE_RULES" "$T2S_CONF" "$DNS_PROXY_CONF" \
-           "$EXITS_DIR"/awg-exit-*.conf; do
+  for p in "$XRAY_DIR" "$EXITS_STATE" "$EXITS_PEERS" "$EXITS_PEERS.wgobf" "$CASCADE_RULES" "$T2S_CONF" "$DNS_PROXY_CONF" \
+           "$EXITS_DIR"/awg-exit-*.conf "$RUDIRECT_USER"/direct.list "$RUDIRECT_USER"/tunnel.list "$TUNFAIL_CONF"; do
     [[ -e "$p" ]] && _BACKUP_TUNNEL_PATHS+=("${p#/}")
   done
   return 0
@@ -159,7 +159,7 @@ _restore_warp() {  # каталог бэкапа
     # служба выполняет от root, — его Тулза пишет сама, из бэкапа не берём.
     # Состояние «включён» тоже не переносим — туннель включают руками.
     mkdir -p "$WARP_DIR" && chmod 700 "$WARP_DIR"
-    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_DIR/account_type"; do
+    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_PEERS.wgobf" "$WARP_DIR/account_type"; do
       [[ -f "$src/wgcf/${f##*/}" ]] && install -D -m 600 "$src/wgcf/${f##*/}" "$f"
     done
     rm -f "$WARP_STATE" "$WARP_STATE.failed"
@@ -193,8 +193,7 @@ _restore_tunnels() {  # каталог бэкапа
       [[ -n "$n" ]] && warn "Из конфига Xray бэкапа убрано: $n"
     else warn "Конфиг Xray из бэкапа не разобран — пропущен"; fi
   fi
-  [[ -f "$x$XRAY_PEERS" ]] && install -D -m 600 "$x$XRAY_PEERS" "$XRAY_PEERS"
-  for f in "$EXITS_STATE" "$EXITS_PEERS"; do
+  for f in "$XRAY_PEERS" "$XRAY_PEERS.wgobf" "$EXITS_STATE" "$EXITS_PEERS" "$EXITS_PEERS.wgobf"; do
     [[ -f "$x$f" ]] && install -D -m 600 "$x$f" "$f"
   done
   for f in "$x$EXITS_DIR"/awg-exit-*.conf; do
@@ -213,6 +212,18 @@ _restore_tunnels() {  # каталог бэкапа
     _dns_write_conf
     [[ -n "$names" ]] && { _dns_upstream_write "$names" || warn "Резолверы DNS из бэкапа не приняты — стоят по умолчанию"; }
   fi
+  # Свои списки «РФ напрямую» и режимы «если туннель упал» — построчно, с проверкой
+  for n in direct tunnel; do
+    [[ -f "$x$RUDIRECT_USER/$n.list" ]] || continue
+    while IFS= read -r f; do _rud_entry_norm "$f"; done < <(grep -vE '^[[:space:]]*(#|$)' "$x$RUDIRECT_USER/$n.list") \
+      | sort -u | head -n "$RUDIRECT_USER_MAX" | write_file "$RUDIRECT_USER/$n.list" 600
+  done
+  if [[ -f "$x$TUNFAIL_CONF" ]]; then
+    grep -xE '(warp|xray|t2s|exits)=block' "$x$TUNFAIL_CONF" | sort -u | write_file "$TUNFAIL_CONF" 644
+    [[ -s "$TUNFAIL_CONF" ]] || rm -f "$TUNFAIL_CONF"
+    _tunfail_units || true
+  fi
+  rudirect_on && { _rudirect_emit && "$RUDIRECT_SCRIPT" apply; } &>/dev/null
   rm -f "$XRAY_STATE"
   [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   for n in $(exits_nodes); do systemctl enable --now "awg-quick@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
@@ -266,7 +277,7 @@ _restore_hooks() {  # конфиг [разрешённые команды…]
 }
 
 do_restore() {
-  local list=() i c src name opts=()
+  local list=() i c src name opts=() bad
   mapfile -t list < <(_restore_list)
   (( ${#list[@]} )) || { err "Бэкапов нет в $BACKUP_DIR"; return 1; }
   for i in "${!list[@]}"; do
@@ -278,6 +289,8 @@ do_restore() {
   (( c )) || return 0
   src="${list[$((c - 1))]}"
   _restore_prepare "$src" || return 1
+  bad=$(py meta-check "$RESTORE_SRC/awg0.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
+  [[ -n "$bad" ]] && warn "В бэкапе у клиентов повреждены метки: $bad — срок или лимит: клиент будет заблокирован до исправления"
   read_confirm "${R}  Текущий сервер будет заменён. Продолжить? (введи yes): ${N}" || return 0
   [[ -d "$RESTORE_SRC/wgobf/etc" ]] && ask_yes "  В бэкапе есть WG + обфускатор — восстановить? [Y/n]: " y && opts+=(wgobf)
   [[ -f "$RESTORE_SRC/tunnels.tar.gz" ]] \
@@ -287,7 +300,7 @@ do_restore() {
 
 # backup_restore БЭКАП [wgobf] [tunnels] — сервер и клиенты всегда, остальное по флагам.
 backup_restore() {
-  local src="$1" label="${1##*/}" port f
+  local src="$1" label="${1##*/}" port f bad
   shift
   command -v awg-quick &>/dev/null || { err "Нет awg-quick — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
   _restore_prepare "$src" || return 1
@@ -300,6 +313,10 @@ backup_restore() {
   conf_uplink_sync force || true
   client_files_sync_suffix
   ok "Сервер и клиенты: $(client_files | wc -l) кл."
+  # Повреждённые метки клиентов (бэкап правили руками или подменили): срок и
+  # лимит — таймер блокирует до исправления, скорость и режим лимита не действуют
+  bad=$(py meta-check "$SERVER_CONF" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
+  [[ -n "$bad" ]] && warn "У клиентов повреждены метки: $bad. Срок или лимит — клиент заблокирован, пока не задать их заново; скорость — не ограничивается"
   _restore_warp "$src"
   for f in "$@"; do
     case "$f" in
@@ -313,6 +330,7 @@ backup_restore() {
   port=$(server_port)
   [[ -n "$port" ]] && ufw_allow "$port/udp" AmneziaWG
   expire_install
+  web_vpn_changed
   if awg_up_diag; then ok "awg0 поднят"; else err "awg0 не поднялся — конфиг: $SERVER_CONF"; return 1; fi
   success_box "Восстановлено из $label"
   log_info "восстановление из $label"

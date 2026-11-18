@@ -28,11 +28,15 @@ clients_clean() {
 # Все туннели: службы, правила и настройки. Бэкап делается до вызова.
 tunnels_remove_all() {
   local n
+  # «Блокировать» — раньше сброса: туннелей не будет, держать клиентов незачем.
+  # «РФ напрямую» без туннелей ничего не делает — уходит вместе с ними
+  tunfail_remove
   tunnels_panic_reset quiet
+  rudirect_remove
   for n in $(exits_nodes); do systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true; done
   remove_unit awg-warp.service awg-usque.service awg-warp-healthcheck.timer awg-warp-healthcheck.service \
     "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service \
-    "$T2S_UNIT" "$EXITS_UNIT" awg-dns-persist.service awg-dns-healthcheck.timer awg-dns-healthcheck.service
+    "$T2S_UNIT" "$EXITS_UNIT" "$EXITS_HEALTH_TIMER" "$EXITS_HEALTH_UNIT" awg-dns-persist.service awg-dns-healthcheck.timer awg-dns-healthcheck.service
   cascade_uninstall quiet
   if [[ -f "$DNS_PROXY_STATE" ]]; then
     dns_rules_down
@@ -45,7 +49,7 @@ tunnels_remove_all() {
     "$USQUE_DIR" "$USQUE_BIN" "$USQUE_SYSCTL" "$WARPSCOUT_DIR" "$WARPSCOUT_BIN" \
     "$XRAY_DIR" "$XRAY_BIN" "$XRAY_ROUTING_SCRIPT" "$XRAY_ASSET_DIR"/geo{ip,site}.dat "$XRAY_ASSET_DIR"/geo{ip,site}_RU.dat \
     "$T2S_DIR" "$T2S_BIN" "$T2S_ROUTING_SCRIPT" "$EXITS_SCRIPT" \
-    "$DNS_PROXY_STATE" "$DNS_PERSIST_SCRIPT" "$DNS_HEALTH_SCRIPT" "$DNS_SYSCTL"
+    "$DNS_PROXY_STATE" "$DNS_PERSIST_SCRIPT" "$DNS_HEALTH_SCRIPT" "$DNS_SYSCTL" "$RUDIRECT_USER"
 }
 
 # Файлы, которые кладёт «make install» amneziawg-tools.
@@ -151,14 +155,18 @@ uninstall_all() {
   rm -rf "$AWG_DIR"
   rm -f "$CLIENT_DIR"/*_awg[23].conf "$MOD_TAG_FILE" "$TOOLS_TAG_FILE" "$UPSTREAM_CACHE" "$MOD_LOG"
   ufw_delete_matching AmneziaWG
+  # Панель — раньше обфускатора: удаление VPN поправило бы её доступ зря
+  if [[ "$del_web" == y ]] && web_installed; then web_remove quiet; fi
   if [[ "$del_wgobf" == y ]]; then wgobf_remove quiet
   elif wgobf_installed; then info "WG + обфускатор оставлен и продолжит работать сам"; fi
-  if [[ "$del_web" == y ]] && web_installed; then web_remove quiet
-  elif web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; fi
-  # Антисканер работает через свой скрипт и без awg2, но управлять им без
-  # awg2 нечем — уходит вместе со скриптом, иначе остаётся защищать сервер
-  if [[ "$del_self" == y ]]; then antiscan_remove
-  elif antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
+  if web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; web_vpn_changed; fi
+  # Антисканер и «VK и Max мимо VPN» работают через свои скрипты и без awg2,
+  # но управлять ими без awg2 нечем — уходят вместе со скриптом, иначе остаются
+  if [[ "$del_self" == y ]]; then antiscan_remove; vkblock_remove
+  else
+    if antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
+    if vkblock_on; then info "VK и Max мимо VPN оставлено и продолжит работать"; fi
+  fi
   if [[ "$del_bot" == y ]]; then
     bot_uninstall quiet
     # Сертификат — для Mini App бота и веб-панели

@@ -89,7 +89,8 @@ peers_all() {  # файл
 # Свои выходы клиентов Xray живут в конфиге самого Xray (правила по адресу):
 # изменились — без пересборки конфига клиент оставался на прежнем выходе,
 # хотя список показывал «по умолчанию» или «напрямую».
-_xray_outs() { grep -F '|' "$XRAY_PEERS" 2>/dev/null | sort; }
+# Клиенты обфускатора со своим выходом — в «.wgobf» рядом.
+_xray_outs() { grep -hF '|' "$XRAY_PEERS" "$XRAY_PEERS.wgobf" 2>/dev/null | sort; }
 _xray_outs_apply() {  # прежний вывод _xray_outs
   [[ "$(_xray_outs)" != "$1" ]] && xray_is_up || return 0
   _xray_prepare || return 1
@@ -114,23 +115,103 @@ tunnel_peers_forget() {
 # опираются только на константы и базовые помощники.
 RT_FUNCS=(valid_ip valid_cidr conf_iface_get server_net ipt_add ipt_ins ipt_del
           ipt_del_grep ipt_del_tagged rp_filter_loose rt_fw_up rt_fw_down rt_up rt_down
-          rt_rules_clear SERVER_CONF AWG_IF)
+          rt_rules_clear rt_rules_file rt_fail_name rt_fail_mode rt_fail_route rt_tunnel_on rt_table_live rt_release_held
+          SERVER_CONF AWG_IF WGOBF_IF WGOBF_STATE TUNFAIL_CONF TUNFAIL_LOG WARP_STATE XRAY_STATE
+          EXITS_STATE T2S_UNIT T2S_TABLE WARP_TABLE XRAY_TABLE EXITS_TABLE EXITS_TABLE_BASE EXITS_TABLE_MAX)
+
+# ── Если туннель упал ─────────────────────────────────────
+# Режим на туннель (TUNFAIL_CONF «warp=block»): direct — как раньше, упавший
+# туннель отпускает клиентов напрямую, с адреса сервера; block — клиенты
+# остаются в таблице туннеля, где под основным маршрутом лежит «недоступно»
+# (metric 4096): пока туннель лежит, их трафик никуда не уходит, кроме «РФ
+# напрямую» (правило 90 — раньше таблиц туннелей). Выключенный руками туннель
+# отпускает клиентов в любом режиме: его состояния к этому моменту уже нет.
+rt_fail_name() {  # таблица → warp|xray|t2s|exits
+  case "$1" in
+    "$T2S_TABLE") echo t2s ;; "$WARP_TABLE") echo warp ;; "$XRAY_TABLE") echo xray ;; *) echo exits ;;
+  esac
+}
+
+rt_fail_mode() {  # таблица|имя → direct|block
+  local n="$1"
+  [[ "$n" =~ ^[0-9]+$ ]] && n=$(rt_fail_name "$1")
+  [[ "$(sed -n "s/^$n=//p" "$TUNFAIL_CONF" 2>/dev/null | tail -1)" == block ]] && echo block || echo direct
+}
+
+# «Недоступно» под основным маршрутом — в режиме block, иначе снять.
+rt_fail_route() {  # таблица
+  if [[ "$(rt_fail_mode "$1")" == block ]]; then
+    ip route replace unreachable default metric 4096 table "$1"
+  else
+    ip route del unreachable default metric 4096 table "$1" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Туннель включён (а не выключен руками) — по его состоянию.
+rt_tunnel_on() {  # таблица
+  case "$1" in
+    "$WARP_TABLE") [[ -f "$WARP_STATE" ]] ;;
+    "$XRAY_TABLE") [[ -f "$XRAY_STATE" ]] ;;
+    "$T2S_TABLE") systemctl is-enabled --quiet "$T2S_UNIT" 2>/dev/null ;;
+    *) [[ "$(head -1 "$EXITS_STATE" 2>/dev/null)" == active ]] ;;
+  esac
+}
+
+# В таблице есть живой маршрут. Не «… | grep -q»: при pipefail ранний выход grep — SIGPIPE у ip и ложное «нет»
+rt_table_live() { grep -q ' dev ' <<< "$(ip route show table "$1" 2>/dev/null)"; }
+
+# Поднимается туннель — снять «удержание» лежащих: их правила (приоритет у
+# каждого свой) иначе перехватили бы клиентов в «недоступно».
+rt_release_held() {  # таблица, которую не трогать
+  local t
+  for t in $(ip rule show 2>/dev/null | awk '$(NF - 1) == "lookup" {print $NF}' | sort -u); do
+    [[ "$t" =~ ^[0-9]+$ && "$t" != "$1" ]] || continue
+    (( t == T2S_TABLE || t == WARP_TABLE || t == XRAY_TABLE || t == EXITS_TABLE \
+       || (t >= EXITS_TABLE_BASE && t <= EXITS_TABLE_MAX) )) || continue
+    (( $1 == EXITS_TABLE && t >= EXITS_TABLE_BASE && t <= EXITS_TABLE_MAX )) && continue
+    rt_table_live "$t" && continue
+    rt_rules_clear "$t"
+    ip route flush table "$t" 2>/dev/null || true
+  done
+  return 0
+}
 
 rt_rules_clear() {  # таблица
   local guard=0
   while (( guard++ < 256 )) && ip rule del lookup "$1" 2>/dev/null; do :; done
 }
 
+# Правила «адрес → таблица» по списку («IP» или «IP|выход» в строке). Рядом —
+# «<список>.wgobf»: клиенты WG + обфускатора (wgobf0), уведённые в тот же
+# туннель. Отдельный файл — синхронизация со списком клиентов AWG его не трогает.
+rt_rules_file() {  # файл таблица
+  local f line ip
+  for f in "$1" "$1.wgobf"; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line; do
+      ip="${line%%|*}"
+      valid_ip "$ip" && ip rule add from "$ip" lookup "$2" priority "$2"
+    done < "$f"
+  done
+  return 0
+}
+
 # NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
 rt_fw_up() {  # устройство [nonat]
-  local dev="$1" net tag="awg2-tun-$1"
+  local dev="$1" net wnet tag="awg2-tun-$1"
   net=$(server_net) || return 1
+  # Подсеть WG + обфускатора: его MASQUERADE («всё, что не в wgobf0») стоит в конце
+  wnet=$(sed -n 's/^NET=//p' "$WGOBF_STATE" 2>/dev/null | head -1)
+  valid_cidr "$wnet" || wnet=""
   # nonat — устройство должно видеть адреса клиентов (inbound tun Xray
-  # выбирает выход клиента по его адресу)
+  # выбирает выход клиента по его адресу); клиентам обфускатора — RETURN до их NAT
   if [[ "${2:-}" == nonat ]]; then
     ipt_del -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+    [[ -z "$wnet" ]] || ipt_ins -t nat POSTROUTING -s "$wnet" -o "$dev" -j RETURN -m comment --comment "$tag"
   else
     ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+    [[ -z "$wnet" ]] || ipt_del -t nat POSTROUTING -s "$wnet" -o "$dev" -j RETURN -m comment --comment "$tag"
   fi
   ipt_ins FORWARD -i "$AWG_IF" -o "$dev" -j ACCEPT -m comment --comment "$tag"
   ipt_ins FORWARD -i "$dev" -o "$AWG_IF" -j ACCEPT -m comment --comment "$tag"
@@ -138,9 +219,12 @@ rt_fw_up() {  # устройство [nonat]
   # до клиента доходит не всегда — без клампа крупные TCP-сессии виснут.
   ipt_add -t mangle FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   ipt_add -t mangle FORWARD -i "$dev" -o "$AWG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
+  # Клиенты WG + обфускатора в этом туннеле: NAT и FORWARD для wgobf0 ставит
+  # он сам («всё, что не в wgobf0»), здесь — только MSS на обратном пути
+  ipt_add -t mangle FORWARD -i "$dev" -o "$WGOBF_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   # Обратная проверка пути для адреса клиента ведёт в таблицу туннеля, а не
   # на awg0 — строгий rp_filter такие пакеты молча дропает.
-  rp_filter_loose "$dev" "$AWG_IF"
+  rp_filter_loose "$dev" "$AWG_IF" "$WGOBF_IF"
 }
 
 # Снимает правила и этой версии, и прежних (те ставились без метки).
@@ -162,26 +246,35 @@ rt_fw_down() {  # устройство
 # rt_up УСТРОЙСТВО ТАБЛИЦА ФАЙЛ_КЛИЕНТОВ|- [SRC]
 # «-» вместо файла — вся подсеть клиентов (как у tun2socks).
 rt_up() {  # устройство таблица peers|- [src] [nonat]
-  local dev="$1" table="$2" peers="$3" src="${4:-}" net ip line
+  local dev="$1" table="$2" peers="$3" src="${4:-}" net
   net=$(server_net) || return 1
   if [[ -n "$src" ]]; then
     ip route replace default dev "$dev" src "$src" table "$table" || return 1
   else
     ip route replace default dev "$dev" table "$table" || return 1
   fi
+  rt_fail_route "$table"
+  rt_release_held "$table"
   rt_rules_clear "$table"
   if [[ "$peers" == - ]]; then
     ip rule add from "$net" lookup "$table" priority "$table" || return 1
-  elif [[ -f "$peers" ]]; then
-    while IFS= read -r line; do
-      ip="${line%%|*}"
-      valid_ip "$ip" && ip rule add from "$ip" lookup "$table" priority "$table"
-    done < "$peers"
+  else
+    rt_rules_file "$peers" "$table"
   fi
   rt_fw_up "$dev" "${5:-}"
 }
 
 rt_down() {  # устройство таблица
+  # Режим block и туннель включён — он упал, а не выключен: клиентов не
+  # отпускаем, в таблице остаётся только «недоступно»
+  if [[ "$(rt_fail_mode "$2")" == block ]] && rt_tunnel_on "$2"; then
+    ip route flush table "$2" 2>/dev/null || true
+    ip route replace unreachable default metric 4096 table "$2" 2>/dev/null || true
+    rt_fw_down "$1"
+    mkdir -p "$(dirname "$TUNFAIL_LOG")" 2>/dev/null
+    echo "[$(date '+%F %T')] $1 упал — клиенты удержаны до его возврата (режим «блокировать»)" >> "$TUNFAIL_LOG" 2>/dev/null
+    return 0
+  fi
   rt_rules_clear "$2"
   ip route flush table "$2" 2>/dev/null || true
   rt_fw_down "$1"
@@ -189,6 +282,9 @@ rt_down() {  # устройство таблица
 
 # ── Состояние и взаимоисключение ──────────────────────────
 warp_is_up()  { ip link show "$WARP_IF" &>/dev/null; }
+# WARP включён, а туннеля нет: health-check увёл клиентов напрямую или warp0
+# не поднялся после перезагрузки. Выключенный руками — не сбой (состояния нет).
+warp_failed() { [[ -f "$WARP_STATE" ]] && ! warp_is_up; }
 xray_is_up()  { ip link show "$XRAY_IF" &>/dev/null || unit_active "$XRAY_UNIT"; }
 t2s_is_up()   { unit_active "$T2S_UNIT"; }
 exits_is_up() { unit_active "$EXITS_UNIT"; }
@@ -221,8 +317,12 @@ tunnels_panic_reset() {
     warn "клиенты пойдут напрямую через сервер. Настройки сохранятся."
     ask_yes "  Продолжить? [Y/n]: " y || return 0
   fi
+  # Состояния — раньше остановки и маршрутов: в режиме «блокировать» rt_down
+  # и остановка служб иначе удержали бы клиентов включённого туннеля
+  rm -f "$XRAY_STATE" "$EXITS_STATE" "$WARP_STATE"
   # Автозапуск тоже снимаем: иначе после перезагрузки туннель вернётся
-  for u in "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" "$T2S_UNIT" "$EXITS_UNIT" awg-usque.service awg-warp.service; do
+  for u in "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" "$T2S_UNIT" "$EXITS_HEALTH_TIMER" "$EXITS_UNIT" \
+           awg-usque.service awg-warp.service; do
     systemctl disable --now "$u" &>/dev/null || true
     systemctl reset-failed "$u" &>/dev/null || true
   done
@@ -234,7 +334,6 @@ tunnels_panic_reset() {
     [[ -f "$dev" ]] && rt_fw_down "$(basename "$dev" .conf)"
   done
   for dev in "$XRAY_IF" "$T2S_IF" "$WARP_IF"; do ip link del "$dev" &>/dev/null || true; done
-  rm -f "$XRAY_STATE" "$EXITS_STATE" "$WARP_STATE"
   net=$(server_net 2>/dev/null) || net=""
   dev=$(uplink_iface 2>/dev/null) || dev=""
   # То же, что ставит PostUp сервера — на случай, если его правила сбиты
@@ -249,13 +348,9 @@ tunnels_panic_reset() {
 # ── Выбор клиентов для туннеля ────────────────────────────
 # Правила работающего туннеля пересобираются по списку целиком.
 _tunnel_rules_refresh() {  # файл устройство таблица
-  local ip
   ip link show "$2" &>/dev/null || return 0
   rt_rules_clear "$3"
-  while IFS= read -r ip; do
-    valid_ip "${ip%%|*}" && ip rule add from "${ip%%|*}" lookup "$3" priority "$3"
-  done < "$1"
-  return 0
+  rt_rules_file "$1" "$3"
 }
 
 # tunnel_client warp|xray ИМЯ|all|none on|off
@@ -336,6 +431,8 @@ do_tunnels_menu() {
     echo -e "  ${C}4)${N} AWG exit-ноды       $(_tun_state exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
     echo -e "  ${C}5)${N} Каскад портов       $(cascade_state_line)"
     echo -e "  ${C}6)${N} Шифрованный DNS     $(dns_state_line)"
+    echo -e "  ${C}7)${N} РФ напрямую         $(rudirect_on && echo -e "${G}● включено${N}" || echo -e "${D}○ выключено${N}")"
+    echo -e "  ${C}8)${N} Если туннель упал   $(tunfail_any_block && echo -e "${Y}● где-то «блокировать»${N}" || echo -e "${D}○ напрямую (как было)${N}")"
     echo -e "  ${R}9)${N} Аварийный сброс ${D}— все клиенты напрямую${N}"
     echo -e "  ${W}0)${N} ← Назад"
     read_choice c "${C}  Выбор: ${N}" 0 9 0
@@ -346,6 +443,8 @@ do_tunnels_menu() {
       4) do_exits_menu || true ;;
       5) do_cascade_menu || true ;;
       6) do_dns_menu || true ;;
+      7) do_rudirect_menu || true ;;
+      8) do_tunfail_menu || true ;;
       9) tunnels_panic_reset || true; pause ;;
       0) return 0 ;;
     esac

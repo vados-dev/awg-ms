@@ -183,11 +183,19 @@ _kill_tree() {
   kill -TERM "$1" 2>/dev/null
 }
 
+# Выходим «от сигнала», а не exit 130: иначе в `bash awg2.sh; bash awg-bot-install.sh`
+# оболочка считает Ctrl+C обработанным и запускает следующую команду.
+_die_by_signal() {  # INT|TERM
+  trap - "$1"
+  kill -"$1" $$
+  exit 130
+}
+
 _run_step_abort() {
   [[ -n "$_RUN_STEP_PID" ]] && _kill_tree "$_RUN_STEP_PID"
   printf '\r\033[K\n'
   warn "Прервано пользователем"
-  exit 130
+  _die_by_signal INT
 }
 
 run_step() {
@@ -266,10 +274,17 @@ rand_range() {
   echo $(( lo + r % span ))
 }
 
-rand_name() {  # xkqve_73
+rand_name() {  # qtrbka7 — 6 букв и цифра (SRANDOM — криптостойкий)
   local a='abcdefghijklmnopqrstuvwxyz' s='' i
-  for i in 1 2 3 4 5; do s+="${a:$(rand_range 0 25):1}"; done
-  printf '%s_%02d\n' "$s" "$(rand_range 0 99)"
+  for i in 1 2 3 4 5 6; do s+="${a:$(rand_range 0 25):1}"; done
+  printf '%s%d\n' "$s" "$(rand_range 0 9)"
+}
+
+# Случайное имя, которого нет среди клиентов.
+rand_client_name() {
+  local n i
+  for i in 1 2 3 4 5 6 7 8; do n=$(rand_name); _name_free "$n" && { echo "$n"; return 0; }; done
+  return 1
 }
 
 fmt_duration() {  # 5с / 3м12с / 2ч15м / 3д4ч

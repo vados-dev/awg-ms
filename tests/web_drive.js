@@ -1,5 +1,5 @@
 // web_drive.js — веб-панель в Chromium: вход, обзор (ПК и телефон), лента и нижняя панель, клиенты
-// с карточкой справа (ПК), скачивание, аккаунт, выход.
+// с карточкой справа (ПК), скачивание, ссылка на конфиг, аккаунт, выход.
 // Запускает test_web.py: node web_drive.js ПОРТ ПУТЬ ЛОГИН ПАРОЛЬ КАТАЛОГ_СКРИНШОТОВ
 const { chromium } = require("playwright");
 const [port, base, user, password, out] = process.argv.slice(2);
@@ -8,12 +8,27 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
   const browser = await chromium.launch();
   for (const [name, vp, scale] of [["ПК", { width: 1366, height: 860 }, 1], ["телефон", { width: 390, height: 844 }, 2]]) {
     const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: vp, deviceScaleFactor: scale, acceptDownloads: true });
+    // Сценарий — про «Классику» (лента и нижняя панель); «Карточки» — отдельным шагом ниже
+    await ctx.addInitScript(() => {
+      try {
+        const v = JSON.parse(localStorage.getItem("awg-look") || "null") || {};
+        if (!v.skin) { v.skin = "toolza"; localStorage.setItem("awg-look", JSON.stringify(v)); }
+      } catch (_) { /* без localStorage — как есть */ }
+    });
     const page = await ctx.newPage();
     page.setDefaultTimeout(20000);
     page.on("pageerror", (e) => console.log(`ERR ${name}: ${e}`));
     page.on("request", (r) => { if (!r.url().startsWith(`https://127.0.0.1:${port}/`)) console.log(`ERR ${name}: внешний запрос ${r.url()}`); });
     const u = `https://127.0.0.1:${port}${base}`;
     const step = async (label, fn) => { try { await fn(); say(true, `${name}: ${label}`); } catch (e) { say(false, `${name}: ${label} — ${String(e).split("\n")[0]}`); } };
+    await step("сбой API при старте — понятная ошибка и рабочая форма входа", async () => {
+      await page.route(/\/api\/me$/, (route) => route.abort());
+      try {
+        await page.goto(u, { waitUntil: "domcontentloaded" });
+        await page.waitForSelector("form.login .bad:has-text('Нет связи с сервером')");
+        if (await page.locator("form.login button").isDisabled()) throw new Error("форма входа заблокирована");
+      } finally { await page.unroute(/\/api\/me$/); }
+    });
     await step("экран входа", async () => {
       await page.goto(u, { waitUntil: "networkidle" });
       await page.waitForSelector("form.login input[autocomplete=username]");
@@ -78,6 +93,14 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
           /viewBox="0 0 30 20"/.test(decodeURIComponent(document.getElementById("favicon").getAttribute("href") || "")) === on, on);
         if (await isFlag()) throw new Error("по умолчанию во вкладке флаг, а не знак");
         await page.click(".top button[aria-label='Тема']");
+        // Заголовки разделов темы не перекрыты тем, что под ними (кнопки значка вкладки наезжали на свой)
+        await page.waitForSelector("[data-name=tab-icon]");
+        const overlap = await page.evaluate(() => [...document.querySelectorAll(".tsep")].filter((e) => e.offsetParent)
+          .map((e) => { const n = e.nextElementSibling; const a = e.getBoundingClientRect(), b = n ? n.getBoundingClientRect() : null;
+            return { t: e.textContent, gap: b ? Math.round(b.top - a.bottom) : 99 }; }).filter((x) => x.gap < 4));
+        if (overlap.length) throw new Error("заголовок раздела темы перекрыт: " + JSON.stringify(overlap));
+        await page.evaluate(() => document.querySelector("[data-name=tab-icon]").scrollIntoView({ block: "center" }));
+        await page.screenshot({ path: `${out}/${name}-тема-значок.png` });
         await page.click("[data-name=tab-icon] button:has-text('Флаг страны')");
         await waitFlag(true);
         await page.keyboard.press("Escape");
@@ -181,6 +204,49 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
       if (!/^[\w-]+\.zip$/.test(dz.suggestedFilename())) throw new Error(dz.suggestedFilename());
       const zb = require("fs").readFileSync(await dz.path());
       if (zb.readUInt32LE(0) !== 0x04034b50 || !zb.includes(Buffer.from(dl.suggestedFilename()))) throw new Error("в ZIP нет " + dl.suggestedFilename());
+    });
+    await step("ссылка на конфиг: QR, «Скачать» — alice.conf (форма со своим Origin), чужим адресам ни запроса, ни referrer; отзыв", async () => {
+      const call = (path, body) => page.evaluate(async ([p, b]) => (await fetch(p, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) })).json(), [base + path, body]);
+      const d = await call("api/client/share", { name: "alice" });
+      if (!/^https:\/\/127\.0\.0\.1:\d+\/s\/[\w-]{32}$/.test(d.url || "")) throw new Error("ссылка не создана");
+      let revoked = false;
+      try {
+        const sp = await ctx.newPage(), sent = [];
+        sp.on("request", (r) => sent.push(r));
+        try {
+          await sp.goto(d.url);
+          await sp.click("#show");
+          await sp.waitForSelector("#box:not([hidden])");
+          if (!/^data:image\/png;base64,/.test(await sp.getAttribute("#qr", "src") || "")) throw new Error("нет QR");
+          const [dl] = await Promise.all([sp.waitForEvent("download"), sp.click("form button")]);
+          if (dl.suggestedFilename() !== "alice.conf") throw new Error(dl.suggestedFilename());
+          if (!require("fs").readFileSync(await dl.path(), "utf8").startsWith("[Interface]")) throw new Error("в файле не конфиг");
+          const post = sent.find((r) => r.method() === "POST" && r.url().endsWith("/file"));
+          const origin = post && (await post.allHeaders()).origin;
+          if (origin !== `https://127.0.0.1:${port}`) throw new Error("Origin формы «Скачать»: " + origin);
+          const ext = sent.filter((r) => !/^(https:\/\/127\.0\.0\.1:\d+\/|data:)/.test(r.url()));
+          if (ext.length) throw new Error("внешний запрос со страницы ссылки: " + ext[0].url());
+          // Переход по внешней ссылке шапки без rel и target: запрос перехвачен и не уходит; referrer в нём быть не должно
+          let hdr = null;
+          await sp.route(/^https?:\/\/(?!127\.0\.0\.1[:/])/, async (r) => { hdr = await r.request().allHeaders(); await r.abort(); });
+          await sp.evaluate(() => { const a = document.querySelector(".top a"); a.removeAttribute("target"); a.removeAttribute("rel"); a.click(); });
+          for (let i = 0; i < 20 && !hdr; i++) await sp.waitForTimeout(100);
+          if (!hdr) throw new Error("переход по внешней ссылке не перехвачен");
+          if (hdr.referer) throw new Error("на внешний адрес ушёл Referer");
+        } finally { await sp.close(); }
+        revoked = (await call("api/client/share/revoke", { id: d.id })).ok === true;
+        if (!revoked) throw new Error("ссылка не отозвана");
+        const gp = await ctx.newPage();
+        try {
+          const resp = await gp.goto(d.url);
+          if (resp.status() !== 404) throw new Error("после отзыва — " + resp.status());
+          await gp.waitForSelector("text=Ссылка недействительна");
+        } finally { await gp.close(); }
+      } finally {
+        // Шаг упал раньше — ссылку всё равно отзываем: не оставлять действующую до конца 5 минут
+        if (!revoked) await call("api/client/share/revoke", { id: d.id }).catch(() => {});
+      }
     });
     await step("сессия кончилась при возврате на открытый экран — форма входа нажимается, в снимок не попадает", async () => {
       await page.goto(u + "#/clients");
@@ -321,15 +387,83 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
         await page.waitForURL(/#\/clients$/);
       });
     }
+    await step("«Карточки»: шрифт свой, туннели и клиенты карточками" + (name === "ПК" ? ", лента на месте" : ", меню в шапке"), async () => {
+      await page.evaluate(() => { const v = JSON.parse(localStorage.getItem("awg-look")); v.skin = "cards"; localStorage.setItem("awg-look", JSON.stringify(v)); });
+      await page.goto(u + "#/tunnels");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForSelector(".kstats");
+      await page.waitForSelector(".kcard[data-tunnel=exits]");
+      const st = await page.evaluate(() => ({ rail: !!document.querySelector("#rail a"), tabs: getComputedStyle(document.getElementById("tabbar")).display,
+        burger: !!document.querySelector(".top .kburger"), over: document.documentElement.scrollWidth - document.documentElement.clientWidth }));
+      if (name === "ПК" ? !st.rail || st.burger : st.rail || !st.burger || st.tabs !== "none") throw new Error(JSON.stringify(st));
+      if (st.over > 0) throw new Error("страница шире экрана на " + st.over + " px");
+      await page.waitForFunction(() => [...document.fonts].some((f) => f.family.indexOf("IBM Plex") >= 0 && f.status === "loaded"));
+      await page.screenshot({ path: `${out}/${name}-карточки-туннели.png`, fullPage: true });
+      await page.goto(u + "#/clients");
+      await page.waitForSelector(".kstats");
+      if (name === "ПК") await page.waitForSelector(".ktools .seg button[aria-label='Таблица']");
+      await page.screenshot({ path: `${out}/${name}-карточки-клиенты.png`, fullPage: true });
+      await page.evaluate(() => { const v = JSON.parse(localStorage.getItem("awg-look")); v.skin = "toolza"; localStorage.setItem("awg-look", JSON.stringify(v)); });
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForSelector("#app h1");
+    });
     await step("аккаунт: смена пароля и сессии", async () => {
       await page.goto(u + "#/account");
       await page.waitForSelector("text=Сменить пароль");
       await page.waitForSelector("text=Последние события");
       await page.screenshot({ path: `${out}/${name}-аккаунт.png`, fullPage: true });
     });
-    await step("выход — снова экран входа, API закрыт", async () => {
+    await step("аккаунт: доступ по адресам — сохранить, неверный адрес, обратно «для всех»", async () => {
+      await page.waitForSelector(".acc-access .seg button.on:has-text('Для всех')");
+      await page.click(".acc-access .seg button:has-text('По адресам')");
+      await page.waitForSelector(".acc-access textarea");
+      // Стенд — тот же компьютер: «с самого сервера», свой адрес добавлять незачем
+      await page.waitForSelector(".acc-access >> text=с самого сервера");
+      if (await page.$(".acc-access button:has-text('Мой адрес')")) throw new Error("кнопка «Мой адрес» для 127.0.0.1");
+      await page.fill(".acc-access textarea", "198.51.100.7, 203.0.113.0/24");
+      await page.click(".acc-access button:has-text('Сохранить доступ')");
+      // Экран перерисован с сервера: список — в виде, в каком его сохранил awg2
+      await page.waitForFunction(() => {
+        const t = document.querySelector(".acc-access textarea");
+        return t && t.value === "198.51.100.7/32, 203.0.113.0/24";
+      }).catch(async () => { throw new Error("после сохранения: " + await page.inputValue(".acc-access textarea")); });
+      await page.waitForSelector(".acc-access .seg button.on:has-text('По адресам')");
+      await page.waitForSelector(".acc-access >> text=Изнутри VPN");
+      await page.screenshot({ path: `${out}/${name}-аккаунт-доступ.png`, fullPage: true });
+      await page.fill(".acc-access textarea", "300.1.1.1");
+      await page.click(".acc-access button:has-text('Сохранить доступ')");
+      await page.waitForSelector(".sheet >> text=300.1.1.1");
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() => !document.querySelector(".sheet-bg"));
+      await page.click(".acc-access .seg button:has-text('Для всех')");
+      await page.click(".acc-access button:has-text('Сохранить доступ')");
+      await page.waitForFunction(() => !document.querySelector(".acc-access textarea"));
+      await page.waitForSelector("text=доступ изменён");
+    });
+    await step("аккаунт: длинный адрес IPv6 на 320 px — без горизонтальной прокрутки", async () => {
+      const vp = page.viewportSize();
+      await page.setViewportSize({ width: 320, height: vp.height });
+      await page.route(/\/api\/web\/account$/, async (r) => {
+        const rr = await r.fetch(), j = await rr.json();
+        j.access = Object.assign({}, j.access, { mode: "ip", me: "2001:0db8:85a3:0000:0000:8a2e:0370:7334", me_vpn: false, me_self: false });
+        r.fulfill({ response: rr, body: JSON.stringify(j) });
+      });
+      try {
+        await page.goto(u + "#/account");
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForSelector(".acc-access button:has-text('Мой адрес')");
+        const over = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+        if (over > 0) throw new Error("страница шире экрана на " + over + " px");
+      } finally { await page.unroute(/\/api\/web\/account$/); await page.setViewportSize(vp); }
+    });
+    await step("выход — снова экран входа, API закрыт; во вкладке снова знак Тулзы, не флаг сервера", async () => {
+      const flagNow = () => page.evaluate(() => /viewBox="0 0 30 20"/.test(decodeURIComponent(document.getElementById("favicon").getAttribute("href") || "")));
+      await page.evaluate(() => { LOOK.tab = "flag"; applyLook(true); });
+      await page.waitForFunction(() => S.status && S.status.country);
+      if (!await flagNow()) throw new Error("перед выходом флаг не показан");
       await page.click("#app button:has-text('Выйти')");
       await page.waitForSelector("form.login");
+      if (await flagNow()) throw new Error("на экране входа во вкладке флаг страны сервера");
       await page.goto(u + "#/clients");
       await page.waitForSelector("form.login");
     });

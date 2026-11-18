@@ -1,7 +1,7 @@
 # Главное меню и шапка. Нумерация разделов — как в прежних версиях.
 
 show_header() {
-  local ch="" upd n prof st hint why
+  local ch="" upd n prof st why
   clear
   [[ "$UPDATE_CHANNEL" == beta ]] && ch=" ${Y}[beta]${N}"
   upd=$(update_available || true)
@@ -16,9 +16,8 @@ show_header() {
     prof="AWG $(server_proto), $(profile_label "$(server_profile)")"
     if iface_up; then st="${G}● работает${N}"; else st="${R}○ не поднят${N}"; fi
     echo -e "  Сервер     : ${W}$(endpoint_host):$(server_port)${N}  $st"
+    # Перехода на 3.1 здесь не предлагаем: 2.0 — такой же обычный выбор (Сервер → Протокол)
     echo -e "  Профиль    : ${W}$prof${N}, клиентов ${W}$n${N}"
-    hint=$(proto_upgrade_hint)
-    [[ -n "$hint" ]] && echo -e "  $hint"
   else
     echo -e "  Сервер     : ${D}не создан — Сервер → Создать сервер${N}"
   fi
@@ -40,8 +39,10 @@ do_server_menu() {
     echo -e "  ${C}7)${N} Endpoint ${D}— ${ep:-IP сервера}${N}"
     echo -e "  ${Y}8)${N} Сбросить сервер"
     echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
+    echo -e "  ${C}10)${N} Перенос из Amnezia ${D}— сервер из Docker-контейнера, клиенты без перевыдачи${N}"
+    echo -e "  ${C}11)${N} VK и Max мимо VPN ${D}— $(vkblock_on && echo "включено" || echo "клиенты VPN не ходят в сети VK")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
+    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -52,6 +53,8 @@ do_server_menu() {
       7) do_endpoint_menu || true ;;
       8) do_reset_server || true ;;
       9) do_antiscan_menu || true; continue ;;
+      10) do_amnezia_menu || true ;;
+      11) do_vkblock_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause

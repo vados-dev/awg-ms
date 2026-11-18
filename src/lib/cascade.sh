@@ -162,6 +162,7 @@ cascade_rule_add() {
   (( added )) || return 1
   _cascade_persist
   info "На клиенте Endpoint: ${W}$(public_ip_cached):$in${N}"
+  info "Если на целевом сервере Тулза — добавь там этот адрес в «Сервер → Точки входа»: конфиги и QR клиентов будут с ним"
 }
 
 cascade_list() {
@@ -171,7 +172,7 @@ cascade_list() {
   printf "  ${D}%-3s %-4s %-6s %-16s %-6s %s${N}\n" "#" "" "ВХОД" "ЦЕЛЬ" "ВЫХОД" "КОММЕНТАРИЙ"
   for i in "${!rows[@]}"; do
     IFS='|' read -r p in dst out cm <<< "${rows[$i]}"
-    if iptables-save -t nat 2>/dev/null | grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)"; then mark="${G}●${N}"; else mark="${R}○${N}"; fi
+    if grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" <<< "$(iptables-save -t nat 2>/dev/null)"; then mark="${G}●${N}"; else mark="${R}○${N}"; fi
     printf "  %-3s %b %-4s %-6s %-16s %-6s %s\n" "$((i + 1)))" "$mark" "${p^^}" "$in" "$dst" "$out" "${cm:-—}"
   done
   echo -e "  ${D}● применено, ○ записано, но в iptables нет (Переприменить правила)${N}"
@@ -235,7 +236,7 @@ cascade_uninstall() {
   # Прежние версии меняли политику FORWARD в UFW. Если AWG-сервера нет,
   # вернуть её было бы некому — возвращаем здесь.
   if [[ -f "$CASCADE_UFW_BACKUP" ]] && ! server_exists; then
-    cp -a "$CASCADE_UFW_BACKUP" /etc/default/ufw
+    cp -a "$CASCADE_UFW_BACKUP" "$UFW_DEFAULTS"
     ufw_active && ufw reload &>/dev/null
   fi
   rm -rf "$CASCADE_DIR"

@@ -20,7 +20,7 @@ from typing import Any, Callable
 from aiogram.types import BufferedInputFile, FSInputFile
 from aiohttp import web
 
-from . import __version__, access, admins, alerts, api, icons, media, store
+from . import __version__, access, admins, alerts, api, icons, media, share, store
 from .sections import backup as bk
 from .sections import botself
 from .sections import clients as cls
@@ -30,11 +30,13 @@ from .sections import wgobf
 # Команды awg2 api, открытые панели; первое слово — раздел
 ALLOWED = {"status", "version", "server", "module", "clients", "client", "mimicry", "diag", "backup",
            "tunnels", "warp", "xray", "t2s", "exits", "cascade", "dns", "wgobf", "update", "log", "bot",
-           "cert", "uninstall", "traffic", "antiscan"}
+           "cert", "uninstall", "traffic", "antiscan", "vkblock", "amnezia", "country", "entry", "rudirect"}
 # backup create auto — ротация автобэкапов: «auto 1» стёр бы все, кроме одного;
 # log web — журнал входов веб-панели (адреса, введённые логины), как раздел «Веб-панель» в боте
 OWNER_ONLY = (("uninstall",), ("bot", "uninstall"), ("bot", "webapp", "port"), ("cert", "issue"),
-              ("cert", "use"), ("cert", "remove"), ("backup", "create", "auto"), ("log", "web"))
+              ("cert", "use"), ("cert", "remove"), ("backup", "create", "auto"), ("log", "web"),
+              # Перенос из Amnezia подменяет сервер целиком — как и удаление Тулзы, только владельцу
+              ("amnezia", "migrate"), ("amnezia", "revert"), ("amnezia", "remove"))
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 MAX_ARGS, MAX_ARG = 32, 4000       # правка всех параметров 3.1 — 23 аргумента
 TIMEOUT_MAX = 900
@@ -129,7 +131,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         def deco(fn: Callable[[web.Request, dict, dict], Any]):  # type: ignore[no-untyped-def]
             async def handler(request: web.Request) -> web.StreamResponse:
                 user = user_of(request)
-                return await fn(request, user, await _body(request))
+                try:
+                    return await fn(request, user, await _body(request))
+                except share.PersistenceError as e:
+                    return web.json_response({"error": str(e)}, status=503)
             app.router.add_post(path, handler)
             return fn
         return deco
@@ -170,8 +175,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         job_id = str(body.get("id") or "")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", job_id):
             raise _bad("id задачи")
-        offset = body.get("offset") or 0
-        return _result(await api.job_status(job_id, int(offset) if str(offset).isdigit() else 0))
+        offset = str(body.get("offset") or 0)
+        # isdigit() пускает и «²» (int() на нём падает), а digits > 4300 int() не берёт вовсе
+        return _result(await api.job_status(job_id, int(offset) if offset.isascii() and offset.isdigit()
+                                            and len(offset) < 12 else 0))
 
     # ── Клиенты: то, что знает только бот ──
     @route("/api/clients")
@@ -216,6 +223,31 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         return web.json_response({"ok": True, "text": text, "file": os.path.basename(r.data.get("file") or ""),
                                   "png": base64.b64encode(png).decode() if png else None})
 
+    # Ссылка на конфиг на 5 минут: адрес — тот, по которому админ сам открыл
+    # панель (Mini App или веб-панель), без секретного пути
+    @route("/api/client/share")
+    async def _share(request: web.Request, user: dict, body: dict) -> web.Response:
+        name = _name(body)
+        r = await api.call("clients", "list")
+        rows = r.data if r.ok and isinstance(r.data, list) else []
+        row = next((c for c in rows if c.get("name") == name), None)
+        pub = row.get("pub") if row else None
+        if not pub:
+            return web.json_response({"error": f"Клиента {name} нет"}, status=404)
+        if row.get("amnezia"):
+            return web.json_response({"error": f"Конфиг клиента {name} есть только у него самого: клиент перенесён "
+                                               "из Amnezia. Нужен новый — «Перевыпустить конфиг»"}, status=400)
+        if not share.host_ok(request.host):
+            return web.json_response({"error": "Адрес сервера не распознан"}, status=400)
+        by = f"web:{user.get('first_name', '')}" if user.get("web") else f"tg:{user.get('id')}"
+        token, rid, exp = share.create(name, pub, by)
+        return web.json_response({"ok": True, "url": f"https://{request.host}/s/{token}", "id": rid,
+                                  "exp": exp, "ttl": share.TTL})
+
+    @route("/api/client/share/revoke")
+    async def _share_revoke(request: web.Request, user: dict, body: dict) -> web.Response:
+        return web.json_response({"ok": share.revoke(str(body.get("id") or "")[:16])})
+
     @route("/api/client/add")
     async def _add(request: web.Request, user: dict, body: dict) -> web.Response:
         name = _name(body)
@@ -249,7 +281,7 @@ def setup(app: web.Application, user_of: UserOf) -> None:
 
     @route("/api/settings")
     async def _settings(request: web.Request, user: dict, body: dict) -> web.Response:
-        if body.get("sort") in cls.SORTS:
+        if isinstance(body.get("sort"), str) and body["sort"] in cls.SORTS:
             store.set_setting("clients_sort", body["sort"])
         return web.json_response({"ok": True})
 
@@ -260,10 +292,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         (только владелец: автобэкап уходит владельцам, уведомления — всем)."""
         if any(k in body for k in ("kind", "backup_mode", "backup_keep", "backup_now")):
             _owner(user)
-            if body.get("kind") in alerts.KIND_IDS:
+            if isinstance(body.get("kind"), str) and body["kind"] in alerts.KIND_IDS:
                 alerts.set_enabled(body["kind"], bool(body.get("on")))
             mode, keep = body.get("backup_mode"), body.get("backup_keep")
-            if mode is not None and mode not in alerts.BACKUP_MODES:
+            if mode is not None and not (isinstance(mode, str) and mode in alerts.BACKUP_MODES):
                 raise _bad("backup_mode: off | day | week")
             if keep is not None and keep not in alerts.BACKUP_KEEP:
                 raise _bad("backup_keep: 3 | 7 | 14 | 30")
@@ -378,6 +410,14 @@ def setup(app: web.Application, user_of: UserOf) -> None:
                                   "png": base64.b64encode(png).decode() if png else None,
                                   "mon": store.monitored(store.WGOBF + body["name"])})
 
+    @route("/api/wgobf/rename")
+    async def _wgobf_rename(request: web.Request, user: dict, body: dict) -> web.Response:
+        old, new = _name(body, "old"), _name(body, "new")
+        r = await api.call("wgobf", "rename", old, new)
+        if r.ok:
+            store.rename_note(store.WGOBF + old, store.WGOBF + new)
+        return _result(r)
+
     @route("/api/wgobf/mon")
     async def _wgobf_mon(request: web.Request, user: dict, body: dict) -> web.Response:
         store.set_monitored(store.WGOBF + _name(body), bool(body.get("on")))
@@ -430,7 +470,7 @@ def setup(app: web.Application, user_of: UserOf) -> None:
     async def _admin_del(request: web.Request, user: dict, body: dict) -> web.Response:
         _owner(user)
         uid = str(body.get("uid") or "")
-        if not uid.isdigit():
+        if not uid.isascii() or not uid.isdigit():
             raise _bad("uid — число")
         ok, msg = admins.remove(int(uid), removed_by=int(user["id"]))
         return web.json_response({"ok": ok, "message": msg, "error": "" if ok else msg})

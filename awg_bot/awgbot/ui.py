@@ -69,6 +69,9 @@ def _page(text: str) -> bool:
     return text.startswith("◀️ Стр") or text.endswith("▶️")
 
 
+SUPPORT_URL = "https://t.me/awgToolza/156/157"
+CHANNEL_URL = "https://t.me/awgToolza"
+
 # Цвет кнопки (Bot API: style): зелёная — только «Поддержать 💚», остальные
 # обычные — красные, синие и зелёные разделы и действия рябили в глазах.
 # Третий элемент кнопки задаёт цвет явно ("" — обычная).
@@ -239,6 +242,11 @@ def clip(text: str, limit: int = TEXT_MAX) -> str:
         else:
             open_tags.append(m.group(2))
     return cut + "…" + "".join(f"</{t}>" for t in reversed(open_tags))
+
+
+def awg_port_ok(v: str) -> bool:
+    """Порт AWG и обфускатора, как awg_port_ok в awg2: 1024-65535 или 443 (QUIC)."""
+    return bool(re.fullmatch(r"[0-9]{1,5}", v)) and (1024 <= int(v) <= 65535 or int(v) == 443)
 
 
 def fmt_bytes(n: int | None) -> str:

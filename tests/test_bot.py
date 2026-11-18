@@ -46,6 +46,13 @@ PACK = {"🖥": "111", "👥": "222", "🌐": "333", "🗑": "444", "⭐": "555"
 
 # ── Окружение бота ────────────────────────────────────────
 API = api_wrapper()
+# Каскад до сервера «работает» только с входов 203.0.113.x — остальные проверку не проходят;
+# у сервера есть IPv6, и он готов принимать клиентов
+with open(API) as f:
+    _w = f.read()
+with open(API, "w") as f:
+    f.write(_w.replace('api_main "$@"', 'entry_probe() { [[ "$1" == 203.0.113.* || "$1" == "[2a01:4f8:c0c:1234::1]:"* ]]; }\n'
+                       'public_ip6() { echo 2a01:4f8:c0c:1234::1; }\napi_main "$@"'))
 STATE = os.path.join(TMP, "botstate")
 os.makedirs(STATE)
 BOT_CONF = os.path.join(TMP, "awg-bot.conf")
@@ -62,7 +69,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "awg_bot"))
 
 from awgbot import admins, api as botapi, bot as botmod, jobs, store, ui, webapp  # noqa: E402
 
-USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:")
+USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:",
+              "ent:e:", "cl:ents:", "ex:ordup:")
 
 logging.getLogger("aiogram").setLevel(logging.WARNING)
 
@@ -410,6 +418,8 @@ async def run():
     await press("cl:bpre")
     await say("p")
     await press("cl:bn:ask")
+    text, _ = screen(await say("²"))
+    chk("массовое создание: не-ASCII цифры — повторный вопрос, не исключение", "Нужно число от 1 до 200" in text, text)
     await say("25")
     await press("cl:be:none")
     text, buttons = screen(await press("cl:dsel"))
@@ -532,6 +542,9 @@ async def run():
     chk("возврат в мастер — тот же шаг с прежними ответами", "Версия протокола" in text, text)
     for step in ("proto=2.0", "dns=0"):
         await press(f"srv:w:{step}")
+    await press("srv:w:mtu=ask")
+    text, _ = screen(await say("²"))
+    chk("мастер: не-ASCII MTU — повторный вопрос, не исключение", "MTU — число 1280-1500" in text, text)
     text, buttons = screen(await press("srv:w:mtu=1280"))
     chk("мастер: подсеть — случайная или вручную", "Подсеть" in text and "srv:w:net=ask" in [d for _, d in buttons],
         [text, buttons])
@@ -540,9 +553,14 @@ async def run():
     chk("мастер: не /24 — повторный вопрос", "сеть /24" in text, text)
     text, buttons = screen(await say("10.66.1.7/24"))
     chk("мастер: после подсети — порт", "UDP-порт" in text, text)
-    await press("srv:w:port=")
+    text, _ = screen(await press("srv:w:port=ask"))
+    chk("мастер: вопрос про порт называет 443 (QUIC)", "443 или 1024-65535" in text, text)
+    text, _ = screen(await say("80"))
+    chk("мастер: порт 80 — повторный вопрос", "Порт — 443 или число 1024-65535" in text, text)
+    text, _ = screen(await say("443"))
+    chk("мастер: порт 443 принят — дальше адрес в конфигах", "Адрес в конфигах" in text, text)
     text, _ = screen(await press("srv:w:endpoint="))
-    chk("мастер: итог с подсетью", "Подсеть: 10.66.1.0/24" in text, text)
+    chk("мастер: итог с подсетью и портом 443", "Подсеть: 10.66.1.0/24" in text and "Порт: 443" in text, text)
     long_domain = "a" * 60 + ".example.com"
     await press("srv:epdom")
     text, buttons = screen(await say(long_domain))
@@ -584,8 +602,12 @@ async def run():
 
     await press("cas:add")
     await press("cas:p:udp")
+    text, _ = screen(await say("²"))
+    chk("каскад: не-ASCII входной порт — повторный вопрос, не исключение", "Порт — число 1-65535" in text, text)
     await say("5555")
     await say("5.6.7.8")
+    text, _ = screen(await say("²"))
+    chk("каскад: не-ASCII порт назначения — повторный вопрос, не исключение", "Порт — число 1-65535" in text, text)
     await press("cas:out:5555")
     text, _ = screen(await press("cas:save"))
     chk("мастер каскада добавляет правило", "✅" in text, text)
@@ -644,6 +666,31 @@ async def run():
     text, buttons = screen(await press(node))
     chk("удаление exit-ноды переспрашивает", "n1" in text and ("🗑 Удалить", "ex:delok:n1") in buttons
         and os.path.exists(os.path.join(awg_dir, "awg-exit-n1.conf")), [text, buttons])
+    # Порядок нод: основная и запасные, ⬆️ меняет местами; упавшая нода — с меткой
+    with open(os.path.join(awg_dir, "awg-exit-n2.conf"), "w") as f:
+        f.write("[Interface]\nPrivateKey = X\nTable = off\n\n[Peer]\nEndpoint = 1.2.3.5:51820\n")
+    _, buttons = screen(await press("ex"))
+    chk("две ноды — на экране exit-нод кнопка «Порядок нод»", ("🪂 Порядок нод", "ex:ord") in buttons, buttons)
+    text, buttons = screen(await press("ex:ord"))
+    chk("порядок: n1 основная, n2 запасная, кнопка ⬆️ только у запасной",
+        "1. <b>n1</b> — основная" in text and "2. <b>n2</b> — запасная 1" in text
+        and [d for _, d in buttons if d.startswith("ex:ordup:")] == ["ex:ordup:n2"], [text, buttons])
+    text, buttons = screen(await press("ex:ordup:n2"))
+    with open(os.path.join(awg_dir, "exits_state")) as f:
+        exs = f.read()
+    chk("⬆️ n2 — основная: в состоянии single_exit=n2, n1 запасная",
+        "✅ n2 — основная" in text and "1. <b>n2</b> — основная" in text and "single_exit=n2" in exs
+        and "order=n1" in exs, [text, exs])
+    hdir = os.path.join(ROOT, "run", "exits-health")
+    os.makedirs(hdir, exist_ok=True)
+    with open(os.path.join(hdir, "n2"), "w") as f:
+        f.write("down 3 0 %d nonet\n" % int(time.time()))
+    text, _ = screen(await press("ex:ord"))
+    chk("упавшая n2 — «🔴 не отвечает с …»", "<b>n2</b> — основная · 🔴 не отвечает с" in text, text)
+    os.remove(os.path.join(hdir, "n2"))
+    os.remove(os.path.join(awg_dir, "awg-exit-n2.conf"))
+    with open(os.path.join(awg_dir, "exits_state"), "w") as f:
+        f.write("active\nmode=all\nbalancer=single\nsingle_exit=n1\n")
 
     print("Xray: свой выход клиенту")
     with open(LINKS) as f:
@@ -669,7 +716,7 @@ async def run():
     with open(os.path.join(ROOT, "xray.peers")) as f:
         peers = f.read().split()
     with open(os.path.join(ROOT, "etc/xray/config.json")) as f:
-        own = [r for r in json.load(f)["routing"]["rules"] if r.get("ruleTag") == "client-out"]
+        own = [r for r in json.load(f)["routing"]["rules"] if str(r.get("ruleTag")).startswith("client-out")]
     chk("в списке «IP|выход», в конфиге Xray — правило по адресу",
         "10.23.45.2|nl" in peers and own and own[0]["source"] == ["10.23.45.2"] and own[0]["outboundTag"] == "nl",
         [peers, own])
@@ -751,6 +798,36 @@ async def run():
         f.write(saved_conf)
     store.set_note("alice", "#ping")
 
+    print("Ссылка на конфиг без Mini App")
+    text, _ = screen(await press("cl:shr:alice"))
+    chk("ссылку отдавать некому (Mini App выключена, веб-панели нет) — так и сказано, ссылка не создана",
+        "ни одна из них не работает" in text and "/s/" not in text, text)
+
+    print("Шкала обновления")
+    from awgbot import progress as prog
+    chk("шкала: обновление awg2 и бота — да, прочее — нет",
+        prog.kind(("update", "install")) == "update" and prog.kind(("update", "install", "force")) == "update"
+        and prog.kind(("bot", "update")) == "bot" and prog.kind(("server", "install")) == "")
+    chk("шкала: этап по журналу и следующий", prog.reached("bot", "→ Скачиваю код бота\n→ Зависимости Python...") == (30, 75)
+        and prog.reached("update", "") == (0, 10) and prog.reached("update", "√ Установлено: v1") == (92, 100))
+    pct, steps = 0.0, []
+    for _ in range(60):
+        pct = prog.creep(pct, 30, 75)
+        steps.append(pct)
+    chk("шкала: к следующему этапу понемногу, не дальше него и не назад",
+        steps[0] >= 30 and all(b >= a for a, b in zip(steps, steps[1:])) and max(steps) <= 74 and steps[-1] > 70, steps[-3:])
+    chk("шкала текстом", prog.bar(50) == "▓▓▓▓▓▓░░░░░░ 50%" and prog.bar(100).startswith("▓" * 12), prog.bar(50))
+
+    print("Случайное имя клиента")
+    from awgbot.sections import clients as clmod
+    names = {clmod.rand_name({"alice"}) for _ in range(50)}
+    chk("случайное имя — 6 букв и цифра, разные", all(re.fullmatch(r"[a-z]{6}[0-9]", n) for n in names) and len(names) > 45,
+        sorted(names)[:5])
+    text, buttons = screen(await press("cl:addrnd"))
+    chk("«🎲 Случайное имя» в боте — новое имя по форме и выбор срока",
+        re.search(r"<b>➕ [a-z]{6}[0-9]</b>", text) is not None and "Срок действия" in text, text)
+    await press("cl")
+
     print("Лимит трафика и трафик по дням")
     text, buttons = screen(await press("cl:lim:alice"))
     chk("экран лимита: готовые размеры, свой, период", "Лимит трафика: alice" in text and "без лимита" in text
@@ -771,6 +848,40 @@ async def run():
     chk("обнулить счётчик", "Счётчик обнулён" in alerts(sent), alerts(sent))
     text, _ = screen(await press("cl:ls:alice|off|month"))
     chk("снять лимит", "Лимит:" not in text and "📶 Лимит трафика" in [t for t, _ in screen(SESSION.sent)[1]], text)
+    text, buttons = screen(await press("cl:lim:alice"))
+    chk("экран лимита: что делать при исчерпании — блок (выбран) или замедлять до 1, 2, 5 Мбит/с",
+        "Исчерпал лимит — <b>блокировать</b>" in text
+        and [d for _, d in buttons if d.startswith("cl:lm:")] == ["cl:lm:alice|block", "cl:lm:alice|1", "cl:lm:alice|2",
+                                                                   "cl:lm:alice|5"]
+        and any(t.startswith("✅") and "Блокировать" in t for t, _ in buttons), [text, buttons])
+    text, buttons = screen(await press("cl:lm:alice|2"))
+    chk("«замедлять до 2» — выбрано, в тексте экрана", "Исчерпал лимит — <b>замедлять до 2 Мбит/с</b>" in text
+        and any(t.startswith("✅") and "2 Мбит/с" in t for t, _ in buttons), [text, buttons])
+    await press("cl:ls:alice|50G|month")
+    text, _ = screen(SESSION.sent)
+    chk("в карточке — лимит и что при исчерпании", "Лимит: 0 Б из 50.0 ГБ за месяц (0%) · исчерпал — 🐢 до 2 Мбит/с" in text,
+        text)
+    await press("cl:ls:alice|off|month")
+    await press("cl:lm:alice|block")
+    text, buttons = screen(await press("cl:spd:alice"))
+    chk("экран скорости: без ограничения, готовые 5–100 Мбит/с, своя", "Скорость: alice" in text
+        and "без ограничения" in text and "cl:ss:alice|20" in [d for _, d in buttons]
+        and "cl:ss:alice|ask" in [d for _, d in buttons] and "cl:ss:alice|off" not in [d for _, d in buttons],
+        [text, buttons])
+    text, buttons = screen(await press("cl:ss:alice|20"))
+    chk("скорость 20 — в карточке", "Скорость: 20 Мбит/с" in text and "cl:spd:alice" in [d for _, d in buttons], text)
+    text, buttons = screen(await press("cl:spd:alice"))
+    chk("экран скорости: выбранная отмечена, «Без лимита» появилась",
+        any(t.startswith("✅") and "20 Мбит/с" in t for t, _ in buttons) and "cl:ss:alice|off" in [d for _, d in buttons],
+        buttons)
+    text, _ = screen(await press("cl:ss:alice|ask"))
+    chk("своя скорость — вопрос", "Мбит/с" in text and "10000" in text, text)
+    text, _ = screen(await say("много"))
+    chk("своя скорость: не число — повтор вопроса с причиной", "Мбит/с" in text and "Скорость: 20" not in text, text)
+    text, _ = screen(await say("35"))
+    chk("своя скорость 35", "Скорость: 35 Мбит/с" in text, text)
+    text, _ = screen(await press("cl:ss:alice|off"))
+    chk("снять ограничение скорости", "Скорость:" not in text, text)
     text, buttons = screen(await press("cl:tday:alice"))
     chk("трафик клиента по дням — столбиками", "трафик по дням" in text and "<pre>" in text
         and text.count("\n", text.index("<pre>")) >= 14, text)
@@ -826,6 +937,249 @@ async def run():
     await al.tick(BOT, st2)
     chk("сервер удалён, пока awg0 лежал, — без ложного «снова работает»",
         not any("снова работает" in t for t in said(mark)) and "down_sent" not in st2, [said(mark), st2])
+    # WARP: включён, а туннеля нет — две проверки подряд и кнопка «Включить»; вернулся — с простоем
+    warp = {"failed": True, "state": "off", "probe": {"up": False, "health": False, "failover": False}}
+    probes = []
+
+    async def warp_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"], "warp_block": warp.get("block", False)}}
+        if args[:2] == ("warp", "probe"):
+            probes.append(args)
+            return dict(warp["probe"])
+        return await real_data(*args, **kw)
+    al.api.data = warp_status
+    st3 = {"boot": "boot-B"}
+
+    def warp_said(mark):
+        return [t for t in said(mark) if "WARP" in t]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("WARP упал: первая проверка — молчит", not warp_said(mark), warp_said(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    chk("WARP лежит две проверки — 🟠 с кнопкой «Включить WARP»", len(rep) == 1
+        and rep[0].reply_markup.inline_keyboard[0][0].callback_data == "warp:up"
+        and "Туннели → WARP → ▶️ Включить" in rep[0].text, warp_said(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("пока WARP лежит — молчит", not warp_said(mark), warp_said(mark))
+    warp.update(failed=False, state="up")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("WARP снова работает — с простоем", any("WARP снова работает" in t and "Простой" in t for t in warp_said(mark))
+        and "warp_sent" not in st3, [warp_said(mark), st3])
+    # Выключили руками, пока лежал: это не «снова работает»
+    st4 = {"boot": "boot-B", "warp_down": 2, "warp_since": int(time.time()) - 60, "warp_sent": True}
+    warp.update(failed=False, state="off")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st4)
+    chk("WARP выключили руками, пока лежал, — без ложного «снова работает»",
+        not warp_said(mark) and "warp_sent" not in st4, [warp_said(mark), st4])
+    # Клиентов увёл health-check (метка failover): он уже проверил трижды — сразу, и вернёт WARP сам
+    st5 = {"boot": "boot-B"}
+    warp.update(failed=True, state="off", probe={"up": False, "health": True, "failover": True})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    chk("health-check увёл клиентов — уведомление с первой проверки: вернёт WARP сам",
+        len(rep) == 1 and "Health-check вернёт его сам" in rep[0].text, warp_said(mark))
+    warp.update(failed=False, state="up", probe={"up": True, "health": True, "failover": False, "ok": False})
+    mark, n = len(SESSION.sent), len(probes)
+    await al.tick(BOT, st5)
+    chk("warp0 подняли, а Cloudflare молчит — не «снова работает»: пока сбой не закрыт, бот пингует и с health-check",
+        not warp_said(mark) and st5.get("warp_sent") and probes[n:] == [("warp", "probe", "ping")], [warp_said(mark), probes[n:]])
+    warp["probe"]["ok"] = True
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5)
+    chk("health-check вернул WARP — «снова работает»", any("WARP снова работает" in t for t in warp_said(mark)), warp_said(mark))
+    # «Если туннель упал → блокировать»: клиенты WARP ждут его, а не уходят напрямую
+    st5b = {"boot": "boot-B"}
+    warp.update(failed=True, state="off", block=True, probe={"up": False, "health": True, "failover": True})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5b)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("режим «блокировать»: WARP упал — клиенты ждут без интернета, не «напрямую»; кнопки «Включить» и «Если упал»",
+        len(rep) == 1 and "ждут его без интернета" in rep[0].text and "напрямую" not in rep[0].text
+        and "warp:up" in cbs and "tf" in cbs, [warp_said(mark), cbs])
+    warp.update(block=False)
+    # Без health-check бот проверяет поднятый WARP сам: не отвечает — клиенты без интернета
+    st6 = {"boot": "boot-B"}
+    warp.update(failed=False, state="up", probe={"up": True, "health": False, "failover": False, "ok": False})
+    mark = len(SESSION.sent)
+    n = len(probes)
+    await al.tick(BOT, st6)
+    chk("WARP поднят, но не отвечает: бот проверил сам, первая проверка — молчит",
+        len(probes) == n + 1 and not warp_said(mark), [probes[n:], warp_said(mark)])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st6)
+    rep = [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "WARP не отвечает" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("не отвечает две проверки — 🟠 «клиенты без интернета», перезапуск и health-check кнопками",
+        len(rep) == 1 and "без интернета" in rep[0].text and cbs == ["warp:restart", "warp:health:on"], [warp_said(mark), cbs])
+    warp["probe"]["ok"] = True
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st6)
+    chk("снова отвечает — «снова работает» с простоем",
+        any("WARP снова работает" in t and "Простой" in t for t in warp_said(mark)) and "warp_sent" not in st6, warp_said(mark))
+    # С health-check поднятый WARP бот не пингует: probe отвечает без ok
+    warp.update(probe={"up": True, "health": True})
+    mark, n = len(SESSION.sent), len(probes)
+    await al.tick(BOT, st6)
+    await al.tick(BOT, st6)
+    chk("с health-check бот не тревожит, пока WARP поднят, и не просит пинг",
+        not warp_said(mark) and "warp_down" not in st6 and probes[n:] == [("warp", "probe")] * 2, [warp_said(mark), st6, probes[n:]])
+    # WARP выключен — не проверяет вовсе
+    warp.update(failed=False, state="off")
+    n = len(probes)
+    await al.tick(BOT, st6)
+    chk("WARP выключен — без проверок", len(probes) == n, probes[n:])
+    # Exit-ноды: сторож awg2 выкинул ноду из общего выхода — 🔴 один раз, вернулась — 🟢
+    ex = {"dead": "", "active": "de", "block": False}
+
+    async def exits_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"exits": "up", "exits_dead": ex["dead"], "exits_active": ex["active"],
+                                "exits_block": ex["block"]}}
+        return await real_data(*args, **kw)
+    al.api.data = exits_status
+    st7 = {"boot": "boot-B"}
+
+    def ex_said(mark):
+        return [t for t in said(mark) if "exit-нода" in t]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("exit-ноды живы — молчит", not ex_said(mark), ex_said(mark))
+    ex.update(dead="de:nonet", active="nl")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    rep = [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "exit-нода de" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("нода de без интернета — 🔴 с причиной, новым общим выходом и кнопкой «Exit-ноды»",
+        len(rep) == 1 and "без выхода в интернет" in rep[0].text and "Общий выход теперь: <b>nl</b>" in rep[0].text
+        and cbs == ["ex"], [ex_said(mark), cbs])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("пока нода лежит — молчит", not ex_said(mark), ex_said(mark))
+    ex.update(dead="de:nonet,nl:silent", active="", block=True)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("упала и вторая, живых нет, режим «блокировать» — только про nl: клиенты ждут без интернета",
+        len(ex_said(mark)) == 1 and "exit-нода nl не отвечает" in ex_said(mark)[0]
+        and "ждут их без интернета" in ex_said(mark)[0], ex_said(mark))
+    ex.update(dead="nl:silent", active="de", block=False)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("de вернулась — 🟢 «снова работает» с общим выходом, про nl молчит",
+        len(ex_said(mark)) == 1 and "exit-нода de снова работает" in ex_said(mark)[0]
+        and "Общий выход: <b>de</b>" in ex_said(mark)[0], ex_said(mark))
+    al.set_enabled("exits", False)
+    ex.update(dead="", active="de + nl".replace(" + ", "+"))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("уведомление «Exit-ноды» выключено — молчит, но состояние помнит",
+        not ex_said(mark) and st7.get("exits_dead") == {}, [ex_said(mark), st7])
+    al.set_enabled("exits", True)
+    # Xray: включён, а через выход трафик не идёт (ссылка устарела) — 🟠 с «Диагностикой»
+    xs = {"fail": "notraffic", "xray": "up", "block": False, "probe": {"up": True, "ok": True, "why": ""}}
+    xprobes = []
+
+    async def xray_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"xray": xs["xray"], "xray_fail": xs["fail"], "xray_block": xs["block"]}}
+        if args[:2] == ("xray", "probe"):
+            xprobes.append(args)
+            return dict(xs["probe"])
+        return await real_data(*args, **kw)
+    al.api.data = xray_status
+    st8 = {"boot": "boot-B"}
+
+    def xr_msgs(mark):
+        return [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "Xray" in (m.text or "")]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("Xray: трафик не идёт — первая проверка молчит (перезапуск — не тревога)", not xr_msgs(mark), xr_msgs(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    rep = xr_msgs(mark)
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("две проверки — 🟠 «через выход трафик не идёт», клиенты напрямую, проверь ссылку; кнопки «Диагностика» и «Перезапустить»",
+        len(rep) == 1 and "через выход трафик не идёт" in rep[0].text and "напрямую, с IP сервера" in rep[0].text
+        and "Проверь ссылку выхода" in rep[0].text and "устареть" in rep[0].text and cbs == ["xr:diag", "xr:restart"]
+        and not xprobes, [[m.text for m in rep], cbs, xprobes])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("пока Xray не работает — молчит", not xr_msgs(mark), [m.text for m in xr_msgs(mark)])
+    xs.update(fail="")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("новая ссылка и перезапуск — 🟢 «Xray снова работает» с простоем, по ответу через выход",
+        any("Xray снова работает" in m.text and "Простой" in m.text for m in xr_msgs(mark)) and xprobes
+        and "xray_sent" not in st8, [[m.text for m in xr_msgs(mark)], xprobes])
+    # Работал и отвалился на ходу: маршруты на месте, а выход не отвечает — клиенты без интернета
+    xs["probe"] = {"up": True, "ok": False, "why": "000"}
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    await al.tick(BOT, st8)
+    rep = xr_msgs(mark)
+    chk("выход отвалился на ходу — бот проверил сам, две проверки: 🟠 «Xray не отвечает», клиенты без интернета",
+        len(rep) == 1 and "Xray не отвечает" in rep[0].text and "без интернета" in rep[0].text, [m.text for m in rep])
+    # Выключили руками, пока не работал: это не «снова работает»
+    xs.update(xray="off", probe={"up": False, "ok": False, "why": ""})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("Xray выключили руками, пока не работал, — без ложного «снова работает»",
+        not xr_msgs(mark) and "xray_sent" not in st8, [[m.text for m in xr_msgs(mark)], st8])
+    # «Блокировать»: клиенты ждут Xray; не запущен — своя строка
+    st9 = {"boot": "boot-B"}
+    xs.update(xray="up", fail="notraffic", block=True)
+    await al.tick(BOT, st9)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st9)
+    rep = xr_msgs(mark)
+    chk("режим «блокировать»: клиенты Xray ждут его без интернета, а не напрямую",
+        len(rep) == 1 and "ждут его без интернета" in rep[0].text and "напрямую" not in rep[0].text, [m.text for m in rep])
+    st9 = {"boot": "boot-B"}
+    xs.update(xray="off", fail="down", block=False)
+    await al.tick(BOT, st9)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st9)
+    rep = xr_msgs(mark)
+    chk("Xray включён, а не запущен — 🟠 «Xray не запущен»: перезапусти, не поднимется — «Диагностика»",
+        len(rep) == 1 and "Xray не запущен" in rep[0].text and "Диагностика" in rep[0].text, [m.text for m in rep])
+    # Экран Xray: трафик не идёт — что делать, прямо на экране
+    real_call = botapi.call
+
+    async def xray_call(*args, **kw):
+        if args[:2] == ("xray", "status"):
+            return botapi.Result(True, 0, {"installed": True, "up": True, "tags": ["vl1"], "fail": "notraffic"},
+                                 "  Туннель   : ▲ включён, но через выход трафик не идёт", "")
+        return await real_call(*args, **kw)
+    botapi.call = xray_call
+    try:
+        text, _ = screen(await press("xr"))
+    finally:
+        botapi.call = real_call
+    chk("экран Xray: «Через выход трафик не идёт» — проверь ссылку: Диагностика, добавь новую, старую удали",
+        "Через выход трафик не идёт" in text and "Диагностика" in text and "добавь новую" in text, text)
+    # WARP (wg, настроен): кнопка «Обновить скаут» и версия сканера в подсказке
+    async def warp_call(*args, **kw):
+        if args[:2] == ("warp", "status"):
+            return botapi.Result(True, 0, {"backend": "wg", "configured": True, "up": True, "scout": "0.13.2"},
+                                 "  Туннель : ● WARP FRA", "")
+        return await real_call(*args, **kw)
+    botapi.call = warp_call
+    try:
+        text, buttons = screen(await press("warp"))
+    finally:
+        botapi.call = real_call
+    chk("экран WARP: «🔄 Обновить скаут» рядом с поиском endpoint, в подсказке — версия warpscout",
+        ("🔄 Обновить скаут", "warp:scout") in buttons and "сейчас 0.13.2" in text, [text, buttons])
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",
@@ -893,6 +1247,41 @@ async def run():
     await al.tick(BOT, st)
     chk("диск: после спада ниже 85% — снова тревога", len(said(mark)) == 1 and "93%" in said(mark)[0], said(mark))
     al.api.data, al.disk_pct = real_data, real_disk
+
+    # Пятничное напоминание о поддержке: время — по часам сервера
+    fri = int(time.mktime((2026, 10, 16, 13, 0, 0, 0, 0, -1)))     # пятница, 13:00
+
+    def support(mark):
+        return [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "донаты" in (m.text or "")]
+    admins.add(333, 111)
+    sst = {"support_since": fri - 10 * 86400}
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, sst, fri - 86400)                     # четверг
+    await al.support_tick(BOT, sst, fri - 2 * 3600)                  # пятница, 11:00
+    chk("о поддержке — не в четверг и не до полудня пятницы", not support(mark) and "support" not in sst, sst)
+    await al.support_tick(BOT, sst, fri)
+    sup = support(mark)
+    rows = sup[0].reply_markup.inline_keyboard if sup and sup[0].reply_markup else []
+    chk("пятница после полудня — владельцу, не админу: одна кнопка «Поддержать 💚» ссылкой, зелёная",
+        [m.chat_id for m in sup] == [111] and len(rows) == 1 and len(rows[0]) == 1
+        and rows[0][0].url == "https://t.me/awgToolza/156/157" and rows[0][0].style == "success", [sup, rows])
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, sst, fri + 3 * 3600)
+    chk("в ту же пятницу — один раз", not support(mark))
+    await al.support_tick(BOT, sst, fri + 7 * 86400)
+    chk("через неделю — снова", len(support(mark)) == 1, support(mark))
+    fresh = {}
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, fresh, fri)
+    await al.support_tick(BOT, fresh, fri + 2 * 86400 + 3600)
+    chk("сразу после установки или обновления бота — не пишет (первые 3 дня)",
+        not support(mark) and fresh.get("support_since") == fri, fresh)
+    await press("ntf:t:support")
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, sst, fri + 14 * 86400)
+    chk("выключено в «Уведомлениях» — напоминаний нет", not al.enabled("support") and not support(mark), al.config())
+    al.set_enabled("support", True)
+    admins.remove(333, removed_by=111)
 
     print("Автобэкап")
     text, buttons = screen(await press("bk"))
@@ -1057,10 +1446,11 @@ async def run():
     print("Все экраны")
     screens = ["srv", "mod", "srv:proto", "srv:par", "srv:ep", "srv:install", "srv:reset", "srv:reboot",
                "cl:activity", "cl:exp:alice", "cl:mim:alice", "cl:tun:alice", "cl:ren:alice",
-               "cl:lim:alice", "cl:tday:alice", "cl:tsrv", "ntf", "abk",
+               "cl:lim:alice", "cl:spd:alice", "cl:tday:alice", "cl:tsrv", "ntf", "abk",
                "diag", "diag:status", "diag:dpi", "diag:logs", "diag:log:manager", "diag:sniff",
                "bk", "bk:list", "tun", "tc::warp", "warp", "warp:backend", "xr", "t2s", "ex", "cas", "dns",
-               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web"]
+               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web", "ent", "cl:ent:alice",
+               "rud", "rud:l:direct", "rud:l:tunnel", "tf", "diag:rt", "diag:rt:r"]
     broken = []
     for data in screens:
         sent = await press(data)
@@ -1125,6 +1515,57 @@ async def run():
     chk("архив для Linux — отдельной кнопкой", docs(sent) and docs(sent)[0].document.filename == "wgobf-clus.zip",
         [n for n, _ in sent])
 
+    # Выход клиентов обфускатора: на выбор — только настроенные туннели
+    text, buttons = screen(await press("wo"))
+    chk("обфускатор: «Выход клиентов: напрямую» и кнопка выбора выхода",
+        "Выход клиентов: <b>напрямую</b>" in text and ("🌐 Выход клиентов", "wo:rt:*") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:rt:*"))
+    chk("на выбор — настроенные туннели (WARP не настроен — его нет), свои выходы Xray, какой туннель работает",
+        ("🔘 Напрямую", "wo:rs:*|d") in buttons and not any(d == "wo:rs:*|w" for _, d in buttons)
+        and ("⚪️ Xray: по умолчанию", "wo:rs:*|x") in buttons and ("⚪️ Xray: de", "wo:rs:*|x0") in buttons
+        and "Работает туннель: exit-ноды." in text, [text, buttons])
+    warp_conf, wl = os.path.join(ROOT, "etc/wireguard/warp0.conf"), os.path.join(ROOT, "warp.peers.wgobf")
+    with open(warp_conf, "w") as f:
+        f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n")
+    text, buttons = screen(await press("wo:rt:*"))
+    chk("WARP настроен — «Через WARP» на выбор", ("⚪️ Через WARP", "wo:rs:*|w") in buttons
+        and ("🔘 Напрямую", "wo:rs:*|d") in buttons, buttons)
+    text, buttons = screen(await press("wo:rs:*|w"))
+    chk("«Через WARP» — адреса клиентов обфускатора в списке WARP, экран: выбрано, WARP выключен",
+        os.path.exists(wl) and open(wl).read().split() == ["10.77.1.2"] and ("🔘 Через WARP", "wo:rs:*|w") in buttons
+        and "через WARP</b> — WARP выключен, пока напрямую" in text, [text, buttons])
+    text, buttons = screen(await press("wo"))
+    chk("главный экран: «через WARP — WARP выключен, пока напрямую»",
+        "через WARP</b> — WARP выключен, пока напрямую" in text, text)
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка клиента: выход и кнопка «Маршрут»", "Выход: через WARP" in text
+        and ("🌐 Маршрут", "wo:rt:clus") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:list"))
+    chk("в списке клиентов — выход, если не напрямую", "🌐 через WARP" in text, text)
+    text, buttons = screen(await press("wo:rs:clus|d"))
+    chk("свой выход клиенту — «напрямую»: из списка WARP, экран клиента", not open(wl).read().strip()
+        and "Выход: clus" in text and ("🔘 Напрямую", "wo:rs:clus|d") in buttons, [text, buttons, open(wl).read()])
+    text, buttons = screen(await press("wo:rs:clus|x3"))
+    chk("устаревшая кнопка (выхода нет) — экран выбора заново, без записи", ("🔘 Напрямую", "wo:rs:clus|d") in buttons
+        and not open(wl).read().strip(), [text, buttons])
+    # Exit-ноды есть (две) — общий выход и каждая нода на выбор
+    ex_dir = os.path.join(ROOT, "etc/amnezia/amneziawg")
+    for n in ("q1", "q2"):
+        open(os.path.join(ex_dir, f"awg-exit-{n}.conf"), "w").close()
+    text, buttons = screen(await press("wo:rt:clus"))
+    chk("exit-ноды на выбор: общий выход и каждая нода", ("⚪️ Exit-ноды: общий", "wo:rs:clus|e") in buttons
+        and any(d.startswith("wo:rs:clus|e") and "Нода q2" in t for t, d in buttons), buttons)
+    q2 = next(d for t, d in buttons if "Нода q2" in t)
+    text, buttons = screen(await press(q2))
+    el = os.path.join(ex_dir, "exits_peers.list.wgobf")
+    chk("клиент → нода q2: в списке exit-нод обфускатора «адрес|нода», экран: выбрано (ноды работают)",
+        open(el).read().split() == ["10.77.1.2|q2"] and "через exit-ноду q2</b>\n" in text
+        and any(t.startswith("🔘 Нода q2") for t, _ in buttons), [text, buttons, open(el).read()])
+    await press("wo:rs:clus|d")
+    for n in ("q1", "q2"):
+        os.remove(os.path.join(ex_dir, f"awg-exit-{n}.conf"))
+    os.remove(warp_conf)
+
     # Трафик и мониторинг клиента обфускатора: dump wgobf0 — рукопожатие минуту назад
     import time as _t
     from awgbot import monitor as _mon
@@ -1174,6 +1615,23 @@ async def run():
     chk("нет ответа по обфускатору — офлайн-клиент не даёт второго «офлайн»", not again and "wgobf:clus" in st,
         [again, st])
     os.remove(WG_DUMP)
+
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка клиента обфускатора: кнопка «Переименовать»", ("✏️ Переименовать", "wo:ren:clus") in buttons, buttons)
+    text, _ = screen(await press("wo:ren:clus"))
+    chk("переименование обфускатора: вопрос про новое имя", "Новое имя" in text and "clus" in text, text)
+    text, _ = screen(await say("bad name"))
+    chk("переименование: недопустимое имя — повторный вопрос", "латиница" in text, text)
+    text, _ = screen(await say("clus2"))
+    with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf")) as f:
+        wgc = f.read()
+    chk("переименование обфускатора: карточка с новым именем, мониторинг переехал, комплект — в новом каталоге",
+        "clus2" in text and "# client=clus2\n" in wgc and "# client=clus\n" not in wgc
+        and store.monitored("wgobf:clus2") and not store.monitored("wgobf:clus")
+        and os.path.isfile(os.path.join(ROOT, "root/wgobf/clus2/wg.conf")), [text, wgc, store.notes()])
+    await press("wo:ren:clus2")
+    text, _ = screen(await say("clus"))
+    chk("и обратно — карточка clus", "<b>🛡 clus</b>" in text and store.monitored("wgobf:clus"), text)
 
     text, buttons = screen(await press("wo:install"))
     chk("установка обфускатора: DNS по умолчанию Cloudflare", "DNS клиентов: Cloudflare" in text, text)
@@ -1240,6 +1698,10 @@ async def run():
         and webapp.check_init_data(init_data(111), "1:other") is None
         and webapp.check_init_data(init_data(111, auth=time.time() - 3 * 86400), token) is None
         and webapp.check_init_data("", token) is None)
+    chk("подпись initData: hash не из ASCII — отказ, а не исключение (500 в журнале бота)",
+        webapp.check_init_data(init_data(111).split("&hash=")[0] + "&hash=%D0%BF%D1%80", token) is None
+        and webapp.check_init_data(init_data(111).split("&hash=")[0] + "&hash=\udcff", token) is None
+        and webapp.check_init_data("user=\udcff&auth_date=1&hash=ab", token) is None)
 
     base = f"https://127.0.0.1:{ports[0]}"
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as http:
@@ -1272,6 +1734,21 @@ async def run():
             chk("скрипт панели отдаётся", r.status == 200 and "runJob" in await r.text(), r.status)
         async with http.get(base + "/icons.js") as r:
             chk("иконки панели отдаются", r.status == 200 and "const ICONS" in await r.text(), r.status)
+        async with http.get(base + "/") as r:
+            page, hd = await r.text(), r.headers
+        m = re.search(r'src="app\.js\?v=([0-9a-f]{16})"', page)
+        chk("страница Mini App: сжата gzip, скрипты — с отпечатком версии, сама — со сверкой (ETag)",
+            hd.get("Content-Encoding") == "gzip" and m is not None and re.search(r'src="icons\.js\?v=[0-9a-f]{16}"', page)
+            and hd.get("Cache-Control") == "no-cache" and hd.get("ETag"), dict(hd))
+        async with http.get(base + "/", headers={"If-None-Match": hd.get("ETag", "")}) as r:
+            chk("повторное открытие страницы — 304 без тела", r.status == 304 and not await r.read(), r.status)
+        async with http.get(base + f"/app.js?v={m.group(1) if m else ''}") as r:
+            chk("app.js с отпечатком — сжат и хранится браузером до новой версии", r.status == 200
+                and r.headers.get("Content-Encoding") == "gzip" and "immutable" in r.headers.get("Cache-Control", ""),
+                dict(r.headers))
+        async with http.get(base + "/app.js?v=0123456789abcdef") as r:
+            chk("чужой отпечаток — со сверкой, не «навсегда»", r.headers.get("Cache-Control") == "no-cache",
+                dict(r.headers))
         # Встроенный браузер Telegram Desktop для Windows без WebView2 — Edge 18:
         # ES2017 и ни шагу дальше, иначе панель не запускается вовсе
         legacy = []
@@ -1282,10 +1759,115 @@ async def run():
                               ("разворот объекта", r"\{\s*\.\.\.|,\s*\.\.\.[\w.]+\s*\}"), ("\\p{} в регулярке", r"/[^/\n]*\\p\{")):
                 legacy += [f"{fn}: {what}" for _ in re.findall(pat, code)]
         chk("панель — без синтаксиса новее ES2017 (Edge 18 в Telegram Desktop)", not legacy, legacy)
+        async with http.get(base + "/fonts/plex-mono-latin-500.woff2") as r:
+            chk("шрифт «Карточек» отдаётся: woff2, кэш на неделю", r.status == 200 and (await r.read())[:4] == b"wOF2"
+                and r.headers.get("Content-Type") == "font/woff2" and r.headers.get("Cache-Control") == "public, max-age=604800",
+                [r.status, dict(r.headers)])
+        bad = []
+        for path in ("/fonts/OFL.txt", "/fonts/none.woff2", "/fonts/..%2fapp.js", "/fonts/"):
+            async with http.get(base + path) as r:
+                bad += [path] if r.status != 404 else []
+        chk("шрифты: только .woff2 из своего каталога", not bad, bad)
         async with http.get(base + "/panel.py") as r:
-            chk("кроме страницы, скрипта и иконок — ничего", r.status == 404, r.status)
+            chk("кроме страницы, скрипта, иконок и шрифтов — ничего", r.status == 404, r.status)
+        print("Ссылка на конфиг на 5 минут")
+        from awgbot import share as shmod
+        st, d = await post("/api/client/share")
+        chk("ссылку без подписи Telegram не создать", st == 401, [st, d])
+        st, d = await api_("/api/client/share", {"name": "alice"})
+        surl = d.get("url") or ""
+        tok = surl.rsplit("/", 1)[-1]
+        chk("ссылка: адрес панели без пути, 192 бита, id для отзыва, 5 минут",
+            st == 200 and re.fullmatch(rf"https://127\.0\.0\.1:{ports[0]}/s/[A-Za-z0-9_-]{{32}}", surl) is not None
+            and re.fullmatch(r"[0-9a-f]{12}", d.get("id") or "") and 290 <= d["exp"] - time.time() <= 300, d)
+        raw = open(shmod._file()).read()
+        chk("на диске — только отпечаток ссылки, права 600", tok and tok not in raw and len(json.loads(raw)) >= 1
+            and oct(os.stat(shmod._file()).st_mode & 0o777) == "0o600", raw[:200])
+        async with http.get(base + f"/s/{tok}") as r:
+            page, hd = await r.text(), r.headers
+        chk("страница по ссылке: оболочка без конфига (предпросмотр мессенджеров его не получит), без кэша, "
+            "не индексируется, не во фрейм, строгий CSP, referrer — только своему адресу",
+            r.status == 200 and "PrivateKey" not in page and "Показать QR и конфиг" in page
+            and hd.get("Cache-Control") == "no-store" and "noindex" in hd.get("X-Robots-Tag", "")
+            and hd.get("X-Frame-Options") == "DENY" and "default-src 'none'" in hd.get("Content-Security-Policy", "")
+            and "frame-ancestors 'none'" in hd.get("Content-Security-Policy", "") and hd.get("Referrer-Policy") == "same-origin",
+            [r.status, dict(hd)])
+        chk("в шапке страницы ссылки — «Telegram» со значком слева и «Поддержать» справа, в новой вкладке, без referrer",
+            'href="https://t.me/awgToolza" target="_blank" rel="noopener noreferrer"' in page
+            and 'href="https://t.me/awgToolza/156/157" target="_blank" rel="noopener noreferrer"' in page
+            and "Поддержать" in page and ">Telegram</a>" in page and "<svg" in page, page[:600])
+        async with http.post(base + f"/s/{tok}/data", json={}) as r:
+            sd = await r.json(content_type=None)
+        chk("по кнопке — конфиг, QR и имя файла", r.status == 200 and "PrivateKey" in (sd.get("text") or "")
+            and sd.get("file") == "alice.conf" and (sd.get("qr") is None or len(sd["qr"]) > 100), [r.status, str(sd)[:200]])
+        async with http.post(base + f"/s/{tok}/file") as r:
+            body_ = await r.text()
+            cd = r.headers.get("Content-Disposition", "")
+        chk("файл — alice.conf, вложением", r.status == 200 and cd == 'attachment; filename="alice.conf"'
+            and body_ == sd.get("text"), [r.status, cd])
+        async with http.get(base + "/s.js") as r:
+            chk("скрипт страницы ссылки отдаётся", r.status == 200 and "Скопировать" in await r.text(), r.status)
+        async with http.get(base + "/s/" + "A" * 32) as r:
+            gone = await r.text()
+            chk("чужая ссылка — «недействительна», 404, шапка та же", r.status == 404 and "недействительна" in gone
+                and "https://t.me/awgToolza/156/157" in gone, r.status)
+        st, d2 = await api_("/api/client/share/revoke", {"id": d.get("id")})
+        async with http.post(base + f"/s/{tok}/data", json={}) as r:
+            chk("«Отозвать» — ссылка больше не отдаёт конфиг", st == 200 and d2.get("ok") is True and r.status == 404,
+                [st, d2, r.status])
+        # Истекла: 5 минут прошли
+        st, d = await api_("/api/client/share", {"name": "alice"})
+        tok = d["url"].rsplit("/", 1)[-1]
+        recs = json.loads(open(shmod._file()).read())
+        for v in recs.values():
+            v["exp"] = int(time.time()) - 1
+        with open(shmod._file(), "w") as f:
+            json.dump(recs, f)
+        async with http.get(base + f"/s/{tok}") as r:
+            chk("через 5 минут — недействительна", r.status == 404, r.status)
+        # Под тем же именем уже другой клиент (ключ не совпадает) — ничего
+        st, d = await api_("/api/client/share", {"name": "alice"})
+        tok = d["url"].rsplit("/", 1)[-1]
+        recs = json.loads(open(shmod._file()).read())
+        for v in recs.values():
+            v["pub"] = "OTHERKEY="
+        with open(shmod._file(), "w") as f:
+            json.dump(recs, f)
+        async with http.post(base + f"/s/{tok}/file") as r:
+            chk("клиент с тем же именем, но другим ключом — конфиг не отдаётся", r.status == 404, r.status)
+        st, d = await api_("/api/client/share", {"name": "nobody"})
+        chk("ссылка на несуществующего клиента — отказ", st == 404, [st, d])
+        async with http.post(base + "/api/client/share", json={"name": "alice"},
+                             headers={"Authorization": "tma " + init_data(111), "Host": "evil.example/x"}) as r:
+            chk("подставной Host в адрес ссылки не попадает", r.status == 400, r.status)
+        shmod._fails.clear()
+        codes = []
+        for i in range(shmod.FAIL_MAX + 1):
+            async with http.get(base + "/s/" + f"{i:032d}") as r:
+                codes.append(r.status)
+        shmod._fails.clear()
+        chk("перебор ссылок с одного адреса — 429", codes[:shmod.FAIL_MAX] == [404] * shmod.FAIL_MAX and codes[-1] == 429,
+            codes[-3:])
+
+        text, buttons = screen(await press("cl:shr:alice"))
+        m2 = re.search(r"<code>(https://[^<]+)/s/([A-Za-z0-9_-]{32})</code>", text)
+        chk("бот: «🔗 Ссылка 5 мин» — адрес Mini App, срок и «Отозвать»",
+            m2 is not None and m2.group(1) + "/" == webapp.SERVER.url and "Действует 5 минут" in text
+            and any(d.startswith("cl:shx:alice|") for _, d in buttons), [text, buttons])
+        rid = next((d for _, d in buttons if d.startswith("cl:shx:")), "|").split("|")[1]
+        sent = await press(f"cl:shx:alice|{rid}")
+        async with http.get(base + f"/s/{m2.group(2) if m2 else 'x'}") as r:
+            chk("бот: «Отозвать» гасит ссылку", "Ссылка отозвана" in alerts(sent) and r.status == 404, [alerts(sent), r.status])
+
+
         st, body = await api_("/api/call", {"args": ["status"]})
         chk("панель: общий вызов awg2 api", st == 200 and body["ok"] and body["data"].get("version"), [st, str(body)[:200]])
+        # Неверные типы в теле — отказ или игнор, а не 500 с трейсом
+        st1, _ = await api_("/api/alerts", {"backup_mode": ["x"]})
+        st2, _ = await api_("/api/alerts", {"kind": ["x"], "on": True})
+        st3, _ = await api_("/api/settings", {"sort": ["x"]})
+        st4, _ = await api_("/api/job/status", {"id": "20250101-000000-abcd", "offset": "²"})
+        chk("панель: списки и «²» вместо строк/чисел — не 500", (st1, st2, st3, st4) == (400, 200, 200, 200), [st1, st2, st3, st4])
         st, body = await api_("/api/call", {"args": ["job", "list"]})
         chk("панель: команды вне белого списка — 403", st == 403, [st, body])
         st, body = await api_("/api/call", {"args": "status"})
@@ -1338,6 +1920,8 @@ async def run():
             [st, body])
         st, body = await api_("/api/bot/invites/revoke", {})
         chk("панель: приглашения гасятся", st == 200 and body.get("revoked") == 1 and admins.pending_invites() == 0, body)
+        st, body = await api_("/api/bot/admin/del", {"uid": "²"})
+        chk("панель: не-ASCII uid — 400, не 500", st == 400 and "число" in body.get("error", ""), [st, body])
         st, body = await api_("/api/bot/admin/del", {"uid": 333})
         chk("панель: владелец отзывает доступ", st == 200 and 333 not in admins.invited_ids(), [st, body])
         st, body = await api_("/api/me", {})
@@ -1424,9 +2008,26 @@ async def run():
         st, body = await upload(b"x" * (20 * 1024 * 1024 + 1))
         chk("панель: больше 20 МБ — отказ", st == 400 and "20 МБ" in body.get("error", ""), [st, body])
 
+    await press("app:port")
+    text, _ = screen(await say("²"))
+    chk("Mini App: не-ASCII порт — повторный вопрос, не исключение", "Порт — число 1-65535" in text, text)
     text, _ = screen(await press(f"app:pset:{ports[1]}"))
     chk("смена порта перезапускает сервер", webapp.SERVER.running and webapp.SERVER.url.endswith(f":{ports[1]}/")
         and f"Порт Mini App: {ports[1]}" in text, [text[:200], webapp.SERVER.url])
+
+    # Два перезапуска сервера разом (двойной тап «Перезапустить», порт + сертификат): оба
+    # сносили сервер и поднимали свой — второй не мог занять порт, а первый слушал
+    # без хозяина, и stop() его уже не закрывал
+    res = await asyncio.gather(webapp.SERVER.start(BOT), webapp.SERVER.start(BOT), return_exceptions=True)
+    chk("два перезапуска Mini App разом: оба прошли, сервер работает",
+        all(r is None for r in res) and webapp.SERVER.running and not webapp.SERVER.error, [res, webapp.SERVER.error])
+    port = int(webapp.SERVER.url.rsplit(":", 1)[1].strip("/"))
+    await webapp.SERVER.stop()
+    with socket.socket() as s:
+        s.settimeout(2)
+        listening = s.connect_ex(("127.0.0.1", port)) == 0
+    chk("после stop() порт Mini App закрыт (нет бесхозного слушателя)", not listening)
+    await webapp.SERVER.start(BOT)
 
     WEBAPP_REJECT[0] = True
     text, buttons = screen(await press("app"))
@@ -1554,6 +2155,13 @@ async def run():
             return botapi.Result(True, data={"url": URL, "user": "admin", "password": PW})
         if args[1] == "stop":
             WEBST["active"] = False
+        if args[1] == "access":
+            web_calls.append(args[2:])
+            if "300.1.1.1" in args:
+                return botapi.Result(False, rc=1, error="Не адрес или слишком широкая подсеть: 300.1.1.1")
+            WEBST["access"] = args[2]
+            if args[2] == "ip":
+                WEBST["allow"] = list(args[3:])
         return botapi.Result(True)
     botapi.call = web_call
     text, buttons = screen(await press("web:inst"))
@@ -1575,6 +2183,43 @@ async def run():
     chk("остановка: статус и кнопка «Запустить», ссылки «Открыть» нет",
         "Остановлена" in text and ("▶️ Запустить", "web:start") in buttons
         and not any(d == URL for _, d in buttons), [text, buttons])
+
+    WEBST.update(access="all", allow=[], vpn_url="https://10.8.0.1:41234/AbCdEfGh123456/", vpn_nets=["10.8.0.0/24"])
+    text, buttons = screen(await press("web"))
+    chk("веб-панель: строка «Доступ: для всех» и кнопка «🛡 Доступ»",
+        "🛡 Доступ: для всех" in text and ("🛡 Доступ", "web:acc") in buttons, [text, buttons])
+    text, buttons = screen(await press("web:acc"))
+    chk("экран доступа: три режима, текущий отмечен, адрес изнутри VPN",
+        "Сейчас: <b>для всех</b>" in text and "https://10.8.0.1:41234/AbCdEfGh123456/" in text
+        and ("✅ 🌍 Для всех", "web:acc_all") in buttons and ("📍 По адресам", "web:acc_ip") in buttons
+        and ("🔒 Только через VPN", "web:acc_vpn") in buttons, [text, buttons])
+    text, buttons = screen(await press("web:acc_ip"))
+    chk("вопрос про адреса: не обещает IPv6 — панель слушает IPv4", "IPv6 тоже" not in text and "IPv4" in text, text)
+    text, buttons = screen(await say("300.1.1.1, 198.51.100.7"))
+    chk("неверный адрес — ошибка awg2 и тот же вопрос снова", "300.1.1.1" in text and "⚠️" in text
+        and ("✖️ Отмена", "web:acc") in buttons and WEBST["access"] == "all", [text, buttons])
+    text, buttons = screen(await say("198.51.100.7, 203.0.113.0/24;2001:db8::/32"))
+    chk("«По адресам»: список уходит в awg2 по одному, режим отмечен",
+        web_calls[-2] == ("ip", "198.51.100.7", "203.0.113.0/24", "2001:db8::/32")
+        and "✅ Доступ: по адресам и через VPN" in text and "<code>203.0.113.0/24</code>" in text
+        and ("✅ 📍 По адресам", "web:acc_ip") in buttons, [web_calls[-3:], text, buttons])
+    text, buttons = screen(await press("web:acc_vpn"))
+    chk("«Только через VPN» — с подтверждением", "Снаружи порт панели закроется" in text
+        and ("🔒 Закрыть снаружи", "web:acc_vpnok") in buttons and WEBST["access"] == "ip", [text, buttons])
+    text, buttons = screen(await press("web:acc_vpnok"))
+    chk("«Только через VPN» включён; прежние адреса — одной кнопкой",
+        "Сейчас: <b>только через VPN</b>" in text and ("📍 Прежние адреса (3)", "web:acc_old") in buttons, [text, buttons])
+    text, buttons = screen(await press("web:acc_old"))
+    chk("прежние адреса — снова «по адресам» тем же списком",
+        web_calls[-2] == ("ip", "198.51.100.7", "203.0.113.0/24", "2001:db8::/32") and WEBST["access"] == "ip", web_calls[-3:])
+    text, buttons = screen(await press("web:acc_all"))
+    chk("«Для всех» — одним нажатием (бот — путь назад, если адрес сменился)",
+        web_calls[-2] == ("all",) and "Сейчас: <b>для всех</b>" in text, [web_calls[-3:], text])
+    admin = User(id=333, is_bot=False, first_name="Admin")
+    admins.add(333, 111)
+    denied = [alerts(await press(d, admin)) for d in ("web:acc", "web:acc_all", "web:acc_vpnok", "web:acc_ip")]
+    chk("приглашённому админу доступ к панели не менять", all(len(a) == 1 and "только владелец" in a[0] for a in denied), denied)
+    admins.remove(333, removed_by=111)
     botapi.call = real_call_
 
     print("Антисканер")
@@ -1647,12 +2292,474 @@ async def run():
     no_hourglass("антисканер")
     botapi.call = real_call_
 
+    print("VK и Max мимо VPN")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка «🚫 VK и Max»", ("🚫 VK и Max", "vk") in buttons, buttons)
+    VKST = {"enabled": False, "active": False, "v4": 0, "v6": 0, "updated": 0, "error": "", "dropped": 0}
+    vk_calls = []
+
+    async def vk_call(*args, **kw):
+        if args[:1] != ("vkblock",):
+            return await real_call_(*args, **kw)
+        vk_calls.append((args[1:], kw.get("timeout")))
+        if args[1] == "status":
+            return botapi.Result(True, data=json.loads(json.dumps(VKST)))
+        if args[1] == "on":
+            VKST.update(enabled=True, active=True, v4=204, v6=3, updated=1791500000, dropped=4321,
+                        error="Список сетей VK: в ответе 3 записей <b>")
+        if args[1] == "off":
+            VKST.update(enabled=False, active=False)
+        return botapi.Result(True)
+    botapi.call = vk_call
+    text, buttons = screen(await press("vk"))
+    chk("выключено: что делает и чем грозит, «Включить», журнал, назад в «Сервер»",
+        "⚪️ Выключено" in text and "Max" in text and "мимо туннеля" in text and ("✅ Включить", "vk:on") in buttons
+        and ("📜 Журнал", "diag:log:vkblock|vk") in buttons and ("◀️ Назад", "srv") in buttons
+        and not any(d == "vk:upd" for _, d in buttons), [text, buttons])
+    n = len(vk_calls)
+    text, buttons = screen(await press("vk:on"))
+    chk("включение — с подтверждением и предупреждением про сервисы VK у клиентов",
+        ("✅ Включить", "vk:onok") in buttons and ("✖️ Отмена", "vk") in buttons and "перестанут" in text
+        and not any(c[0][0] == "on" for c in vk_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("vk:onok"))
+    chk("включено: долгий вызов, подсети, счётчик, ошибка экранирована, «Обновить» и «Выключить»",
+        (("on",), 180) in vk_calls and "🟢 Включено · подсетей 207" in text and "Отбито: 4 321 пакетов" in text
+        and "&lt;b&gt;" in text and ("🔄 Обновить список", "vk:upd") in buttons and ("⏹ Выключить", "vk:off") in buttons,
+        [vk_calls[-3:], text, buttons])
+    await press("vk:upd")
+    chk("обновить список — долгий вызов", (("update",), 180) in vk_calls, vk_calls[-3:])
+    text, buttons = screen(await press("vk:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "vk:offok") in buttons, buttons)
+    text, buttons = screen(await press("vk:offok"))
+    chk("выключено снова", (("off",), None) in vk_calls and "⚪️ Выключено" in text, [vk_calls[-3:], text])
+    text, buttons = screen(await press("diag:log:vkblock|vk"))
+    chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
+    no_hourglass("VK и Max")
+    botapi.call = real_call_
+
+    print("РФ напрямую, если туннель упал, куда идёт адрес")
+    text, buttons = screen(await press("tun"))
+    chk("в «Туннелях» — «🇷🇺 РФ напрямую» и «🪂 Если упал», строки их состояния",
+        ("🇷🇺 РФ напрямую", "rud") in buttons and ("🪂 Если упал", "tf") in buttons and "РФ напрямую — выключено" in text
+        and "Если туннель упал — напрямую (как было)" in text, [text, buttons])
+    RUDST = {"enabled": False, "active": False, "ru": 0, "mine": 0, "excl": 0, "updated": 0, "src": "", "error": "",
+             "packets": 0, "bytes": 0, "direct": [], "tunnel": [], "xray_ru": False, "tg": False, "abroad": ""}
+    TF = {"warp": "direct", "xray": "direct", "t2s": "direct", "exits": "direct"}
+    TFL = {"warp": "WARP", "xray": "Xray", "t2s": "tun2socks", "exits": "Exit-ноды WG"}
+    ROUTE = {"rows": []}
+    rt_calls = []
+
+    async def rt_call(*args, **kw):
+        if args[:1] == ("rudirect",):
+            rt_calls.append((args, kw.get("timeout")))
+            a = args[1]
+            if a == "status":
+                return botapi.Result(True, data=json.loads(json.dumps(RUDST)))
+            if a == "on":
+                RUDST.update(enabled=True, active=True, ru=8673, updated=1791500000, src="ipverse", packets=12345,
+                             error="ipdeny.com: не скачался <b>")
+            if a == "off":
+                RUDST.update(enabled=False, active=False)
+            if a == "tg":
+                RUDST["tg"] = args[2] == "on"
+            if a == "add":
+                if args[3] == "bad.example":
+                    return botapi.Result(False, error="Нужен публичный IPv4, подсеть не шире /12 или домен")
+                RUDST[args[2]].append(args[3])
+            if a == "del":
+                RUDST[args[2]] = [] if args[3] == "all" else [x for x in RUDST[args[2]] if x != args[3]]
+            return botapi.Result(True)
+        if args[:2] == ("tunnels", "fail"):
+            rt_calls.append((args, kw.get("timeout")))
+            if args[2:3] == ("set",):
+                for n in (TF if args[3] == "all" else [args[3]]):
+                    TF[n] = args[4]
+                return botapi.Result(True)
+            return botapi.Result(True, data=[{"name": n, "label": TFL[n], "mode": TF[n], "enabled": n in ("warp", "xray"),
+                                              "up": n == "warp", "held": n == "xray" and TF[n] == "block"} for n in TF])
+        if args[:2] == ("diag", "route"):
+            rt_calls.append((args, kw.get("timeout")))
+            if args[3] == "gone.example":
+                return botapi.Result(False, error="Домен gone.example не разрешается в IPv4 с этого сервера")
+            return botapi.Result(True, data={"client": args[2], "input": args[3], "ip": "10.8.1.2", "rows": ROUTE["rows"]})
+        if args[:2] == ("tunnels", "status"):
+            r = await real_call_(*args, **kw)
+            if isinstance(r.data, dict):
+                r.data.update(rudirect=RUDST["enabled"], fail_block="block" in TF.values(),
+                              held="Xray" if TF["xray"] == "block" else "")
+            return r
+        return await real_call_(*args, **kw)
+    botapi.call = rt_call
+
+    text, buttons = screen(await press("rud"))
+    chk("РФ напрямую выключено: что делает, «Включить», свои списки, «Куда идёт», журнал, назад в «Туннели»",
+        "⚪️ Выключено" in text and "мимо него" in text and ("✅ Включить", "rud:on") in buttons
+        and ("📝 Напрямую: 0", "rud:l:direct") in buttons and ("📝 В туннель: 0", "rud:l:tunnel") in buttons
+        and ("🧭 Куда идёт", "diag:rt:r") in buttons and ("📜 Журнал", "diag:log:rudirect|rud") in buttons
+        and ("◀️ Назад", "tun") in buttons and not any(d in ("rud:upd", "rud:fix") for _, d in buttons), [text, buttons])
+    RUDST["abroad"] = "NL"
+    text, buttons = screen(await press("rud:on"))
+    chk("сервер не в России — в подтверждении включения предупреждение", "Сервер не в России (NL)" in text
+        and "блокируют как раз за это" in text and ("✅ Включить", "rud:onok") in buttons, [text, buttons])
+    RUDST["abroad"] = ""
+    n = len(rt_calls)
+    text, buttons = screen(await press("rud:on"))
+    chk("включение — с подтверждением, без вызова до него",
+        ("✅ Включить", "rud:onok") in buttons and ("✖️ Отмена", "rud") in buttons and "адреса сервера" in text
+        and not any(c[0][1:2] == ("on",) for c in rt_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("rud:onok"))
+    chk("включено: долгий вызов, сетей РФ, счётчик, источник, ошибка экранирована, «Обновить», «Починить», «Выключить»",
+        (("rudirect", "on"), 240) in rt_calls and "🟢 Включено · сетей РФ 8 673" in text and "Мимо туннеля: 12 345" in text
+        and "(ipverse)" in text and "&lt;b&gt;" in text and ("🔄 Обновить", "rud:upd") in buttons
+        and ("🛠 Починить", "rud:fix") in buttons and ("⏹ Выключить", "rud:off") in buttons, [rt_calls[-2:], text, buttons])
+    chk("Telegram через туннель: строка и кнопка «✈️ TG напрямую», подсказка, когда она нужна",
+        "✈️ Telegram: через туннель" in text and "«Соединение…»" in text
+        and ("✈️ TG напрямую", "rud:tg:on") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:tg:on"))
+    chk("Telegram напрямую: долгий вызов, итог, кнопка вернуть в туннель, подсказка ушла",
+        (("rudirect", "tg", "on"), 240) in rt_calls and "✅ Telegram напрямую" in text
+        and "✈️ Telegram: напрямую с адреса сервера" in text and "«Соединение…»" not in text
+        and ("✈️ TG в туннель", "rud:tg:off") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:tg:off"))
+    chk("Telegram — снова через туннель", (("rudirect", "tg", "off"), 240) in rt_calls and "✅ Telegram — снова через туннель" in text
+        and ("✈️ TG напрямую", "rud:tg:on") in buttons, [text, buttons])
+    RUDST["abroad"] = "NL"
+    text, _ = screen(await press("rud"))
+    chk("включено на сервере не в России — предупреждение на экране и как поправить страну",
+        "⚠️ Сервер не в России (NL)" in text and "флагом в шапке панели" in text, text)
+    RUDST["abroad"] = ""
+    text, _ = screen(await press("rud"))
+    chk("сервер в России — без предупреждения", "не в России" not in text, text)
+    await press("rud:upd")
+    await press("rud:fix")
+    chk("обновить и починить — долгие вызовы", (("rudirect", "update"), 240) in rt_calls
+        and (("rudirect", "repair"), 240) in rt_calls, rt_calls[-3:])
+    text, buttons = screen(await press("rud:l:direct"))
+    chk("список «всегда напрямую»: что это, пусто, «Добавить», назад к РФ напрямую",
+        "Всегда напрямую" in text and "пока пусто" in text and ("➕ Добавить", "rud:a:direct") in buttons
+        and ("◀️ Назад", "rud") in buttons and not any(d.startswith("rud:x:") for _, d in buttons), [text, buttons])
+    await press("rud:a:direct")
+    text, _ = screen(await say("два слова"))
+    chk("свой адрес: с пробелом — переспрашивает, в awg2 не уходит", "⚠️" in text
+        and not any(c[0][1:2] == ("add",) for c in rt_calls), text)
+    text, _ = screen(await say("bad.example"))
+    chk("свой адрес: отказ awg2 — переспрашивает с причиной", "⚠️" in text and "публичный IPv4" in text, text)
+    text, buttons = screen(await say("https://bank.example/login"))
+    chk("свой адрес: ссылка уходит в awg2 как есть, список показан, запись можно убрать",
+        (("rudirect", "add", "direct", "https://bank.example/login"), 240) in rt_calls and "✅ Добавлено" in text
+        and ("❌ https://bank.example/login", "rud:d:d|https://bank.example/login") in buttons
+        and ("🧹 Очистить", "rud:x:direct") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:d:d|https://bank.example/login"))
+    chk("убрать запись", (("rudirect", "del", "direct", "https://bank.example/login"), 240) in rt_calls and "✅ Убрано" in text,
+        [rt_calls[-2:], text])
+    await press("rud:a:tunnel")
+    await say("77.88.8.0/24")
+    text, buttons = screen(await press("rud:x:tunnel"))
+    chk("очистить — с подтверждением", ("🧹 Очистить", "rud:xok:tunnel") in buttons and ("✖️ Отмена", "rud:l:tunnel") in buttons,
+        buttons)
+    text, buttons = screen(await press("rud:xok:tunnel"))
+    chk("очищено", (("rudirect", "del", "tunnel", "all"), 240) in rt_calls and "пока пусто" in text, text)
+    text, buttons = screen(await press("rud:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "rud:offok") in buttons, buttons)
+    text, buttons = screen(await press("rud:offok"))
+    chk("выключено снова", (("rudirect", "off"), None) in rt_calls and "⚪️ Выключено" in text, text)
+    text, buttons = screen(await press("diag:log:rudirect|rud"))
+    chk("журнал РФ напрямую: подпись, «Назад» — на экран РФ напрямую", "РФ напрямую" in text and ("◀️ Назад", "rud") in buttons,
+        [text, buttons])
+
+    text, buttons = screen(await press("tf"))
+    chk("если туннель упал: оба режима объяснены, четыре туннеля «напрямую», журнал, назад в «Туннели»",
+        "Напрямую" in text and "Блокировать" in text and "адрес сервера не засветится" in text
+        and [b for b in buttons if b[1].startswith("tf:t:")] == [("➡️ WARP", "tf:t:warp"), ("➡️ Xray", "tf:t:xray"),
+                                                                  ("➡️ tun2socks", "tf:t:t2s"), ("➡️ Exit-ноды WG", "tf:t:exits")]
+        and "🟢 работает" in text and "⚪️ выключен" in text and ("📜 Журнал", "diag:log:tunfail|tf") in buttons
+        and ("◀️ Назад", "tun") in buttons and not any(d == "tf:all" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("tf:t:warp"))
+    chk("работающему WARP — «блокировать» сразу, без подтверждения",
+        (("tunnels", "fail", "set", "warp", "block"), None) in rt_calls and ("🛑 WARP", "tf:t:warp") in buttons
+        and ("↪️ Всем напрямую", "tf:all") in buttons, [text, buttons])
+    n = len(rt_calls)
+    text, buttons = screen(await press("tf:t:xray"))
+    chk("включённому, но лежащему Xray — сначала подтверждение: клиенты сразу без интернета",
+        ("🛑 Блокировать", "tf:bok:xray") in buttons and ("✖️ Отмена", "tf") in buttons and "сразу останутся без интернета" in text
+        and not any(c[0][2:3] == ("set",) for c in rt_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("tf:bok:xray"))
+    chk("Xray «блокировать»: удерживает клиентов — видно в строке", (("tunnels", "fail", "set", "xray", "block"), None) in rt_calls
+        and "🔴 упал — клиенты ждут его без интернета" in text, text)
+    text, buttons = screen(await press("tun"))
+    chk("в «Туннелях» видно удержание: строка и кнопка 🔴", "удерживает клиентов: Xray" in text
+        and ("🔴 Если упал", "tf") in buttons, [text, buttons])
+    text, buttons = screen(await press("tf:t:xray"))
+    chk("удержанному — «напрямую» сразу (отпустить)", (("tunnels", "fail", "set", "xray", "direct"), None) in rt_calls, rt_calls[-2:])
+    text, buttons = screen(await press("tf:all"))
+    chk("«Всем напрямую» — как было", (("tunnels", "fail", "set", "all", "direct"), None) in rt_calls
+        and all(v == "direct" for v in TF.values()) and not any(d == "tf:all" for _, d in buttons), [TF, buttons])
+    sent = await press("tf:t:nope")
+    chk("неизвестный туннель — «кнопка устарела»", any("устарела" in a for a in alerts(sent)), alerts(sent))
+    text, buttons = screen(await press("diag:log:tunfail|tf"))
+    chk("журнал «если упал»: «Назад» — туда же", "Если туннель упал" in text and ("◀️ Назад", "tf") in buttons, [text, buttons])
+
+    text, buttons = screen(await press("diag"))
+    chk("в «Диагностике» — «🧭 Куда идёт»", ("🧭 Куда идёт", "diag:rt") in buttons, buttons)
+    text, buttons = screen(await press("diag:rt:r"))
+    chk("куда идёт адрес из РФ напрямую: список клиентов, «Назад» — в РФ напрямую",
+        ("alice", "diag:rtc:alice|r") in buttons and ("◀️ Назад", "rud") in buttons, buttons)
+    text, buttons = screen(await press("diag:rtc:alice|r"))
+    chk("вопрос адреса; «Отмена» — к списку клиентов", "ya.ru" in text and ("✖️ Отмена", "diag:rt:r") in buttons, [text, buttons])
+    text, _ = screen(await say("ya ru"))
+    chk("адрес с пробелом — переспрашивает", "⚠️" in text and not any(c[0][:2] == ("diag", "route") for c in rt_calls), text)
+    text, _ = screen(await say("gone.example"))
+    chk("домен не разрешается — переспрашивает с причиной", "⚠️" in text and "не разрешается" in text, text)
+    ROUTE["rows"] = [{"ip": "1.1.1.1", "kind": "held", "dev": "", "note": "туннель лежит, режим «блокировать» <b>"},
+                     {"ip": "77.88.8.8", "kind": "rudirect", "dev": "eth0", "note": "напрямую с сервера — сеть России"},
+                     {"ip": "8.8.8.8", "kind": "warp", "dev": "warp0", "note": "через WARP"}]
+    text, buttons = screen(await say("https://ya.ru/x"))
+    chk("итог: каждый адрес с видом и пояснением (экранировано), подсказки «Если упал» и «В туннель», ещё раз и назад",
+        (("diag", "route", "alice", "https://ya.ru/x"), None) in rt_calls and "alice</b> (10.8.1.2)" in text
+        and "🔴 <code>1.1.1.1</code>" in text and "🇷🇺 <code>77.88.8.8</code>" in text and "🟢 <code>8.8.8.8</code> — через WARP" in text
+        and "&lt;b&gt;" in text and "Если упал" in text and "В туннель" in text
+        and ("🔄 Другой адрес", "diag:rtc:alice|r") in buttons and ("◀️ Назад", "rud") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:tun:alice"))
+    chk("маршрут клиента — кнопка «🧭 Куда идёт»", ("🧭 Куда идёт", "diag:rtc:alice|t") in buttons, buttons)
+    ROUTE["rows"] = [{"ip": "149.154.167.51", "kind": "rudirect", "dev": "eth0",
+                      "note": "напрямую с сервера — Telegram («Telegram напрямую»)"}]
+    text, buttons = screen(await press("diag:rtc:alice|t"))
+    chk("из маршрута клиента: «Отмена» — обратно в маршрут", ("✖️ Отмена", "cl:tun:alice") in buttons, buttons)
+    text, buttons = screen(await say("8.8.8.8"))
+    chk("итог из маршрута клиента: «Назад» — в маршрут клиента", ("◀️ Назад", "cl:tun:alice") in buttons, buttons)
+    chk("Telegram напрямую в итоге — подсказка вернуть Telegram в туннель, а не «В туннель»",
+        "✈️ TG в туннель" in text and "→ В туннель»" not in text, text)
+    no_hourglass("РФ напрямую")
+    botapi.call = real_call_
+
+    print("Точки входа (каскад)")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка «📍 Точки входа»", ("📍 Точки входа", "ent") in buttons, buttons)
+    text, buttons = screen(await press("srv:ep"))
+    chk("в «Endpoint» — про каскад и кнопка «📍 Точки входа»", ("📍 Точки входа", "ent") in buttons and "каскад" in text, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("без точек входа в карточке клиента нет ни строки «Вход», ни кнопки",
+        "Вход:" not in text and not any(d == "cl:ent:alice" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("ent"))
+    chk("экран входов: что это, «напрямую» с адресом сервера, «Добавить», назад в «Сервер»",
+        "каскад" in text and "Напрямую" in text and ("➕ Добавить", "ent:add") in buttons and ("◀️ Назад", "srv") in buttons,
+        [text, buttons])
+    await press("ent:add")
+    text, _ = screen(await say("a|b"))
+    chk("название с «|» — переспрашивает", "⚠️" in text, text)
+    text, _ = screen(await say("Каскад NL"))
+    chk("после названия — спрашивает адрес", "Вход «Каскад NL»" in text and "203.0.113.5:443" in text, text)
+    text, _ = screen(await say("abc"))
+    chk("адрес без порта — переспрашивает", "⚠️" in text, text)
+    text, buttons = screen(await say("203.0.113.5:443"))
+    chk("вход добавлен — итог awg2 и назад к списку входов",
+        "✅" in text and "Каскад NL" in text and "203.0.113.5:443" in text and ("◀️ Назад", "ent") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent"))
+    chk("в списке — новый вход кнопкой и итог проверки",
+        any(t.endswith("Каскад NL") and d == "ent:e:1" for t, d in buttons) and "✅ работает" in text, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("с точками входа — в карточке «Вход: напрямую» и кнопка «📍 Вход»",
+        "Вход: напрямую" in text and ("📍 Вход", "cl:ent:alice") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:ent:alice"))
+    chk("выбор входа клиента: напрямую отмечено, вход — кнопкой с номером",
+        ("🔘 Напрямую", "cl:ents:0|alice") in buttons and ("⚪️ Каскад NL", "cl:ents:1|alice") in buttons
+        and "203.0.113.5:443" in text, [text, buttons])
+    text, buttons = screen(await press("cl:ents:1|alice"))
+    chk("вход клиента сменён: новый Endpoint и кнопка «Конфиг и QR»",
+        "alice" in text and "Каскад NL" in text and "Endpoint: <code>203.0.113.5:443</code>" in text
+        and ("📄 Конфиг и QR", "cl:conf:alice") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("в карточке — вход и его адрес", "Вход: «Каскад NL» — <code>203.0.113.5:443</code>" in text, text)
+    await press("ent")
+    text, buttons = screen(await press("ent:e:1"))
+    chk("карточка входа: адрес, клиентов 1, действия",
+        "203.0.113.5:443" in text and "Клиентов: 1" in text and ("🩺 Проверить", "ent:chk:1") in buttons
+        and ("⭐ Для новых", "ent:def:1") in buttons and ("👥 Всех сюда", "ent:all:1") in buttons
+        and ("🗑 Удалить", "ent:del:1") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:def:1"))
+    chk("«Для новых» — отмечен, кнопка пропала", "⭐ да" in text and not any(d == "ent:def:1" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("ent:e:0"))
+    chk("«напрямую»: без проверки, адреса и удаления", not any(d.startswith(("ent:chk:", "ent:del:", "ent:addr:")) for _, d in buttons)
+        and ("⭐ Для новых", "ent:def:0") in buttons, buttons)
+    await press("ent:def:0")
+    # Выбрать клиентов: отметка, «Всех», «Выдать», конфиги в чат
+    text, buttons = screen(await press("ent:pick:1"))
+    chk("выбор клиентов: alice уже на входе (📍), никто не отмечен",
+        "Никто не отмечен" in text and any(t == "⬜️ alice 📍" and d == "ent:t:1|0|alice" for t, d in buttons)
+        and ("☑️ Всех", "ent:pa:1|0|all") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:t:1|0|bob"))
+    chk("отметка клиента", "Отмечено: 1" in text and ("✅ Выдать: 1", "ent:go:1") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:go:1"))
+    chk("выдача — с подтверждением и адресом", ("✅ Выдать", "ent:gook:1") in buttons and "203.0.113.5:443" in text, [text, buttons])
+    text, buttons = screen(await press("ent:gook:1"))
+    chk("выдано: кому, Endpoint, «Конфиги» в чат", "✅" in text and "bob" in text and ("📨 Конфиги: 1", "ent:send") in buttons,
+        [text, buttons])
+    sent = await press("ent:send")
+    chk("конфиги выбранных — в чат файлами", any(n == "SendDocument" and m.document.filename == "bob_awg2.conf" for n, m in sent),
+        [n for n, _ in sent])
+    text, _ = screen(await press("ent"))
+    chk("на входе теперь двое", "клиентов 2" in text, text)
+    # Новый адрес проверку не проходит — выдача заперта
+    await press("ent:addr:1")
+    text, buttons = screen(await say("198.51.100.9:8443"))
+    chk("новый адрес не доходит — предупреждение", "✅" in text and "не дошли" in text, text)
+    await press("ent")
+    text, buttons = screen(await press("ent:e:1"))
+    chk("запертый вход: итог проверки и 🔒 на выдаче",
+        "❌" in text and "🔒" in text and ("🔒 Выбрать", "ent:lock:1") in buttons and ("🔒 Всех сюда", "ent:lock:1") in buttons,
+        [text, buttons])
+    sent = await press("ent:lock:1")
+    chk("🔒 — объяснение во всплывающем окне", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    sent = await press("ent:pick:1")
+    chk("выбор клиентов на запертом входе не открывается", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    await press("cl:ents:0|alice")
+    text, buttons = screen(await press("cl:ent:alice"))
+    chk("в карточке клиента запертый вход — 🔒, нажатие объясняет",
+        ("🔒 Каскад NL", "cl:entl") in buttons and "❌" in text, [text, buttons])
+    sent = await press("cl:entl")
+    chk("🔒 в карточке — окно с причиной", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    await press("ent")
+    text, buttons = screen(await press("ent:del:1"))
+    chk("удаление входа с клиентами — с подтверждением и предупреждением",
+        ("🗑 Удалить", "ent:delok:1") in buttons and "клиенты (1) перейдут" in text, [text, buttons])
+    text, buttons = screen(await press("ent:delok:1"))
+    chk("вход удалён", "✅" in text and "удалена" in text, text)
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("после удаления последнего входа в карточке снова нет «Вход»", "Вход:" not in text, text)
+    with open(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf")) as f:
+        conf = f.read()
+    chk("в awg0.conf не осталось меток входа", "AWG_ENTRY" not in conf and "entry=" not in conf, conf[:300])
+    no_hourglass("точки входа")
+
+    print("IPv6 сервера — точкой входа")
+    text, buttons = screen(await press("ent"))
+    chk("у сервера есть IPv6 — в «Точках входа» адрес и кнопка «🌐 IPv6 сервера»",
+        "2a01:4f8:c0c:1234::1" in text and ("🌐 IPv6 сервера", "ent:v6") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:v6"))
+    chk("IPv6 сервера добавлен: вход «IPv6» на [IPv6]:порт AWG, проверка пройдена",
+        "✅" in text and "[2a01:4f8:c0c:1234::1]:51820" in text and "Вход работает" in text and ("◀️ Назад", "ent") in buttons,
+        [text, buttons])
+    text, buttons = screen(await press("ent"))
+    v6 = [d for t, d in buttons if t.endswith("IPv6") and d.startswith("ent:e:")]
+    chk("после добавления — вход в списке, кнопки «🌐» нет", v6 and not any(d == "ent:v6" for _, d in buttons), [text, buttons])
+    idx = v6[0].rsplit(":", 1)[-1] if v6 else "1"
+    await press(f"ent:del:{idx}")
+    text, _ = screen(await press(f"ent:delok:{idx}"))
+    with open(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf")) as f:
+        conf = f.read()
+    chk("вход IPv6 удаляется, меток не осталось", "удалена" in text and "AWG_ENTRY" not in conf, [text, conf[:200]])
+    no_hourglass("IPv6 сервера")
+
+    print("WARP: кнопки из уведомлений")
+    started, real_job_w = [], botapi.job_start
+
+    async def warp_job(*args, **kw):
+        started.append(args)
+        return botapi.Result(False, error="тест: задачу не запускаем")
+    botapi.job_start = warp_job
+    await press("warp:restart")
+    chk("«Перезапустить WARP» — задача awg2 warp restart", ("warp", "restart") in started, started)
+    botapi.job_start = real_job_w
+    health_calls = []
+
+    async def warp_health_call(*args, **kw):
+        if args[:2] == ("warp", "health"):
+            health_calls.append(args)
+            return botapi.Result(True)
+        return await real_call_(*args, **kw)
+    botapi.call = warp_health_call
+    await press("warp:health:on")
+    chk("«Включить health-check» — awg2 warp health on", ("warp", "health", "on") in health_calls, health_calls)
+    botapi.call = real_call_
+
+    print("Перенос из Amnezia")
+    AMZ = {"container": "amnezia-awg2", "running": True, "migrated": False, "proto": "3.1", "port": 51888,
+           "net": "10.8.1.0/24", "clients": [{"name": "Petr", "orig": "Пётр <b>", "ip": "10.8.1.1"},
+                                             {"name": "cat", "orig": "cat", "ip": "10.8.1.2"}],
+           "errors": [], "warnings": ["не переносится: PostUp"], "blockers": []}
+    amz_calls, amz_jobs = [], []
+    real_job_ = botapi.job_start
+
+    async def amz_call(*args, **kw):
+        if args[:1] != ("amnezia",):
+            return await real_call_(*args, **kw)
+        amz_calls.append(args[1:])
+        if args[1] in ("status", "scan"):
+            return botapi.Result(True, data=json.loads(json.dumps(AMZ)))
+        return botapi.Result(True, log="Контейнер amnezia-awg2 удалён")
+
+    async def amz_job(*args, **kw):
+        amz_jobs.append(args)
+        return botapi.Result(False, error="тест: задачу не запускаем")
+    botapi.call = amz_call
+    botapi.job_start = amz_job
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка переноса, когда найден контейнер", ("🐳 Перенос из Amnezia", "amz") in buttons, buttons)
+    text, buttons = screen(await press("amz"))
+    chk("экран переноса: протокол, порт, клиенты с исходными именами (экранированы), предупреждения",
+        "AWG 3.1 · порт 51888/udp" in text and "Petr ← Пётр &lt;b&gt;" in text and "cat ←" not in text
+        and "⚠️ не переносится: PostUp" in text and "Клиентов: 2" in text, text)
+    chk("кнопки: перенести, обновить, назад", ("🚚 Перенести", "amz:go") in buttons and ("◀️ Назад", "srv") in buttons, buttons)
+    text, buttons = screen(await press("amz:go"))
+    chk("перенос — с вопросом: контейнер остановится, вернётся сам при ошибке", "остановлен (не удалён)" in text
+        and "вернётся автоматически" in text and ("🚚 Перенести", "amz:gook") in buttons, text)
+    await press("amz:gook")
+    chk("перенос — задачей awg2 amnezia migrate", ("amnezia", "migrate") in amz_jobs, amz_jobs)
+    AMZ["blockers"] = ["components"]
+    text, buttons = screen(await press("amz"))
+    chk("нет компонентов — причина и кнопка установки вместо «Перенести»", "Сначала установи компоненты" in text
+        and ("📦 Компоненты", "srv:install") in buttons and not any(d == "amz:go" for _, d in buttons), buttons)
+    AMZ.update(migrated=True)
+    text, buttons = screen(await press("amz"))
+    chk("после переноса: вернуть или удалить контейнер", "Перенос сделан" in text and ("↩️ Вернуть Amnezia", "amz:rev") in buttons
+        and ("🗑 Удалить контейнер", "amz:rm") in buttons, buttons)
+    await press("amz:revok")
+    chk("возврат — задачей amnezia revert", ("amnezia", "revert") in amz_jobs, amz_jobs)
+    text, _ = screen(await press("amz:rmok"))
+    chk("удаление контейнера — awg2 amnezia remove", ("remove",) in amz_calls and "удалён" in text, [amz_calls[-2:], text])
+    AMZ.clear()
+    AMZ.update(container="", migrated=False)
+    text, buttons = screen(await press("srv"))
+    chk("контейнера нет — кнопки переноса нет", not any(d == "amz" for _, d in buttons), buttons)
+    botapi.job_start = real_job_
+
+    async def imp_call(*args, **kw):
+        r = await real_call_(*args, **kw)
+        if args[:2] == ("clients", "list") and r.ok and isinstance(r.data, list):
+            for c in r.data:
+                if c.get("name") == "alice":
+                    c["amnezia"] = "Алиса"
+        if args[:2] == ("client", "reissue"):
+            amz_calls.append(args)
+            return botapi.Result(False, error="тест: перевыпуск")
+        return r
+    botapi.call = imp_call
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("карточка перенесённого: пометка и исходное имя, «Перевыпустить» вместо конфига, ссылки и мимикрии",
+        "Перенесён из Amnezia («Алиса»)" in text and ("🔁 Перевыпустить конфиг", "cl:rei:alice") in buttons
+        and not any(d in ("cl:conf:alice", "cl:shr:alice", "cl:mim:alice") for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("cl:rei:alice"))
+    chk("перевыпуск — с вопросом: прежний конфиг перестанет подключаться", "перестанет" in text
+        and ("🔁 Перевыпустить", "cl:reiok:alice") in buttons, text)
+    text, _ = screen(await press("cl:reiok:alice"))
+    chk("перевыпуск — awg2 client reissue, ошибка — экраном", ("client", "reissue", "alice") in amz_calls
+        and "тест: перевыпуск" in text, text)
+    text, _ = screen(await press("cl:shr:alice"))
+    chk("ссылку на 5 минут перенесённому не создать — карточка", "Перенесён из Amnezia" in text, text)
+    no_hourglass("перенос из Amnezia")
+    botapi.call = real_call_
+
     print("Ширина экрана")
     short = ui.fit("<b>🛡 alice</b>", ui.kb(("📦 Комплект", "a"), ("🗑 Удалить", "b")))
     chk("короткий текст дополняется до ширины кнопок", short.startswith("<b>🛡 alice</b>")
         and ui.width(short.replace("<b>", "").replace("</b>", "")) >= 2 * (ui.width("📦 Комплект") + 4), short)
     long_text = "<b>Заголовок</b>\n" + "очень длинная строка текста экрана"
     chk("длинный текст не трогается", ui.fit(long_text, ui.kb(("📦 Комплект", "a"))) == long_text)
+
+    print("Порт AWG и обфускатора")
+    chk("ui.awg_port_ok: 443 и 1024-65535 — да; 80, 1023, 65536, мусор — нет",
+        all(ui.awg_port_ok(v) for v in ("443", "1024", "51820", "65535"))
+        and not any(ui.awg_port_ok(v) for v in ("80", "53", "1023", "0", "65536", "", "44x", "١٠٢٤", "000443000")))
 
 
 asyncio.run(run())

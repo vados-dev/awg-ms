@@ -125,14 +125,15 @@ do_install() {
   why=$(reboot_reason)
   if [[ -n "$why" && "$why" != *modprobe* ]]; then
     echo ""
-    warn "Нужна перезагрузка: $why"
+    # «новое ядро … — нужна перезагрузка» уже говорит само за себя
+    if [[ "$why" == *"нужна перезагрузка"* ]]; then warn "$why"; else warn "Нужна перезагрузка: $why"; fi
     if [[ "$why" == *"перезагрузка модуля"* ]]; then
       mod_reload || true
     elif (( ! AUTO_MODE )) && ask_yes "  Перезагрузить сервер сейчас? [Y/n]: " y; then
-      ok "Перезагружаюсь. После — sudo awg2 → Сервер → Создать сервер"
+      ok "Перезагружаюсь. После — sudo awg2 → ${INSTALL_NEXT:-Сервер → Создать сервер}"
       sleep 2; reboot
     fi
-  else
+  elif [[ -z "${INSTALL_NEXT:-}" ]]; then   # из переноса Amnezia — сводка идёт сразу следом
     info "Следующий шаг: Сервер → Создать сервер"
   fi
 }
@@ -206,7 +207,7 @@ setup_autostart() {
 # ── Запись конфигов ───────────────────────────────────────
 # Параметры создаваемого сервера (заполняются меню или --auto).
 S_PROFILE=lite S_PROTO=2.0 S_REGION=world S_DNS="1.1.1.1, 1.0.0.1" MTU=1280
-S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT=""
+S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT="" S_ENDPOINT_V6=0
 
 _postup_lines() {
   local net="$1" dev="$2"
@@ -214,9 +215,10 @@ _postup_lines() {
   echo "PostDown = iptables -t nat -D POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
 }
 
-# Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU.
+# Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU,
+# $7 Endpoint (по умолчанию — сервер напрямую; у клиента точки входа — её адрес).
 write_client_conf() {
-  local f="$1" priv="$2" addr="$3" psk="$4" dns="$5" mtu="$6" srv_pub
+  local f="$1" priv="$2" addr="$3" psk="$4" dns="$5" mtu="$6" ep="${7:-}" srv_pub
   srv_pub=$(conf_iface_get PrivateKey | awg pubkey) || return 1
   {
     echo "[Interface]"
@@ -230,7 +232,7 @@ write_client_conf() {
     echo "[Peer]"
     echo "PublicKey = $srv_pub"
     echo "PresharedKey = $psk"
-    echo "Endpoint = $(endpoint_host):$(server_port)"
+    echo "Endpoint = ${ep:-$(entry_direct)}"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = $(keepalive_for "$(server_proto)")"
   } | write_file "$f" 600
@@ -244,7 +246,7 @@ proto31_cached() {
   bin=$(command -v awg) || return 1
   key="$(mod_tag)|$(stat -c %s:%Y "$bin" 2>/dev/null)|$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null)"
   if [[ -f "$f" ]] && IFS=$'\t' read -r k v < "$f" && [[ "$k" == "$key" && "$v" =~ ^[01]$ ]]; then
-    _PROTO_PROBE[31]=$v           # proto_upgrade_hint в том же вызове не пробует заново
+    _PROTO_PROBE[31]=$v           # повторный вопрос в том же вызове (server info) не пробует заново
     return "$v"
   fi
   proto_supported 3.1 || rc=$?
@@ -326,16 +328,11 @@ server_write() {
 server_start_new() {
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   awg_up_diag || return 1
-  if ufw_active; then
-    ufw_allow "$S_PORT/udp" AmneziaWG && ok "UFW: открыт $S_PORT/udp"
-    if grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw 2>/dev/null; then
-      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-      ufw reload &>/dev/null || true
-      info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
-    fi
-  fi
+  ufw_open "$S_PORT/udp" AmneziaWG
+  ufw_forward_accept
   setup_autostart
   expire_install
+  web_vpn_changed
   log_info "сервер создан: AWG $S_PROTO, профиль $S_PROFILE, порт $S_PORT"
 }
 
@@ -356,7 +353,7 @@ _choose_dns() {
     5) while true; do
          read_line d "${C}  DNS через запятую: ${N}"
          [[ -n "$d" ]] || { S_DNS="1.1.1.1, 1.0.0.1"; break; }
-         [[ "$d" =~ ^[0-9.,[:space:]]+$ ]] && { S_DNS="$d"; break; }
+         valid_dns_list "$d" && { S_DNS="$d"; break; }
          warn "Нужны IPv4-адреса через запятую"
        done ;;
   esac
@@ -481,20 +478,26 @@ _choose_net() {
 _choose_port() {
   local v
   while true; do
-    read_line v "${C}  UDP-порт [Enter = случайный]: ${N}"
+    read_line v "${C}  UDP-порт: 443 или 1024-65535 [Enter = случайный]: ${N}"
     v="${v// /}"
     if [[ -z "$v" ]]; then S_PORT=$(random_free_udp_port) || return 1; return 0; fi
-    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1024 && v <= 65535 )); then
+    if awg_port_ok "$v"; then
       udp_port_busy "$v" && { warn "Порт $v занят"; continue; }
       S_PORT=$v; return 0
     fi
-    warn "Порт — число 1024-65535"
+    warn "Порт — 443 или число 1024-65535"
   done
 }
 
 _choose_endpoint() {
-  local d
-  S_ENDPOINT_DOMAIN=""
+  local d v6
+  S_ENDPOINT_DOMAIN="" S_ENDPOINT_V6=0
+  v6=$(public_ip6)
+  if [[ -n "$v6" ]]; then
+    echo -e "  ${D}У сервера есть IPv6: $v6. Клиенты без IPv6 в своей сети по нему не подключатся —${N}"
+    echo -e "  ${D}тогда в их карточке вход меняется на «напрямую» (IPv4).${N}"
+    ask_yes "  Подключать новых клиентов по IPv6? [y/N]: " n && { S_ENDPOINT_V6=1; return 0; }
+  fi
   ask_yes "  Использовать в конфигах домен вместо IP (переезд без перевыдачи)? [y/N]: " n || return 0
   while true; do
     read_line d "${C}  Домен (Enter — отмена): ${N}"
@@ -533,35 +536,56 @@ server_create() {
     return 1
   fi
   success_box "Сервер создан: AWG $S_PROTO, клиент $S_FIRST_CLIENT"
+  (( S_ENDPOINT_V6 )) && _server_create_ipv6
   echo "Файл конфигурации: $(client_file "$S_FIRST_CLIENT")"
   mimicry_module_warnings
 }
 
+# IPv6 при создании: точка входа «IPv6», она же — для новых клиентов, и
+# первый клиент сразу на ней. Не готов IPv6 — сервер остаётся на IPv4.
+_server_create_ipv6() {
+  local log
+  mktmp log || return 0
+  if entry_add_ipv6 > "$log" && entry_default "$ENTRY_NAME" >> "$log" \
+      && client_entry_set "$S_FIRST_CLIENT" "$ENTRY_NAME" >> "$log"; then
+    ok "Клиенты подключаются по IPv6: $(client_endpoint "$S_FIRST_CLIENT")"
+    info "Клиенту без IPv6 в его сети — вход «напрямую» (IPv4) в его карточке"
+  else
+    grep -E '×|▲' "$log" || true
+    warn "IPv6 не готов — клиенты подключаются по IPv4. Разобраться: Сервер → Точки входа → IPv6 → Проверить"
+  fi
+}
+
 # Создание без вопросов: server_create_opts ключ=значение...
 #   profile=lite|pro  proto=2.0|3.1  region=world|ru  dns="1.1.1.1, 1.0.0.1"
-#   mtu=  port=  net=10.x.y.0/24  endpoint=домен  client=имя  mimicry=строка
+#   mtu=  port=  net=10.x.y.0/24  endpoint=домен|ipv6  client=имя  mimicry=строка
 # Не заданное — как у «AmneziaVPN»: версия 3.1, если компоненты её умеют.
 server_create_opts() {
   local kv k v mim=""
   server_create_ready || return 1
   [[ -n "$REBOOT_WHY" ]] && warn "$REBOOT_WHY"
   S_PROFILE=lite; S_PROTO=""; S_REGION=world; S_DNS="1.1.1.1, 1.0.0.1"; MTU=""
-  S_PORT=""; S_NET=""; S_ENDPOINT_DOMAIN=""; S_FIRST_CLIENT=""
+  S_PORT=""; S_NET=""; S_ENDPOINT_DOMAIN=""; S_FIRST_CLIENT=""; S_ENDPOINT_V6=0
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
       profile) [[ "$v" =~ ^(lite|pro)$ ]] || { err "profile: lite | pro"; return 1; }; S_PROFILE="$v" ;;
       proto) [[ "$v" =~ ^(2\.0|3\.1)$ ]] || { err "proto: 2.0 | 3.1"; return 1; }; S_PROTO="$v" ;;
       region) [[ "$v" =~ ^(world|ru)$ ]] || { err "region: world | ru"; return 1; }; S_REGION="$v" ;;
-      dns) [[ "$v" =~ ^[0-9.,[:space:]]+$ ]] || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
+      dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }; MTU="$v" ;;
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; S_PORT="$v" ;;
       net) valid_cidr "$v" && [[ "${v#*/}" == 24 ]] || { err "net: сеть /24"; return 1; }
            v="${v%.*}.0/24"
            taken_networks | py net-overlaps "$v" >/dev/null && { err "Сеть $v пересекается с адресами сервера"; return 1; }
            S_NET="$v" ;;
-      endpoint) [[ -z "$v" ]] || valid_domain "$v" || { err "endpoint: домен"; return 1; }; S_ENDPOINT_DOMAIN="${v,,}" ;;
+      endpoint) if [[ "$v" == ipv6 ]]; then
+                  [[ -n "$(public_ip6)" ]] || { err "endpoint=ipv6: у сервера нет глобального IPv6"; return 1; }
+                  S_ENDPOINT_V6=1
+                else
+                  [[ -z "$v" ]] || valid_domain "$v" || { err "endpoint: домен или ipv6"; return 1; }; S_ENDPOINT_DOMAIN="${v,,}"
+                fi ;;
       client) _name_free "$v" || { err "Имя клиента недопустимо"; return 1; }; S_FIRST_CLIENT="$v" ;;
       mimicry) mim="$v" ;;
       *) err "Неизвестный параметр: $k"; return 1 ;;
@@ -584,6 +608,12 @@ server_create_opts() {
 
 do_create_server() {
   if ! server_create_ready; then return 1; fi
+  # Сервер Amnezia на этом VPS: перенос сохраняет клиентам их конфиги, новый сервер — нет
+  if amnezia_container &>/dev/null && ! amnezia_migrated; then
+    warn "На сервере есть Amnezia ($(amnezia_container)) — перенеси его: Сервер → Перенос из Amnezia."
+    info "Клиенты останутся со своими конфигами. Новый сервер — новые конфиги всем."
+    ask_yes "  Всё равно создать новый сервер? [y/N]: " n || return 0
+  fi
   if [[ -n "$REBOOT_WHY" ]]; then
     warn "$REBOOT_WHY"
     ask_yes "  Продолжить без перезагрузки? [y/N]: " n || return 0
@@ -608,7 +638,8 @@ do_create_server() {
   echo -e "  Версия   : ${W}AWG $S_PROTO${N}, профиль ${W}$(profile_label "$S_PROFILE")${N}"
   echo -e "  Мимикрия : ${W}$MIMICRY${N}${CPS_DOMAIN:+ ($CPS_DOMAIN)}"
   echo -e "  Подсеть  : ${W}$S_NET${N}, MTU ${W}$MTU${N}, DNS ${W}$S_DNS${N}"
-  echo -e "  Endpoint : ${W}${S_ENDPOINT_DOMAIN:-$(public_ip_cached)}:$S_PORT${N}"
+  if (( S_ENDPOINT_V6 )); then echo -e "  Endpoint : ${W}[$(public_ip6)]:$S_PORT${N} ${D}(IPv6)${N}"
+  else echo -e "  Endpoint : ${W}${S_ENDPOINT_DOMAIN:-$(public_ip_cached)}:$S_PORT${N}"; fi
   ask_yes "  Создать? [Y/n]: " y || { info "Отменено"; return 0; }
   server_create && share_config "$(client_file "$S_FIRST_CLIENT")"
 }
@@ -650,6 +681,33 @@ REPAIR_ISSUES=0 REPAIR_FIXED=0
 _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
+# Файрвол: при включённом UFW порты awg0 и обфускатора открыты (UFW могли
+# включить уже после установки, или на русской локали Тулза его не видела),
+# политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
+# ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
+_repair_firewall() {
+  local p st on=0 what tag
+  for what in AWG обфускатора; do
+    if [[ "$what" == AWG ]]; then server_exists || continue; p=$(server_port); tag=AmneziaWG
+    else wgobf_installed || continue; p=$(wgobf_get PORT); tag="$WGOBF_TAG"; fi
+    st=$(ufw_port_state "$p/udp")
+    case "$st" in
+      open) on=1; ok "UFW: порт $what $p/udp открыт" ;;
+      closed) on=1; _issue "UFW включён, а порт $what $p/udp закрыт"
+              ufw_allow "$p/udp" "$tag" && _fixed "UFW: открыт $p/udp" ;;
+    esac
+  done
+  if (( on )) && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
+    _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
+    ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
+  fi
+  if wgobf_installed && ip link show "$WGOBF_IF" &>/dev/null \
+     && ! iptables -C FORWARD -i "$WGOBF_IF" -j ACCEPT -m comment --comment "$WGOBF_TAG" 2>/dev/null; then
+    _issue "Нет правил файрвола $WGOBF_IF (NAT, FORWARD) — обфускатор без выхода в интернет"
+    wgobf_fw_run up && _fixed "Правила $WGOBF_IF восстановлены"
+  fi
+}
+
 do_repair() {
   local bad conf_n live_n dev net perm rc old
   REPAIR_ISSUES=0 REPAIR_FIXED=0
@@ -674,6 +732,7 @@ do_repair() {
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
   else _issue "Нет автозагрузки модуля"; mod_autoload && _fixed "Автозагрузка настроена"; fi
 
+  _repair_firewall
   server_exists || { err "Сервер не создан"; return 1; }
   if [[ -z "$(conf_marker AWG_OBF_LEVEL)" ]]; then
     # Бот по этой метке решает, сколько пакетов I1-I5 выдать клиенту
@@ -742,17 +801,6 @@ mimicry_module_warnings() {
         "$CLIENT_DIR"/*_awg[23].conf 2>/dev/null | sort -n | tail -1)
   (( ${n:-0} > 3598 )) && warn "Цепочка I1-I5 длиннее $n симв — выше предела awg-tools (буфер 4 КБ)"
   return 0
-}
-
-# Подсказка для шапки: предложить переход на 3.1.
-proto_upgrade_hint() {
-  server_exists || return 0
-  [[ "$(server_proto)" == 3.1 ]] && return 0
-  if proto_supported 3.1; then
-    echo -e "${G}⬆ доступен переход на AWG 3.1${N} ${D}— Сервер → Протокол${N}"
-  else
-    echo -e "${Y}для AWG 3.1 обнови модуль${N} ${D}— Сервер → Модуль ядра${N}"
-  fi
 }
 
 # Снимок конфигов сервера и клиентов — откат, если awg0 не поднимется.
@@ -973,7 +1021,7 @@ do_proto_menu() {
 # ── Endpoint ──────────────────────────────────────────────
 # endpoint_set ДОМЕН|"" [переписать_выданные 1|0] — пусто = публичный IP.
 endpoint_set() {
-  local d="${1,,}" rw="${2:-1}" ep port f
+  local d="${1,,}" rw="${2:-1}" ep port f n
   server_exists || { err "Сервер не создан"; return 1; }
   port=$(server_port)
   if [[ -n "$d" ]]; then
@@ -984,8 +1032,13 @@ endpoint_set() {
   fi
   ok "Endpoint для новых конфигов: $ep"
   if [[ "$rw" == 1 ]]; then
-    while read -r f; do sed -i "s|^Endpoint = .*|Endpoint = $ep|" "$f"; done < <(client_files)
+    # Клиенты на точках входа подключаются через вход — их Endpoint не меняется
+    while read -r n; do
+      f=$(client_file "$n")
+      [[ -f "$f" ]] && sed -i "s|^Endpoint = .*|Endpoint = $ep|" "$f"
+    done < <(py entry "$SERVER_CONF" direct)
     ok "Выданные конфиги обновлены — клиентам нужно забрать новые"
+    [[ -n "$(py entry "$SERVER_CONF" list)" ]] && info "Конфиги клиентов на точках входа не тронуты — у них адрес входа"
   fi
 }
 
@@ -998,8 +1051,9 @@ do_endpoint_menu() {
   echo -e "  Сейчас: ${W}${cur:-$(public_ip_cached)}:$port${N} ${D}(${cur:+домен}${cur:-IP})${N}"
   echo -e "  ${C}1)${N} Задать домен"
   echo -e "  ${C}2)${N} Вернуться на IP"
+  echo -e "  ${C}3)${N} Точки входа ${D}— клиенты через другой сервер (каскад): $(py entry "$SERVER_CONF" list | grep -c . || true)${N}"
   echo -e "  ${W}0)${N} ← Назад"
-  read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+  read_choice c "${C}  Выбор [0-3]: ${N}" 0 3 0
   case "$c" in
     1) while true; do
          read_line d "${C}  Домен (Enter — отмена): ${N}"; d="${d// /}"
@@ -1010,6 +1064,7 @@ do_endpoint_menu() {
        domain_points_here "$d" || ask_yes "  Всё равно задать? [y/N]: " n || return 0 ;;
     2) [[ -n "$cur" ]] || { info "Уже IP"; return 0; }
        d="" ;;
+    3) do_entries_menu; return 0 ;;
     *) return 0 ;;
   esac
   rw=0
@@ -1043,6 +1098,7 @@ server_reset() {
   # Снимок счётчиков — метка жизни таймера: старый после сброса заставил бы
   # сторож «чинить» таймер посреди создания нового сервера
   rm -f "$EXPIRE_STATE_DIR/transfer"
+  web_vpn_changed
   ok "Сервер сброшен. Создать новый: Сервер → Создать сервер"
   log_info "сервер сброшен"
 }

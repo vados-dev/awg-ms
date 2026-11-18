@@ -56,6 +56,7 @@ async def _ntf(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
     await ui.render(cb, "<b>🔔 Уведомления</b>\n\nБот пишет владельцам и админам, когда с сервером что-то "
                         f"случилось; проверка — раз в {max(1, o['interval'] // 60)} мин. Каждое событие — один раз.\n\n"
                         f"{lines}\n\n"
+                        "Напоминание о поддержке — только владельцу, по пятницам, раз в неделю.\n"
                         "Сроки и лимиты трафика клиентов сообщает таймер awg2 — они приходят всегда, "
                         "даже когда бот остановлен.",
                     ui.kb([(f"{'✅' if k['on'] else '⬜️'} {k['short']}", ntf.data("t", k["id"])) for k in o["kinds"]],
@@ -594,7 +595,7 @@ async def _set_port(target: ui.Target, port: str) -> str:
 @ask.on("app_port")
 async def _app_port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg).lower()
-    if v != "off" and not (v.isdigit() and 0 < int(v) < 65536 and v != "80"):
+    if v != "off" and not (v.isascii() and v.isdigit() and 0 < int(v) < 65536 and v != "80"):
         await ask.retry(msg, state, ctx, "Порт — число 1-65535, кроме 80, или off")
         return
     await app_screen(msg, await _set_port(msg, v))

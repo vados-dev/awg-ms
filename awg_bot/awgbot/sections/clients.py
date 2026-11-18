@@ -6,13 +6,16 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import secrets
+import string
 import time
 
 from aiogram import Bot, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 
-from .. import api, ask, media, store, ui
+from .. import api, ask, media, share, store, ui, webapp
+from . import entries
 from ..ui import esc
 
 router = Router()
@@ -65,9 +68,13 @@ def sort_rows(rows: list[dict], mode: str) -> list[dict]:
                                        -(c.get("handshake") or 0), c["name"].lower()))
 
 
+BLOCKED_WORD = {"traffic": "заблокирован: исчерпан лимит трафика",
+                "meta": "заблокирован: повреждена метка срока или лимита"}
+
+
 def seen(c: dict) -> str:
     if c.get("blocked"):
-        return "заблокирован: исчерпан лимит трафика" if c.get("blocked_by") == "traffic" else "заблокирован: срок истёк"
+        return BLOCKED_WORD.get(c.get("blocked_by"), "заблокирован: срок истёк")
     if c.get("online"):
         return f"онлайн ({ui.fmt_dur(c.get('ago'))} назад)"
     if c.get("handshake"):
@@ -210,8 +217,9 @@ async def _export(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 
 def expired_block(c: dict) -> bool:
     """Заблокирован сроком: такие и удаляет «Истёкшие». Заблокированные за
-    трафик остаются — они разблокируются сами в новом месяце."""
-    return bool(c.get("blocked")) and c.get("blocked_by") != "traffic"
+    трафик остаются — они разблокируются сами в новом месяце, за повреждённые
+    метки (meta) — после исправления метки."""
+    return bool(c.get("blocked")) and c.get("blocked_by") == "expire"
 
 
 @act("purge")
@@ -293,7 +301,25 @@ def limit_text(c: dict) -> str:
             f" ({min(999, used * 100 // max(lim, 1))}%)")
 
 
-def card_text(c: dict, route: dict) -> str:
+def speed_text(c: dict) -> str:
+    """«20 Мбит/с», «🐢 2 Мбит/с — лимит исчерпан» или пусто."""
+    sp, slow = c.get("speed"), c.get("limit_slow")
+    if c.get("slowed") and slow and not (sp and sp < slow):
+        return f"🐢 {slow} Мбит/с — лимит трафика исчерпан"
+    return f"{sp} Мбит/с" if sp else ""
+
+
+def entry_text(c: dict, ents: list[dict] | None) -> str:
+    """«Вход: …» — только когда точки входа есть или клиент на входе."""
+    named = [e for e in ents or [] if e.get("name")]
+    if not named and not c.get("entry"):
+        return ""
+    e = next((e for e in ents or [] if e.get("name") == (c.get("entry") or "")), None)
+    addr = f" — <code>{esc(e['addr'])}</code>" if e and e.get("addr") else ""
+    return f"Вход: {'«' + esc(c['entry']) + '»' if c.get('entry') else 'напрямую'}{addr}"
+
+
+def card_text(c: dict, route: dict, ents: list[dict] | None = None) -> str:
     name = c["name"]
     note = store.strip_tag(store.note(name))
     month = c.get("month")
@@ -304,30 +330,42 @@ def card_text(c: dict, route: dict) -> str:
         f"Статус: {icon(c)} {seen(c)}",
         f"Трафик: ↓{ui.fmt_bytes(c.get('rx'))} ↑{ui.fmt_bytes(c.get('tx'))}"
         + (f" · за месяц {ui.fmt_bytes(month)}, сегодня {ui.fmt_bytes(c.get('today'))}" if month is not None else ""),
-        f"Лимит: {limit_text(c)}" if c.get("limit") else "",
+        f"Лимит: {limit_text(c)}" + (f" · исчерпал — 🐢 до {c['limit_slow']} Мбит/с" if c.get("limit_slow") else "")
+        if c.get("limit") else "",
+        f"Скорость: {speed_text(c)}" if speed_text(c) else "",
         f"Адрес клиента: <code>{esc(c['endpoint'].rsplit(':', 1)[0])}</code>" if c.get("endpoint") else "",
         f"Срок: {ui.fmt_expire(c.get('expires'))}",
-        f"Мимикрия: {esc(c['mimicry']) if c.get('mimicry') not in (None, '', 'none') else 'без I1-I5'}",
+        f"Мимикрия: {esc(c['mimicry']) if c.get('mimicry') not in (None, '', 'none') else 'без I1-I5'}"
+        if not c.get("amnezia") else "",
         f"Маршрут: {route_of(c, route)}",
+        entry_text(c, ents),
+        ("🐳 Перенесён из Amnezia" + (f" («{esc(c['amnezia'])}»)" if c["amnezia"] != name else "")
+         + " — конфиг есть только у самого клиента, в Тулзе его можно перевыпустить") if c.get("amnezia") else "",
         f"Заметка: {esc(note)}" if note else "",
         f"Мониторинг: {'🔔 вкл' if store.monitored(name) else '🔕 выкл'}",
     ]))
 
 
 async def card(target: ui.Target, name: str) -> None:
-    c, route = await asyncio.gather(client(name), active_route())
+    c, route, ents = await asyncio.gather(client(name), active_route(), entries.entries())
     if c is None:
         await ui.render(target, f"Клиента <b>{esc(name)}</b> нет.", ui.kb(ui.back("cl")))
         return
     mon = store.monitored(name)
-    await ui.render(target, card_text(c, route), ui.kb(
-        ("📄 Конфиг и QR", act.data("conf", name)),
+    imported = bool(c.get("amnezia"))
+    has_entries = any(e.get("name") for e in ents or []) or bool(c.get("entry"))
+    await ui.render(target, card_text(c, route, ents), ui.kb(
+        ("📄 Конфиг и QR", act.data("conf", name)) if not imported else None,
+        ("🔗 Ссылка 5 мин", act.data("shr", name)) if not imported else None,
+        ("🔁 Перевыпустить конфиг", act.data("rei", name)) if imported else None,
         ("✏️ Переименовать", act.data("ren", name)),
         ("⏳ Срок действия", act.data("exp", name)),
         ("📶 Лимит трафика", act.data("lim", name)),
+        ("🚀 Скорость", act.data("spd", name)),
         ("📊 Трафик по дням", act.data("tday", name)),
-        ("🎭 Мимикрия", act.data("mim", name)),
+        ("🎭 Мимикрия", act.data("mim", name)) if not imported else None,
         ("🌐 Маршрут", act.data("tun", name)) if route["kind"] in ("warp", "xray", "exits") else None,
+        ("📍 Вход", act.data("ent", name)) if has_entries else None,
         ("📝 Заметка", act.data("note", name)),
         ("🔕 Мониторинг" if mon else "🔔 Мониторинг", act.data("mon", name)),
         ("🗑 Удалить", act.data("del", name)),
@@ -343,6 +381,75 @@ async def _view(cb: CallbackQuery, state: FSMContext, name: str) -> None:
 async def _conf(cb: CallbackQuery, state: FSMContext, name: str) -> None:
     await cb.answer()
     await send_config(cb.bot, ui.chat_of(cb).chat.id, name)  # type: ignore[arg-type]
+
+
+@act("rei")
+async def _reissue(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    await ui.confirm(cb, f"<b>🔁 Перевыпустить конфиг {esc(name)}</b>\n\nКлиенту — новый ключ и новый конфиг с QR. "
+                         "Адрес, сроки, лимиты и маршрут остаются, а прежний конфиг (из Amnezia) перестанет "
+                         "подключаться — отправь клиенту новый.",
+                     ("🔁 Перевыпустить", act.data("reiok", name)), act.data("v", name))
+
+
+@act("reiok")
+async def _reissue_ok(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    r = await api.call("client", "reissue", name)
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Перевыпуск конфига"), ui.kb(ui.back(act.data("v", name))))
+        return
+    await cb.answer(f"Новый конфиг: {name}")
+    await send_config(cb.bot, ui.chat_of(cb).chat.id, name)  # type: ignore[arg-type]
+    await card(cb, name)
+
+
+# ── Вход клиента (точка входа, каскад) ────────────────────
+@act("ent")
+async def _entry(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    c, ents = await asyncio.gather(client(name), entries.entries())
+    if c is None or ents is None:
+        await ui.render(cb, f"Клиента <b>{esc(name)}</b> нет." if c is None else "Точки входа не прочитаны.",
+                        ui.kb(ui.back(act.data("v", name))))
+        return
+    await ui.remember(state, "centry", [e["name"] for e in ents])
+    cur = c.get("entry") or ""
+    lines = [f"<b>📍 Вход {esc(name)}</b>", "",
+             "Через какой адрес клиент подключается. После смены в его конфиге и QR новый Endpoint — "
+             "старый конфиг клиенту нужно заменить.", ""]
+    lines += [f"{'🔘' if e['name'] == cur else '⚪️'} {esc(entries.label(e))} — <code>{esc(e.get('addr', ''))}</code>"
+              + (f"\n   {entries.status(e)}" if e.get("name") else "") for e in ents]
+    if any(not entries.usable(e) for e in ents):
+        lines += ["", "🔒 — вход не прошёл проверку, выдать его нельзя."]
+    await ui.render(cb, "\n".join(lines), ui.kb(
+        [(f"{'🔘' if e['name'] == cur else '⚪️' if entries.usable(e) else '🔒'} {entries.label(e)}",
+          act.data("ents", f"{i}|{name}") if entries.usable(e) or e["name"] == cur else act.data("entl"))
+         for i, e in enumerate(ents)],
+        ("📍 Точки входа", "ent"),
+        ui.back(act.data("v", name))))
+
+
+@act("entl")
+async def _entry_locked(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await cb.answer(entries.LOCKED, show_alert=True)
+
+
+@act("ents")
+async def _entry_set(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    idx, _, name = arg.partition("|")
+    ename = await ui.recall(state, "centry", idx)
+    if ename is None:
+        await _entry(cb, state, name)
+        return
+    r = await api.call("client", "entry", name, entries.arg(ename))
+    if not r.ok or not isinstance(r.data, dict):
+        await ui.render(cb, ui.fail(r, f"Вход {name}"), ui.kb(ui.back(act.data("v", name))))
+        return
+    imported = not r.data.get("text")
+    await ui.render(cb, f"✅ <b>{esc(name)}</b> → {'вход «' + esc(ename) + '»' if ename else 'напрямую'}\n"
+                        f"Endpoint: <code>{esc(r.data.get('endpoint', ''))}</code>\n\n"
+                        + ("Конфига в Тулзе нет (перенесён из Amnezia) — адрес войдёт в перевыпущенный."
+                           if imported else "В старом конфиге клиента прежний адрес — отправь ему новый конфиг или QR."),
+                    ui.kb(("📄 Конфиг и QR", act.data("conf", name)) if not imported else None,
+                          ui.back(act.data("v", name), "◀️ К клиенту")))
 
 
 @act("mon")
@@ -564,6 +671,53 @@ async def _exdate(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     await card(msg, ctx["name"])
 
 
+# ── Ссылка на конфиг на 5 минут ───────────────────────────
+async def share_base() -> str:
+    """Чей адрес в ссылке: Mini App, а без неё — веб-панель, если она открыта всем
+    (панель «только через VPN» человеку без VPN ссылку не отдаст)."""
+    if webapp.SERVER.running and webapp.SERVER.url:
+        return webapp.SERVER.url
+    w = await api.data("web", "status", default={}) or {}
+    if w.get("active") and w.get("access") == "all" and w.get("url"):
+        return str(w["url"])
+    return ""
+
+
+@act("shr")
+async def _share(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    c = await client(name)
+    if c is None or not c.get("pub") or c.get("amnezia"):
+        await card(cb, name)
+        return
+    base = await share_base()
+    if not base:
+        await ui.render(cb, "<b>🔗 Ссылка на конфиг</b>\nСсылку отдаёт Mini App или веб-панель с доступом для всех — "
+                            "сейчас ни одна из них не работает. Включи Mini App: Бот → 📱 Mini App.",
+                        ui.kb(ui.back(act.data("v", name))))
+        return
+    try:
+        token, rid, exp = share.create(name, c["pub"], f"tg:{cb.from_user.id}")
+    except share.PersistenceError as e:
+        await cb.answer(str(e), show_alert=True)
+        return
+    await ui.render(cb, f"<b>🔗 Ссылка на конфиг {esc(name)}</b>\n<code>{esc(share.url_for(base, token))}</code>\n\n"
+                        f"Действует 5 минут — до {time.strftime('%H:%M:%S', time.localtime(exp))}. По ней: QR, текст "
+                        "и файл .conf.\nСсылка — это доступ к VPN: отправляй только тому, кому конфиг предназначен.",
+                    ui.kb(("🚫 Отозвать", act.data("shx", f"{name}|{rid}")), ui.back(act.data("v", name))))
+
+
+@act("shx")
+async def _share_revoke(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, _, rid = arg.partition("|")
+    try:
+        revoked = share.revoke(rid)
+    except share.PersistenceError as e:
+        await cb.answer(str(e), show_alert=True)
+        return
+    await cb.answer("Ссылка отозвана" if revoked else "Ссылка уже не действует")
+    await card(cb, name)
+
+
 # ── Лимит трафика ─────────────────────────────────────────
 LIMITS = ["10G", "50G", "100G", "300G"]
 
@@ -578,19 +732,38 @@ async def _lim(cb: CallbackQuery, state: FSMContext, name: str) -> None:
     chosen, _, p = ((await state.get_data()).get("lim_period") or "").rpartition("|")
     period = p if chosen == name and p in PERIOD else c.get("period") or "month"
     other = "total" if period == "month" else "month"
+    slow = c.get("limit_slow")
+    mode = f"замедлять до {slow} Мбит/с" if slow else "блокировать"
     await ui.render(cb, f"<b>📶 Лимит трафика: {esc(name)}</b>\n"
                         f"Сейчас: {limit_text(c) or 'без лимита'}\n"
-                        f"За этот месяц: {ui.fmt_bytes(c.get('month'))}\n\n"
-                        "Исчерпал лимит — клиент блокируется, как истёкший. «В месяц» — счётчик "
-                        "обнуляется 1-го числа, и клиент разблокируется сам; «всего» — считается с "
-                        "момента установки, без сброса.\n\n"
+                        f"За этот месяц: {ui.fmt_bytes(c.get('month'))}\n"
+                        f"Исчерпал лимит — <b>{mode}</b>\n\n"
+                        "«Блокировать» — клиент отключается, как истёкший; «замедлять» — остаётся на связи, "
+                        "но на малой скорости. «В месяц» — счётчик обнуляется 1-го числа, и всё снимается "
+                        "само; «всего» — считается с момента установки, без сброса.\n\n"
                         f"Период для новых значений: <b>{PERIOD[period]}</b>",
                     ui.kb([(f"📶 {v[:-1]} ГБ", act.data("ls", f"{name}|{v}|{period}")) for v in LIMITS],
                           ("✏️ Свой размер…", act.data("ls", f"{name}|ask|{period}")),
                           (f"🔁 {'Всего' if other == 'total' else 'В месяц'}", act.data("lp", f"{name}|{other}")),
                           ("🔄 Обнулить", act.data("lr", name)) if c.get("limit") else None,
+                          [(("✅ " if (m == "block" and not slow) or str(slow) == m else "")
+                            + ("🚫 Блокировать" if m == "block" else f"🐢 {m} Мбит/с"), act.data("lm", f"{name}|{m}"))
+                           for m in SLOW_MODES],
                           ("♾ Снять лимит", act.data("ls", f"{name}|off|{period}")) if c.get("limit") else None,
                           ui.back(act.data("v", name))))
+
+
+SLOW_MODES = ["block", "1", "2", "5"]
+
+
+@act("lm")
+async def _lim_mode(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, _, m = arg.partition("|")
+    r = await api.call("client", "limit-mode", name, m if m in SLOW_MODES else "block")
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Лимит трафика"), ui.kb(ui.back(act.data("lim", name))))
+        return
+    await _lim(cb, state, name)
 
 
 @act("lp")
@@ -635,6 +808,53 @@ async def _lim_reset(cb: CallbackQuery, state: FSMContext, name: str) -> None:
         return
     await cb.answer("Счётчик обнулён")
     await card(cb, name)
+
+
+# ── Скорость ──────────────────────────────────────────────
+SPEEDS = ["5", "10", "20", "50", "100"]
+
+
+@act("spd")
+async def _spd(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    c = await client(name)
+    if c is None:
+        await card(cb, name)
+        return
+    sp = c.get("speed")
+    await ui.render(cb, f"<b>🚀 Скорость: {esc(name)}</b>\n"
+                        f"Сейчас: {speed_text(c) or 'без ограничения'}\n\n"
+                        "Одна цифра на скачивание и отдачу, Мбит/с. Действует при любом маршруте — "
+                        "напрямую, WARP, Xray, exit-ноды. Если один конфиг стоит на нескольких "
+                        "устройствах, они делят скорость.",
+                    ui.kb([(("✅ " if str(sp) == v else "") + f"🚀 {v} Мбит/с", act.data("ss", f"{name}|{v}"))
+                           for v in SPEEDS],
+                          ("✏️ Своя…", act.data("ss", f"{name}|ask")),
+                          ("♾ Без лимита", act.data("ss", f"{name}|off")) if sp else None,
+                          ui.back(act.data("v", name))))
+
+
+@act("ss")
+async def _spd_set(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, _, v = arg.partition("|")
+    if v == "ask":
+        await ask.ask(cb, state, "cl_speed", "Скорость в Мбит/с: целое число от 1 до 10000, "
+                                             "<code>0</code> — без ограничения",
+                      act.data("spd", name), name=name)
+        return
+    r = await api.call("client", "speed", name, v)
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Скорость"), ui.kb(ui.back(act.data("spd", name))))
+        return
+    await card(cb, name)
+
+
+@ask.on("cl_speed")
+async def _spd_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
+    r = await api.call("client", "speed", ctx["name"], ask.text_of(msg).strip() or "0")
+    if not r.ok:
+        await ask.retry(msg, state, ctx, r.message)
+        return
+    await card(msg, ctx["name"])
 
 
 # ── Трафик по дням ────────────────────────────────────────
@@ -748,7 +968,7 @@ async def _tun(cb: CallbackQuery, state: FSMContext, name: str) -> None:
         await ui.render(cb, f"<b>🌐 Маршрут: {esc(name)}</b>\n\n"
                             + ("Все клиенты идут через tun2socks — выбора по клиентам у него нет."
                                if kind == "tun2socks" else "Туннели выключены — все клиенты идут напрямую."),
-                        ui.kb(("🌐 Туннели и DNS", "tun"), ui.back(back_to)))
+                        ui.kb(("🌐 Туннели и DNS", "tun"), ("🧭 Куда идёт", f"diag:rtc:{name}|t"), ui.back(back_to)))
         return
 
     def opt(label: str, value: str, cur: bool) -> ui.Button:
@@ -775,7 +995,7 @@ async def _tun(cb: CallbackQuery, state: FSMContext, name: str) -> None:
         buttons = [opt(f"Через {TUNNEL_NAMES[kind]}", "on", on), opt("Напрямую", "off", not on)]
         note = ""
     await ui.render(cb, f"<b>🌐 Маршрут: {esc(name)}</b>\nРаботает туннель: {TUNNEL_NAMES[kind]}.{note}",
-                    ui.kb(buttons, ui.back(back_to)))
+                    ui.kb(buttons, ("🧭 Куда идёт", f"diag:rtc:{name}|t"), ui.back(back_to)))
 
 
 @act("rt")
@@ -813,13 +1033,17 @@ async def _add_expire(target: ui.Target, state: FSMContext, name: str) -> None:
     await ui.render(target, f"<b>➕ {esc(name)}</b>\nСрок действия:", expire_kb("ne", "", False, "cl"))
 
 
+def rand_name(taken: set[str]) -> str:
+    """Случайное имя — 6 букв и цифра (qtrbka7), криптостойко, не из занятых."""
+    while True:
+        n = "".join(secrets.choice(string.ascii_lowercase) for _ in range(6)) + secrets.choice(string.digits)
+        if n not in taken:
+            return n
+
+
 @act("addrnd")
 async def _add_rnd(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
-    taken = {c["name"] for c in await clients() or []}
-    n = 1
-    while f"client{n}" in taken:
-        n += 1
-    await _add_expire(cb, state, f"client{n}")
+    await _add_expire(cb, state, rand_name({c["name"] for c in await clients() or []}))
 
 
 @ask.on("cl_add")
@@ -958,7 +1182,7 @@ async def _bulk_n(cb: CallbackQuery, state: FSMContext, n: str) -> None:
 async def _bulk_count_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
     prefix = (await state.get_data()).get("bulk_prefix")
-    if not v.isdigit() or not 1 <= int(v) <= 200:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 200:
         await ask.retry(msg, state, ctx, "Нужно число от 1 до 200")
         return
     await _bulk_expire_screen(msg, state, f"{prefix}:{int(v)}")

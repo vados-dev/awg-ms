@@ -68,6 +68,11 @@ if [[ "$1" == is-active || "$1" == is-enabled ]]; then
   for a in "$@"; do grep -qxF -- "$a" "$ACTIVE" && exit 0; done
   exit 1
 fi
+# «Упавшие» юниты — по строке в $ACTIVE.failed
+if [[ "$1" == is-failed ]]; then
+  for a in "$@"; do grep -qxF -- "$a" "$ACTIVE.failed" 2>/dev/null && exit 0; done
+  exit 1
+fi
 exit 0''',
     "sysctl": r'''echo "sysctl $*" >> "$CALLS"; exit 0''',
     "awg": r'''case "$1" in
@@ -89,11 +94,31 @@ exit 0''',
 [[ "$1" == show && "${3:-}" == transfer && -f "$WG_DUMP" ]] && awk -F'\t' 'NR > 1 {print $1 "\t" $6 "\t" $7}' "$WG_DUMP"
 exit 0''',
     "conntrack": r'''exit 0''',
+    "ipset": r'''echo "ipset $*" >> "$CALLS"
+[[ "$1" == restore ]] && cat > /dev/null
+exit 0''',
     "ss": r'''exit 0''',
     "curl": r'''for a in "$@"; do [[ "$a" == *http_code* ]] && { echo 204; exit 0; }; done
 exit 1''',
     "ufw": r'''exit 1''',
     "modprobe": r'''exit 0''',
+    # tc: журнал; корень awg0 помнится в файле (своя HTB после -batch, снятие — del);
+    # TC_FAIL — файл: -batch падает с этой ошибкой; TC_ROOT_BUSY — чужая очередь
+    "tc": r'''echo "tc $*" >> "$CALLS"
+st="$CALLS.tcroot"
+if [[ "$1" == -batch ]]; then
+  sed 's/^/tc> /' "$2" >> "$CALLS"
+  [[ -f "$CALLS.tcfail" ]] && { cat "$CALLS.tcfail" >&2; exit 1; }
+  grep -q "^qdisc add dev awg0 root handle a2:" "$2" && echo "qdisc htb a2: root refcnt 2 r2q 10 default 0x1" > "$st"
+  exit 0
+fi
+if [[ "$1" == qdisc && "$2" == show ]]; then
+  [[ "$*" == *root* ]] || exit 0
+  if [[ -f "$CALLS.tcbusy" ]]; then cat "$CALLS.tcbusy"; elif [[ -f "$st" ]]; then cat "$st"; else echo "qdisc noqueue 0: root refcnt 2"; fi
+  exit 0
+fi
+[[ "$1" == qdisc && "$2" == del && "$*" == *"dev awg0 root"* ]] && rm -f "$st"
+exit 0''',
 }
 for name, body in STUBS.items():
     p = os.path.join(BIN, name)
@@ -118,12 +143,13 @@ CLIENT_DIR="{ROOT}/root"; STATE_DIR="{ROOT}/var/lib/awg2"; LOG_FILE="{ROOT}/awg.
 INSTALL_LOG="{ROOT}/install.log"; EXITS_DIR="$AWG_DIR"
 EXITS_PEERS="$EXITS_DIR/exits_peers.list"; EXITS_STATE="$EXITS_DIR/exits_state"
 for v in DNS_PERSIST_SCRIPT DNS_HEALTH_SCRIPT CASCADE_SCRIPT T2S_ROUTING_SCRIPT XRAY_ROUTING_SCRIPT \\
-         EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK ANTISCAN_SCRIPT; do
+         EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK ANTISCAN_SCRIPT \\
+         WEB_FW_SCRIPT VKBLOCK_SCRIPT RUDIRECT_SCRIPT TUNFAIL_SCRIPT; do
   printf -v "$v" '%s' "{ROOT}/scripts/$v"
 done
 CASCADE_DIR="{ROOT}/etc/awg-cascade"; CASCADE_RULES="$CASCADE_DIR/rules.conf"; CASCADE_LOG="{ROOT}/cascade.log"
-WGOBF_DIR="{ROOT}/etc/awg-wgobf"; WGOBF_STATE="$WGOBF_DIR/state"
-WGOBF_WG_CONF="{ROOT}/etc/wireguard/wgobf0.conf"; WGOBF_CLIENTS="{ROOT}/root/wgobf"
+WGOBF_DIR="{ROOT}/etc/awg-wgobf"; WGOBF_STATE="$WGOBF_DIR/state"; WGOBF_OBF_CONF="$WGOBF_DIR/obfuscator.conf"
+WGOBF_WG_CONF="{ROOT}/etc/wireguard/wgobf0.conf"; WGOBF_CLIENTS="{ROOT}/root/wgobf"; WGOBF_AA_DIR="{ROOT}/etc/apparmor.d"
 CERT_DIR="{ROOT}/etc/awg2/cert"; CERT_FULL="$CERT_DIR/fullchain.pem"; CERT_KEY="$CERT_DIR/key.pem"
 CERT_STATE="{ROOT}/var/lib/awg2/cert"; ACME_DIR="{ROOT}/acme.sh"; ACME_HOME="{ROOT}/var/lib/awg2/acme"
 CERT_FIND_ROOT="{ROOT}"
@@ -131,18 +157,29 @@ EXPIRE_STATE_DIR="{ROOT}/var/lib/awg2-expire"; EXPIRE_LOG="{ROOT}/expire.log"; B
 BOT_ADMINS="{ROOT}/admins.json"; TRAFFIC_DB="$STATE_DIR/traffic.json"
 EXPIRE_STALE=999999999      # сторож таймера в песочнице молчит; его проверка — отдельно
 BACKUP_DIR="{ROOT}/awg_backup"; MOD_BACKUP_DIR="{ROOT}/mod-backups"; UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
-MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"; COUNTRY_CACHE="$STATE_DIR/country"
+MOD_TAG_FILE="$STATE_DIR/module_tag"; TOOLS_TAG_FILE="$STATE_DIR/tools_tag"; UPSTREAM_CACHE="$STATE_DIR/upstream_tags"; COUNTRY_CACHE="$STATE_DIR/country"; COUNTRY_MANUAL="$STATE_DIR/country_manual"
 WARP_PEERS="{ROOT}/warp.peers"; XRAY_PEERS="{ROOT}/xray.peers"; USQUE_LOG="{ROOT}/usque.log"
 XRAY_DIR="{ROOT}/etc/xray"; XRAY_CONF="$XRAY_DIR/config.json"; XRAY_STATE="$XRAY_DIR/state"
 XRAY_BIN="{ROOT}/bin/xray"; XRAY_ASSET_DIR="{ROOT}/xray-assets"
 T2S_DIR="{ROOT}/etc/tun2socks"; T2S_CONF="$T2S_DIR/proxy.txt"
-DNS_PROXY_CONF="{ROOT}/etc/dnscrypt-proxy/dnscrypt-proxy.toml"; DNS_PROXY_STATE="{ROOT}/etc/dnscrypt-proxy/awg.state"
-DNS_PROXY_BACKUP_CONF="$DNS_PROXY_CONF.awg-backup"
+DNS_PROXY_CONF="{ROOT}/etc/dnscrypt-proxy/dnscrypt-proxy.toml"; DNS_PROXY_STATE="{ROOT}/etc/dnscrypt-proxy/awg.state"; DNS_RESOLVERS_MD="{ROOT}/var/cache/dnscrypt-proxy/public-resolvers.md"
+DNS_PROXY_BACKUP_CONF="$DNS_PROXY_CONF.awg-backup"; UFW_DEFAULTS="{ROOT}/etc/default/ufw"
 WARP_DIR="{ROOT}/etc/wgcf"; WARP_ACCOUNT="$WARP_DIR/wgcf-account.toml"; WARP_PROFILE="$WARP_DIR/wgcf-profile.conf"
 WARP_STATE="$WARP_DIR/state"; WARP_CONF="{ROOT}/etc/wireguard/warp0.conf"; WARP_BACKEND_FILE="{ROOT}/etc/awg-warp-backend"
 USQUE_DIR="{ROOT}/etc/usque"; USQUE_CONF="$USQUE_DIR/config.json"
 ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf"; ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"
 ANTISCAN_LOG="{ROOT}/antiscan.log"
+WARP_HEALTH_FAILS="{ROOT}/warp-fails"; WARP_HEALTH_RETRY="{ROOT}/warp-retry"; WARP_HEALTH_LOG="{ROOT}/warp-health.log"
+VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBLOCK_LOG="{ROOT}/vkblock.log"
+RUDIRECT_DIR="$STATE_DIR/rudirect"; RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"; RUDIRECT_USER="{ROOT}/etc/awg2/rudirect"
+RUDIRECT_LOG="{ROOT}/rudirect.log"; TUNFAIL_CONF="{ROOT}/etc/awg2/tunnel-fail.conf"; TUNFAIL_LOG="{ROOT}/tunfail.log"
+DIAG_FWD="{ROOT}/ip_forward"; RUDIRECT_RPF="{ROOT}/rpf"
+EXITS_HEALTH_DIR="{ROOT}/run/exits-health"; EXITS_LOCK="{ROOT}/exits.lock"; EXITS_HEALTH_LOG="{ROOT}/exits-health.log"
+AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
+AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
+# Веб-панель: стенд (web_stand.py) передаёт свои конфиг и список адресов
+WEB_CONF="${{AWG_WEB_CONF:-{ROOT}/etc/awg-web.conf}}"; WEB_DIR="{ROOT}/etc/awg-web"; WEB_LOG="{ROOT}/awg-web.log"
+WEB_NETS_FILE="${{AWG_WEB_NETS:-$WEB_DIR/access.nets}}"
 write_unit() {{ mkdir -p "{ROOT}/units"; cat > "{ROOT}/units/$1"; }}
 remove_unit() {{ :; }}
 mkdir -p "$AWG_DIR" "$CLIENT_DIR" "$STATE_DIR" "{ROOT}/scripts"

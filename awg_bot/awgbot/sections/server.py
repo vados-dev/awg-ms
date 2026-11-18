@@ -3,6 +3,7 @@ endpoint, сброс и перезагрузка — пункты меню «С�
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 from aiogram import Bot, Router
@@ -11,7 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 from .. import api, ask, jobs, ui
 from ..ui import esc
-from . import clients
+from . import amnezia, clients
 
 router = Router()
 act = ui.Actions(router, "srv")
@@ -30,7 +31,7 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
 
 
 async def screen(target: ui.Target) -> None:
-    r = await api.call("server", "info")
+    r, amz = await asyncio.gather(api.call("server", "info"), amnezia.found())
     if not r.ok or not isinstance(r.data, dict):
         await ui.render(target, ui.fail(r, "Сервер"), ui.kb(ui.back()))
         return
@@ -64,8 +65,11 @@ async def screen(target: ui.Target) -> None:
         ("🔀 Протокол", act.data("proto")) if exists else None,
         ("🎛 Параметры AWG", act.data("par")) if exists else None,
         ("🌍 Endpoint", act.data("ep")) if exists else None,
+        ("📍 Точки входа", "ent") if exists else None,
         ("🛠 Починить", act.data("repair")),
         ("🛡 Антисканер", "as"),
+        ("🚫 VK и Max", "vk"),
+        ("🐳 Перенос из Amnezia", "amz") if amz else None,
         ("♻️ Перезагрузка", act.data("reboot")),
         ("⚠️ Сбросить", act.data("reset")) if exists else None,
         ui.back()))
@@ -174,7 +178,8 @@ async def _wizard_answer(cb: CallbackQuery, state: FSMContext, arg: str) -> None
             await ask.ask(cb, state, "srv_dns", "DNS для клиентов: IPv4 через запятую", "srv")
             return
     if key == "port" and val == "ask":
-        await ask.ask(cb, state, "srv_port", "UDP-порт сервера: 1024-65535", "srv")
+        await ask.ask(cb, state, "srv_port", "UDP-порт сервера: 443 или 1024-65535\n"
+                                             "<i>443 — порт QUIC (HTTP/3): трафик на нём выглядит привычнее.</i>", "srv")
         return
     if key == "mtu" and val == "ask":
         await ask.ask(cb, state, "srv_mtu", "MTU: число 1280-1500", "srv")
@@ -214,16 +219,16 @@ async def _dns_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 @ask.on("srv_port")
 async def _port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1024 <= int(v) <= 65535:
-        await ask.retry(msg, state, ctx, "Порт — число 1024-65535")
+    if not ui.awg_port_ok(v):
+        await ask.retry(msg, state, ctx, "Порт — 443 или число 1024-65535")
         return
-    await _wizard_set(msg, state, "port", v)
+    await _wizard_set(msg, state, "port", str(int(v)))
 
 
 @ask.on("srv_mtu")
 async def _mtu_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1280 <= int(v) <= 1500:
+    if not v.isascii() or not v.isdigit() or not 1280 <= int(v) <= 1500:
         await ask.retry(msg, state, ctx, "MTU — число 1280-1500")
         return
     await _wizard_set(msg, state, "mtu", v)
@@ -281,7 +286,7 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
             return
         profiles = await api.data("mimicry", default=[])
         await ui.render(target, head + "<b>Профиль мимикрии</b>\nПять пакетов залпом естественны для DNS, "
-                                       "STUN и RTP; на высоком порту — STUN, WebRTC, RTP.\n\n" + ui.profile_hints(profiles),
+                                       "STUN и RTP; на высоком порту — STUN, WebRTC, RTP; на порту 443 — QUIC с одним I1.\n\n" + ui.profile_hints(profiles),
                         ui.kb([(p["label"], _w("mimicry", f"{p['id']}:{wiz['level']}")) for p in profiles], cancel))
     elif step == "proto":
         info = await api.data("server", "info", default={}) or {}
@@ -315,9 +320,15 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
         await ui.render(target, head + "<b>UDP-порт</b>",
                         ui.kb(("🎲 Случайный", _w("port", "")), ("✏️ Ввести…", _w("port", "ask")), cancel))
     elif step == "endpoint":
+        v6 = (await api.data("server", "info", default={}) or {}).get("ipv6") or ""
         await ui.render(target, head + "<b>Адрес в конфигах клиентов</b>\nДомен вместо IP — переезд сервера "
-                                       "без перевыдачи конфигов.",
-                        ui.kb(("IP этого сервера", _w("endpoint", "")), ("✏️ Домен…", _w("endpoint", "ask")), cancel))
+                                       "без перевыдачи конфигов."
+                        + (f"\n\nУ сервера есть IPv6 <code>{esc(v6)}</code>: клиенты могут подключаться по нему. "
+                           "У кого в сети IPv6 нет — в карточке клиента вход меняется на «напрямую» (IPv4)."
+                           if v6 else ""),
+                        ui.kb(("IP этого сервера", _w("endpoint", "")),
+                              ("🌐 IPv6 сервера", _w("endpoint", "ipv6")) if v6 else None,
+                              ("✏️ Домен…", _w("endpoint", "ask")), cancel))
     else:
         await ui.render(target, head + "\n".join([
             f"Регион: {'Россия' if wiz['region'] == 'ru' else 'мир'}",
@@ -325,7 +336,8 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
             f"Версия: AWG {wiz['proto']} · MTU {wiz['mtu']}",
             f"Подсеть: {esc(wiz['net'] or 'случайная 10.x.y.0/24')}",
             f"DNS: {esc(wiz['dns'])}",
-            f"Порт: {wiz['port'] or 'случайный'} · endpoint: {esc(wiz['endpoint'] or 'IP сервера')}",
+            f"Порт: {wiz['port'] or 'случайный'} · endpoint: "
+            + esc({"": "IP сервера", "ipv6": "IPv6 сервера"}.get(wiz["endpoint"], wiz["endpoint"])),
         ]), ui.kb(ui.Row(("✅ Создать сервер", act.data("createok")), cancel)))
 
 
@@ -405,6 +417,9 @@ PHINT = {
     "MaxHandshakeAttempts": "сколько раз повторять рукопожатие: число или a-b",
 }
 PMATCH = "S и H обязаны совпадать у клиентов — после их правки старые конфиги не подключатся."
+# Не обязаны совпадать у клиентов: «🎲 без S и H» старые конфиги не ломает
+PFREE = ("Jc", "Jmin", "Jmax", "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
+         "KeepaliveTimeout", "MaxHandshakeAttempts")
 PVAL_RE = re.compile(r"^\d{1,10}(-\d{1,10})?$")
 
 
@@ -455,6 +470,7 @@ async def params_screen(target: ui.Target, state: FSMContext) -> None:
     ready = changed and not d.get("errors")
     await ui.render(target, text, ui.kb(
         *rows,
+        ui.Row(("🎲 Кроме S и H", act.data("prnd", "free")), ("🎲 Все поля", act.data("prnd", "all"))),
         ("✅ Применить", act.data("pgo")) if ready else None,
         ("↩️ Сбросить правки", act.data("preset")) if changed else None,
         ui.back("srv")))
@@ -486,6 +502,23 @@ async def _param_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     edits[ctx["param"]] = v
     await state.update_data(params=edits)
     await params_screen(msg, state)
+
+
+# Случайные значения от awg2 (server params gen — пределы генератора сервера) —
+# в правки, как ручной ввод: проверка на экране, запись — «Применить»
+@act("prnd")
+async def _params_random(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    r = await api.call("server", "params", "gen")
+    if not r.ok or not isinstance(r.data, dict):
+        await ui.render(cb, ui.fail(r, "Параметры AWG"), ui.kb(("◀️ Назад", act.data("pview"))))
+        return
+    data = await state.get_data()
+    vals, edits = data.get("params_vals") or {}, dict(data.get("params") or {})
+    for k, v in (r.data.get("values") or {}).items():
+        if k in vals and k not in PSWITCH and (arg == "all" or k in PFREE):
+            edits[k] = str(v)
+    await state.update_data(params=edits)
+    await params_screen(cb, state)
 
 
 @act("preset")
@@ -541,9 +574,12 @@ async def _ep(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     dom = info.get("domain")
     await ui.render(cb, f"<b>🌍 Endpoint</b>\n\nВ конфигах: <code>{esc(info.get('endpoint', ''))}</code>\n"
                         + ("Домен задан — сервер можно переносить без перевыдачи конфигов." if dom
-                           else "Сейчас IP. С доменом переезд сервера не требует новых конфигов."),
+                           else "Сейчас IP. С доменом переезд сервера не требует новых конфигов.")
+                        + "\n\n📍 Клиентам через другой сервер (каскад) — «Точки входа»: "
+                          "у них в конфиге адрес входа, смена Endpoint их не трогает.",
                     ui.kb(("✏️ Указать домен", act.data("epdom")),
                           ("🔢 Публичный IP", act.data("epset", "ip")) if dom else None,
+                          ("📍 Точки входа", "ent"),
                           ui.back("srv")))
 
 

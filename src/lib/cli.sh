@@ -45,11 +45,11 @@ tunnel_cli() {  # туннель действие
   esac
 }
 
-_on_interrupt() {
+_on_interrupt() {  # INT|TERM
   _cleanup_tmp
   echo ""
   warn "Прервано"
-  exit 130
+  _die_by_signal "$1"
 }
 
 main() {
@@ -61,7 +61,8 @@ main() {
   (( EUID == 0 )) || { echo "awg2: нужен root — sudo awg2" >&2; exit 1; }
   log_init
   trap _cleanup_tmp EXIT
-  trap _on_interrupt INT TERM
+  trap '_on_interrupt INT' INT
+  trap '_on_interrupt TERM' TERM
   # Машинный интерфейс бота: весь вывод — внутри одного JSON-ответа
   [[ "${1:-}" == api ]] && { shift; api_main "$@"; exit; }
   update_channel_init
@@ -89,7 +90,7 @@ main() {
       xray_ru_update || exit 1
       info "Новые базы подхватятся при перезапуске туннеля Xray"
       exit 0 ;;
-    --wgobf) AUTO_MODE=1; wgobf_cli "${2:-}" "${3:-}" && exit 0 || exit 1 ;;
+    --wgobf) AUTO_MODE=1; wgobf_cli "${2:-}" "${3:-}" "${4:-}" && exit 0 || exit 1 ;;
     "") [[ "${AUTOINSTALL:-}" == 1 ]] && { AUTO_MODE=1; do_autoinstall; exit; } ;;
     *) err "Неизвестный аргумент: $1"; info "awg2 --help — список аргументов"; exit 1 ;;
   esac

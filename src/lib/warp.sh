@@ -11,6 +11,8 @@ warp_backend() {
 }
 
 warp_wg_possible()    { modprobe wireguard 2>/dev/null || [[ -d /sys/module/wireguard ]]; }
+# Профиль есть (wg или usque) — WARP можно включать
+warp_configured()     { [[ -f "$WARP_CONF" || -s "$USQUE_CONF" ]]; }
 warp_usque_possible() {
   [[ -n "$(go_arch)" ]] || return 1
   [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null
@@ -102,6 +104,16 @@ warp_license_set() {  # ключ
   return 0
 }
 
+# Профиль со stdin в виде, который разбирает warp_wg_bringup: без \r и
+# пробелов по краям строк, «Ключ = значение» (генераторы пишут и «Ключ=значение»),
+# заголовки секций со скобками — при копировании с телефона «[» в начале
+# текста теряется, и профиль «Interface]» отвергался целиком.
+warp_profile_clean() {
+  tr -d '\r' | sed -E -e 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+    -e 's/^\[?[Ii]nterface\]?$/[Interface]/; s/^\[?[Pp]eer\]?$/[Peer]/' \
+    -e 's/^([A-Za-z0-9]+)[[:space:]]*=[[:space:]]*/\1 = /'
+}
+
 # Импорт готового wgcf-profile.conf (регистрация с сервера не проходит).
 warp_import() {
   local content k
@@ -109,7 +121,7 @@ warp_import() {
   echo -e "  Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):"
   echo -e "  ${G}curl -fsSL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_amd64 && chmod +x wgcf && ./wgcf register --accept-tos && ./wgcf generate && cat wgcf-profile.conf${N}"
   echo -e "  Вставь вывод целиком, затем Enter и Ctrl+D:"
-  content=$(cat)
+  content=$(warp_profile_clean)
   for k in '^\[Interface\]' '^PrivateKey' '^Address' '^\[Peer\]' '^PublicKey' '^Endpoint'; do
     grep -q "$k" <<< "$content" || { err "Не похоже на wgcf-profile.conf: нет ${k//[\\^]/}"; return 1; }
   done
@@ -118,13 +130,26 @@ warp_import() {
   printf '%s\n' "$content" | write_file "$WARP_PROFILE" 600
   install -m 600 "$WARP_PROFILE" "$WARP_CONF"
   [[ -f "$WARP_ACCOUNT" ]] || printf '# импортирован готовый профиль\nimported = true\n' | write_file "$WARP_ACCOUNT" 600
+  [[ -n "$(warp_awg_params)" ]] && info "В профиле параметры AmneziaWG — WARP поднимется через AmneziaWG"
   ok "Профиль импортирован — включай туннель"
 }
+
+# Параметры AmneziaWG из профиля WARP (Jc, Jmin, Jmax, S1-S4, H1-H4, I1-I5),
+# строками «Ключ = значение». Их несут готовые профили «WARP для России»:
+# с российских серверов чистый WireGuard к Cloudflare режут, а с мусорными
+# пакетами AmneziaWG рукопожатие проходит.
+warp_awg_params() {
+  sed -nE 's/^[[:space:]]*(Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5])[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1 = \2/p' \
+    "$WARP_CONF" 2>/dev/null
+}
+
+# wg или awg — чем говорить с warp0: из профиля с параметрами AWG он amneziawg
+warp_tool() { if ip -d link show "$WARP_IF" 2>/dev/null | grep -q amneziawg; then echo awg; else echo wg; fi; }
 
 # Поднимает warp0 из профиля и уводит в него клиентов. Работает и в
 # скрипте автозапуска, поэтому без вывода в интерфейс пользователя.
 warp_wg_bringup() {
-  local priv pub ep mtu addr a tmp
+  local priv pub ep mtu addr a tmp obf kind=wireguard tool=wg
   [[ -f "$WARP_CONF" && -f "$SERVER_CONF" ]] || return 1
   ip link show "$WARP_IF" &>/dev/null && return 0
   priv=$(awk -F' = ' '/^PrivateKey/{print $2; exit}' "$WARP_CONF")
@@ -136,23 +161,28 @@ warp_wg_bringup() {
     [[ "$a" == *.* ]] && addr="$a"
   done
   [[ -n "$priv" && -n "$pub" && -n "$ep" && -n "${addr:-}" ]] || { echo "профиль WARP не разобран" >&2; return 1; }
-  ip link add dev "$WARP_IF" type wireguard || return 1
+  # Профиль с параметрами AmneziaWG — через AmneziaWG: wg их не знает и отверг бы
+  obf=$(warp_awg_params)
+  if [[ -n "$obf" ]] && command -v awg >/dev/null; then kind=amneziawg; tool=awg; else obf=""; fi
+  ip link add dev "$WARP_IF" type "$kind" || return 1
   # Временный файл — в /etc/wireguard: пакетный wg на Ubuntu 26.04 не читает
   # из /tmp (AppArmor), а /etc/wireguard — каталог root:700.
   tmp="/etc/wireguard/.warp0.$$"
-  printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = %s\n' \
-    "$priv" "$pub" "$ep" > "$tmp"
+  printf '[Interface]\nPrivateKey = %s\n%s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = %s\n' \
+    "$priv" "$obf" "$pub" "$ep" > "$tmp"
   chmod 600 "$tmp"
-  if ! wg setconf "$WARP_IF" "$tmp"; then rm -f "$tmp"; ip link del "$WARP_IF"; return 1; fi
+  if ! "$tool" setconf "$WARP_IF" "$tmp"; then rm -f "$tmp"; ip link del "$WARP_IF"; return 1; fi
   rm -f "$tmp"
   ip -4 addr add "$addr" dev "$WARP_IF"
   ip link set mtu "${mtu:-1280}" up dev "$WARP_IF" || { ip link del "$WARP_IF"; return 1; }
+  # Health-check возвращает WARP без клиентов: маршруты — только после ответа Cloudflare
+  [[ -n "${WARP_NO_RT:-}" ]] && return 0
   rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "${addr%/*}"
 }
 
 _warp_autostart_install() {
   emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
-    WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_wg_bringup || return 1
+    WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup || return 1
   write_unit awg-warp.service <<EOF
 [Unit]
 Description=AWG Toolza — WARP для клиентов AWG
@@ -263,8 +293,9 @@ warp_usque_install() { _usque_install_bin && _usque_register && _usque_write; }
 
 # ── Включение / выключение ────────────────────────────────
 warp_up() {
-  local be i
+  local be i had=""
   server_exists || { err "Сначала создай сервер"; return 1; }
+  [[ -f "$WARP_STATE" ]] && had=1
   tunnel_guard warp || return 1
   warp_is_up && { info "WARP уже включён"; return 0; }
   be=$(warp_backend)
@@ -286,7 +317,14 @@ warp_up() {
     (( i == 3 )) && {
       err "Через WARP трафик не идёт — выключаю, клиенты остаются напрямую"
       [[ "$be" == wg ]] && info "Попробуй найти рабочий endpoint (warpscout) или импортировать профиль"
-      warp_down quiet
+      [[ "$be" == wg && -z "$(warp_awg_params)" ]] && info "С российских серверов чистый WireGuard к Cloudflare часто режут — помогает профиль с параметрами AmneziaWG (Jc, Jmin, Jmax)"
+      # WARP упал раньше, а health-check включён — он и дальше пробует вернуть его сам
+      if [[ -n "$had" ]] && unit_active awg-warp-healthcheck.timer; then
+        warp_failover
+        info "Health-check продолжит пробовать сам и вернёт WARP, когда Cloudflare ответит"
+      else
+        warp_down quiet
+      fi
       return 1
     }
     sleep 2
@@ -299,6 +337,8 @@ warp_up() {
 }
 
 warp_down() {
+  # Состояние — раньше маршрутов: в режиме «блокировать» rt_down иначе удержал бы клиентов
+  rm -f "$WARP_STATE"
   rt_down "$WARP_IF" "$WARP_TABLE"
   if [[ "$(warp_backend)" == usque ]]; then
     systemctl stop awg-usque.service &>/dev/null || true
@@ -311,28 +351,87 @@ warp_down() {
 }
 
 # ── Health-check ──────────────────────────────────────────
-# Три провала подряд — клиенты возвращаются на прямой маршрут.
-warp_health_run() {
-  local f=/tmp/awg-warp-fails n
-  ip link show "$WARP_IF" &>/dev/null || exit 0
-  command -v ping >/dev/null || exit 0
-  if ping -c1 -W3 -I "$WARP_IF" 1.1.1.1 &>/dev/null; then echo 0 > "$f"; exit 0; fi
-  n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
-  echo "$n" > "$f"
-  echo "$(date '+%F %T') FAIL $n/3" >> "$WARP_HEALTH_LOG"
-  (( n >= 3 )) || exit 0
+# Раз в минуту — пинг 1.1.1.1 через warp0. Три провала подряд — клиенты WARP
+# уходят напрямую (warp_failover), а WARP остаётся включённым. Дальше
+# health-check сам возвращает его, пока не вернёт или пока WARP либо
+# health-check не выключат: первые 10 попыток — раз в минуту, потом раз в
+# 5 минут (сеть хостера может лежать часами). Пробует без клиентов: warp0
+# поднимается без их маршрутов, и только ответ Cloudflare возвращает их в туннель.
+warp_ping() { ping -c3 -i0.5 -W2 -I "$WARP_IF" 1.1.1.1 &>/dev/null; }
+
+# Клиенты WARP — напрямую, WARP остаётся включённым с меткой .failed.
+warp_failover() {
   rt_down "$WARP_IF" "$WARP_TABLE"
   # usque держит warp0 сам: гасим службу, иначе warp_is_up остаётся истинным,
   # warp_up отвечает «уже включён», а хук usque при реконнекте вернёт правила.
   if [[ "$(cat "$WARP_BACKEND_FILE" 2>/dev/null)" == usque ]]; then systemctl stop awg-usque.service 2>/dev/null
   else ip link del "$WARP_IF" 2>/dev/null; fi
   echo failed > "$WARP_STATE.failed"
-  echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую" >> "$WARP_HEALTH_LOG"
+}
+
+warp_health_recover() {
+  local r="$WARP_HEALTH_RETRY" n i src
+  n=$(( $(cat "$r" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$r"
+  (( n <= 10 || n % 5 == 0 )) || return 0
+  # Пока WARP лежал, включили другой туннель — ему не мешаем
+  [[ -z "$(tunnel_conflict warp)" ]] || return 0
+  if (( n == 1 || n % 60 == 0 )); then echo "$(date '+%F %T') RETRY $n: пробую вернуть WARP" >> "$WARP_HEALTH_LOG"; fi
+  if [[ "$(cat "$WARP_BACKEND_FILE" 2>/dev/null)" == usque ]]; then
+    # usque поднимает warp0 и маршруты клиентов сам, когда достучится до Cloudflare
+    systemctl start awg-usque.service 2>/dev/null || return 0
+    for i in {1..15}; do ip link show "$WARP_IF" &>/dev/null && break; sleep 1; done
+    if ! { ip link show "$WARP_IF" &>/dev/null && warp_ping; }; then warp_failover; return 0; fi
+  else
+    WARP_NO_RT=1 warp_wg_bringup 2>/dev/null || return 0
+    if ! warp_ping; then ip link del "$WARP_IF" 2>/dev/null; return 0; fi
+    src=$(ip -4 -o addr show dev "$WARP_IF" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')
+    rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "$src" || { warp_failover; return 0; }
+  fi
+  rm -f "$WARP_STATE.failed" "$r"
+  echo 0 > "$WARP_HEALTH_FAILS"
+  echo "$(date '+%F %T') RECOVERED: WARP снова работает, клиенты WARP — в туннеле (попытка $n)" >> "$WARP_HEALTH_LOG"
+}
+
+warp_health_run() {
+  local f="$WARP_HEALTH_FAILS" n src
+  command -v ping >/dev/null || exit 0
+  if ! ip link show "$WARP_IF" &>/dev/null; then
+    # WARP включён, а туннеля нет: health-check увёл клиентов или warp0 не поднялся при загрузке
+    [[ -f "$WARP_STATE" ]] && warp_health_recover
+    exit 0
+  fi
+  if warp_ping; then
+    echo 0 > "$f"
+    # Попытку вернуть WARP прервали между подъёмом warp0 и маршрутами — доставить маршруты
+    if [[ -f "$WARP_STATE" ]] && ! ip route show table "$WARP_TABLE" 2>/dev/null | grep -q '^default'; then
+      src=$(ip -4 -o addr show dev "$WARP_IF" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')
+      rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "$src"
+    fi
+    exit 0
+  fi
+  n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$f"
+  echo "$(date '+%F %T') FAIL $n/3" >> "$WARP_HEALTH_LOG"
+  (( n >= 3 )) || exit 0
+  warp_failover
+  rm -f "$WARP_HEALTH_RETRY"
+  if [[ "$(rt_fail_mode warp)" == block ]]; then
+    echo "$(date '+%F %T') FAILOVER: клиенты WARP удержаны (режим «блокировать»), WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  else
+    echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую, WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  fi
+}
+
+_warp_health_emit() {
+  emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE WARP_CONF WARP_PEERS \
+    WARP_BACKEND_FILE WARP_HEALTH_LOG WARP_HEALTH_FAILS WARP_HEALTH_RETRY XRAY_IF XRAY_UNIT T2S_UNIT EXITS_UNIT "${RT_FUNCS[@]}" \
+    unit_active warp_is_up xray_is_up t2s_is_up exits_is_up tunnel_conflict \
+    warp_awg_params warp_wg_bringup warp_ping warp_failover warp_health_recover warp_health_run
 }
 
 warp_health_on() {
-  emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
-    WARP_BACKEND_FILE WARP_HEALTH_LOG "${RT_FUNCS[@]}" warp_health_run || return 1
+  _warp_health_emit || return 1
   write_unit awg-warp-healthcheck.service <<EOF
 [Unit]
 Description=AWG Toolza — проверка WARP
@@ -352,52 +451,105 @@ OnUnitActiveSec=60s
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl enable --now awg-warp-healthcheck.timer &>/dev/null && ok "Health-check включён (раз в минуту)"
+  systemctl enable --now awg-warp-healthcheck.timer &>/dev/null \
+    && ok "Health-check включён: раз в минуту; WARP не отвечает — клиенты напрямую, WARP вернётся сам"
 }
 
 warp_health_off() {
   remove_unit awg-warp-healthcheck.timer awg-warp-healthcheck.service
-  rm -f "$WARP_HEALTH_SCRIPT" /tmp/awg-warp-fails
+  rm -f "$WARP_HEALTH_SCRIPT" "$WARP_HEALTH_FAILS" "$WARP_HEALTH_RETRY"
 }
 
 # ── warpscout: поиск рабочего endpoint ────────────────────
+_warpscout_version() { "$WARPSCOUT_BIN" version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1; }
+
+# Последняя версия warpscout с GitHub — официальным установщиком (он же обновляет)
+_warpscout_install() {
+  local f out
+  [[ "$(go_arch)" =~ ^(amd64|arm64)$ ]] || { err "warpscout — только amd64/arm64"; return 1; }
+  mktmp f || return 1
+  curl -4 -fsSL --max-time 60 https://raw.githubusercontent.com/vernette/warpscout/master/install.sh -o "$f" \
+    || { err "Не скачался установщик warpscout (GitHub недоступен?)"; return 1; }
+  if ! out=$(INSTALL_DIR="${WARPSCOUT_BIN%/*}" sh "$f" -y 2>&1) || ! "$WARPSCOUT_BIN" version &>/dev/null; then
+    err "warpscout не установился:"
+    _warpscout_tail <<< "$out"
+    return 1
+  fi
+}
+
+# Вывод warpscout без цветов, рамок и пустых строк — последние строки, для причины сбоя
+_warpscout_tail() {
+  sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\r' | grep -vE '^[[:space:]]*$|[╭╮╰╯│─]' | tail -n 8 | sed 's/^/      /'
+}
+
 _warpscout_ready() {
   if ! "$WARPSCOUT_BIN" version &>/dev/null; then
-    [[ "$(go_arch)" =~ ^(amd64|arm64)$ ]] || { err "warpscout — только amd64/arm64"; return 1; }
     info "Ставлю warpscout..."
-    curl -4 -fsSL --max-time 60 https://raw.githubusercontent.com/vernette/warpscout/master/install.sh \
-      | INSTALL_DIR="${WARPSCOUT_BIN%/*}" sh -s -- -y >/dev/null 2>&1
-    "$WARPSCOUT_BIN" version &>/dev/null || { err "warpscout не установился"; return 1; }
+    _warpscout_install || return 1
   fi
   mkdir -p "$WARPSCOUT_DIR" && chmod 700 "$WARPSCOUT_DIR"
-  [[ -s "$WARPSCOUT_ACCOUNT" ]] || "$WARPSCOUT_BIN" register -a "$WARPSCOUT_ACCOUNT" >/dev/null 2>&1 \
-    || { err "Регистрация warpscout не удалась"; return 1; }
+  local out
+  [[ -s "$WARPSCOUT_ACCOUNT" ]] || out=$(cd "$WARPSCOUT_DIR" && HOME="${HOME:-/root}" \
+    "$WARPSCOUT_BIN" register -a "$WARPSCOUT_ACCOUNT" 2>&1 </dev/null) \
+    || { err "Регистрация warpscout не удалась:"; _warpscout_tail <<< "${out:-}"; return 1; }
+}
+
+# Обновить warpscout (кнопка «Обновить скаут»): аккаунт остаётся прежним
+warpscout_update() {
+  local was now
+  was=$(_warpscout_version)
+  info "${was:+Сейчас warpscout $was — }ставлю последнюю версию с GitHub..."
+  _warpscout_install || return 1
+  now=$(_warpscout_version)
+  if [[ -n "$was" && "$was" == "$now" ]]; then ok "warpscout $now — уже последняя версия"
+  else ok "warpscout ${was:+$was → }$now"; fi
+}
+
+# Скан warpscout: в stdout — его вывод без цветов. Каталог — свой: туда же он
+# пишет отчёт скана (иначе — в текущий, хоть в /), отчёты не копятся.
+_warpscout_scan() {
+  ( cd "$WARPSCOUT_DIR" && HOME="${HOME:-/root}" "$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" "$@" ) \
+    2>&1 </dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\r'
+  rm -f "$WARPSCOUT_DIR"/warpscout-report-*.txt 2>/dev/null
+  return 0
 }
 
 # Лучший endpoint по замерам warpscout → сразу в профиль. $1 — страна (DE, NL...).
+# Ответ — строка «IP:порт» (последняя такая: новые версии печатают ход скана и
+# после него). Пусто — ещё раз (сбой сети на миг), потом — его же слова о причине.
 warp_endpoint_best() {
-  local best
+  local best="" out="" try
   [[ "$(warp_backend)" == wg ]] || { err "Только для бэкенда wg"; return 1; }
   [[ -z "${1:-}" || "$1" =~ ^[A-Za-z]{2}$ ]] || { err "Страна — две буквы (DE, NL)"; return 1; }
   _warpscout_ready || return 1
-  info "Сканирую (до минуты)..."
-  best=$("$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" -best ${1:+-country "${1^^}"} 2>/dev/null | tail -1)
+  for try in 1 2; do
+    if (( try == 1 )); then info "Сканирую (до минуты)..."; else info "Пусто — сканирую ещё раз..."; fi
+    out=$(_warpscout_scan -best ${1:+-country "${1^^}"})
+    best=$(grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+$' <<< "$out" | tail -1 || true)
+    [[ -n "$best" ]] && break
+  done
+  if [[ -z "$best" ]]; then
+    err "warpscout не нашёл рабочий endpoint${1:+ в стране ${1^^}} — его вывод:"
+    _warpscout_tail <<< "$out"
+    info "WARP при этом может работать и на текущем endpoint. Не помогает — «Обновить скаут»"
+    return 1
+  fi
   warp_endpoint_set "$best"
 }
 
 warp_endpoint_set() {  # ip:порт
   local pub
-  [[ "$1" =~ ^[0-9.]+:[0-9]+$ ]] || { err "Ни один endpoint не прошёл проверку — UDP к Cloudflare, похоже, режут"; return 1; }
+  [[ "$1" =~ ^[0-9.]+:[0-9]+$ ]] || { err "Endpoint — IP:порт, а не «$1»"; return 1; }
   sed -i "s|^Endpoint = .*|Endpoint = $1|" "$WARP_CONF" "$WARP_PROFILE" 2>/dev/null
   if warp_is_up; then
-    pub=$(wg show "$WARP_IF" peers | head -1)
-    [[ -n "$pub" ]] && wg set "$WARP_IF" peer "$pub" endpoint "$1"
+    pub=$("$(warp_tool)" show "$WARP_IF" peers | head -1)
+    [[ -n "$pub" ]] && "$(warp_tool)" set "$WARP_IF" peer "$pub" endpoint "$1"
   fi
   ok "Endpoint: $1"
 }
 
 warp_find_endpoint() {
-  local c country rep lines=() i
+  local c country rep lines=() i out
   [[ "$(warp_backend)" == wg ]] || { warn "Только для бэкенда wg"; return 0; }
   echo -e "  ${C}1)${N} Найти лучший и применить"
   echo -e "  ${C}2)${N} Показать список и выбрать"
@@ -410,9 +562,9 @@ warp_find_endpoint() {
   _warpscout_ready || return 1
   info "Сканирую (до минуты)..."
   mktmp rep || return 1
-  "$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" -plain -o "$rep" 2>/dev/null
-  mapfile -t lines < <(grep -oE '[0-9.]+:[0-9]+' "$rep" | sort -u)
-  (( ${#lines[@]} )) || { err "Рабочих endpoint не найдено"; return 1; }
+  out=$(_warpscout_scan -plain -o "$rep")
+  mapfile -t lines < <(grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+' "$rep" 2>/dev/null | sort -u)
+  (( ${#lines[@]} )) || { err "Рабочих endpoint не найдено — вывод warpscout:"; _warpscout_tail <<< "$out"; return 1; }
   for i in "${!lines[@]}"; do printf "  %2d) %s\n" "$((i + 1))" "${lines[$i]}"; done
   read_choice c "${C}  Выбор (0 — отмена): ${N}" 0 "${#lines[@]}" 0
   (( c == 0 )) && return 0
@@ -504,11 +656,12 @@ do_warp_menu() {
       echo -e "  ${C}6)${N} Warp+ (ключ)"
       echo -e "  ${C}7)${N} Импорт wgcf-profile.conf"
       echo -e "  ${C}8)${N} Поиск рабочего endpoint (warpscout)"
+      echo -e "  ${C}9)${N} Обновить warpscout ${D}— сканер endpoint${N}"
     fi
     echo -e "  ${C}b)${N} Сменить бэкенд (wg ↔ usque)"
     echo -e "  ${R}d)${N} Удалить WARP"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор: ${N}" 0 8 0 "b|d"
+    read_choice c "${C}  Выбор: ${N}" 0 9 0 "b|d"
     case "$c" in
       1) if [[ "$be" == wg ]]; then warp_wg_install || true; else warp_usque_install || true; fi ;;
       2) warp_up || true ;;
@@ -518,6 +671,7 @@ do_warp_menu() {
       6) [[ "$be" == wg ]] && { warp_license || true; } ;;
       7) [[ "$be" == wg ]] && { warp_import || true; } ;;
       8) [[ "$be" == wg ]] && { warp_find_endpoint || true; } ;;
+      9) [[ "$be" == wg ]] && { warpscout_update || true; } ;;
       b) warp_switch_backend || true ;;
       d) warp_remove || true ;;
       0) return 0 ;;

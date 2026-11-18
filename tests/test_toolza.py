@@ -20,10 +20,13 @@ test_toolza.py — проверка собранного awg2 (dist/awg2.sh) б�
 Выход:   0 — всё прошло, 1 — есть провалы.
 """
 import base64
+import concurrent.futures
 import hashlib
 import os
+import re
 import sys
 import time
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sandbox import *  # noqa: E402,F401,F403
@@ -31,9 +34,14 @@ from sandbox import *  # noqa: E402,F401,F403
 # ── 1. Генератор параметров ───────────────────────────────
 print("Параметры AWG")
 N = 120
+# Девять наборов независимы и только считают — генерируем разом
+GEN = [(proto, profile) for proto in ("2.0", "3.0", "3.1") for profile in ("lite", "standard", "pro")]
+with concurrent.futures.ThreadPoolExecutor(max_workers=len(GEN)) as _pool:
+    GEN = dict(zip(GEN, _pool.map(lambda pp: bash(
+        f'MTU=1280; AUTO_MODE=1; for i in $(seq {N}); do gen_awg_params {pp[1]} {pp[0]} || exit 1; echo "$AWG_PARAMS"; echo ---; done'), GEN)))
 for proto in ("2.0", "3.0", "3.1"):
     for profile in ("lite", "standard", "pro"):
-        rc, out, err = bash(f'MTU=1280; AUTO_MODE=1; for i in $(seq {N}); do gen_awg_params {profile} {proto} || exit 1; echo "$AWG_PARAMS"; echo ---; done')
+        rc, out, err = GEN[(proto, profile)]
         sets = [kv(b) for b in out.split("---") if b.strip()]
         label = f"{proto}/{profile}"
         chk(f"{label}: сгенерировано {N}", rc == 0 and len(sets) == N, err[-300:])
@@ -237,6 +245,22 @@ with open(WG) as f:
     wg = f.read()
 chk("WG + обфускатор: удаляется ровно свой [Peer]", out.split() == ["a", "c"] and "PublicKey = B" not in wg
     and "PublicKey = A" in wg and "PublicKey = C" in wg and wg.startswith("[Interface]\nPrivateKey = S"), wg)
+WCL = os.path.join(ROOT, "root/wgobf")
+os.makedirs(os.path.join(WCL, "a"), exist_ok=True)
+with open(os.path.join(WCL, "a", "wg.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = KA\n")
+rc, out, _ = bash('wgobf_write_bundle() { echo "BUNDLE $1"; }; wgobf_rename_client a alice 2>&1; echo "rc=$?"; wgobf_clients')
+with open(WG) as f:
+    wg = f.read()
+chk("WG + обфускатор: переименование — меняется только имя над пиром, комплект переезжает и пересобирается",
+    "rc=0" in out and "BUNDLE alice" in out and out.split()[-2:] == ["alice", "c"]
+    and "# client=alice\nPublicKey = A\nAllowedIPs = 10.77.1.2/32" in wg and "# client=a\n" not in wg
+    and os.path.isfile(os.path.join(WCL, "alice", "wg.conf")) and not os.path.exists(os.path.join(WCL, "a")), [out, wg])
+rc, out, _ = bash('wgobf_write_bundle() { :; }; for n in c all "bad name" alice; do wgobf_rename_client alice "$n" >/dev/null 2>&1; '
+                  'echo "rc$?"; done; wgobf_rename_client zz q >/dev/null 2>&1; echo "rc$?"; wgobf_clients')
+chk("WG + обфускатор: занятое имя, all, недопустимое и чужой клиент — отказ; то же имя — ничего не меняет",
+    out.split() == ["rc1", "rc1", "rc1", "rc0", "rc1", "alice", "c"], out)
+shutil.rmtree(os.path.join(WCL, "alice"), ignore_errors=True)
 
 rc, out, _ = bash('printf "10.10.0.0/16\\n10.20.1.1/24\\n" | py pick-net awg')
 net = out.strip()
@@ -265,13 +289,13 @@ rules = xc.get("routing", {}).get("rules", [])
 chk("Xray: два выхода, балансировщик, РФ напрямую",
     len([o for o in xc.get("outbounds", []) if o["protocol"] == "vless"]) == 2
     and xc["routing"]["balancers"][0]["strategy"]["type"] == "leastPing"
-    and sum(1 for r in rules if r.get("ruleTag") == "ru-direct") == 2
+    and [r.get("ruleTag") for r in rules if str(r.get("ruleTag")).startswith("ru-direct")] == ["ru-direct", "ru-direct-ip"]
     and rules[-1].get("balancerTag") == "balancer"
     and all(i.get("protocol") != "tun" for i in xc["inbounds"]), err or out[:300])
 rc, out, _ = bash(f'py xray-del "{XC}" proxy_two_example_com; py xray-prepare "{XC}" native; cat "{XC}"')
 xc = json.loads(out)
 chk("Xray: удаление выхода чинит балансировщик", not xc["routing"].get("balancers")
-    and any(i.get("protocol") == "tun" for i in xc["inbounds"])
+    and any(i.get("protocol") == "tun" and i["settings"].get("name") == "xray0" for i in xc["inbounds"])
     and all(r.get("outboundTag") != "proxy_two_example_com" for r in xc["routing"]["rules"]), out[:300])
 
 # ── Xray: пробы на бинаре ─────────────────────────────────
@@ -292,6 +316,11 @@ if os.environ.get("XRAY_STUB_OLD") and any(o.get("protocol") == "hysteria" for o
     print("infra/conf: unknown config id: hysteria"); sys.exit(23)
 if "allowInsecure" in json.dumps(c):
     print("The feature allowInsecure has been removed"); sys.exit(23)
+# С Xray 26.9 повтор ruleTag отвергает конфиг при запуске
+tags = [r.get("ruleTag") for r in (c.get("routing") or {}).get("rules") or [] if r.get("ruleTag")]
+dup = next((t for t in tags if tags.count(t) > 1), None)
+if dup:
+    print("Failed to start: main: failed to create server > app/router: duplicate ruleTag " + dup); sys.exit(23)
 # Проверка с inbound tun создаёт устройство: занятое имя — отказ, как у Xray
 busy = open(os.environ["LINKS"]).read().split()
 for ib in c.get("inbounds", []):
@@ -314,6 +343,99 @@ rc, out, _ = bash(XRAY_ENV + 'py xray-prepare "$XRAY_CONF" native; xray_test && 
 open(LINKS, "w").close()
 chk("Xray работает (xray0 занят): проверка конфига и проба tun не упираются в busy",
     "TEST-OK" in out and "TUN-YES" in out, out)
+
+# Включение туннеля целиком на Xray 26.7+: устройство входа tun называется по
+# settings.name, без имени — utunN. Заглушка systemctl «запускает» Xray так же
+XSBIN = os.path.join(TMP, "xsbin")
+os.makedirs(XSBIN, exist_ok=True)
+with open(os.path.join(XSBIN, "systemctl"), "w") as f:
+    f.write(r"""#!/usr/bin/env bash
+if [[ "$1" == start && " $* " == *" awg-xray.service "* ]]; then
+  python3 -c 'import json, sys
+c = json.load(open(sys.argv[1]))
+t = [i for i in c.get("inbounds", []) if i.get("protocol") == "tun"]
+print((t[0].get("settings") or {}).get("name") or "utun77" if t else "")' "$XRAY_CONF" >> "$LINKS"
+  echo awg-xray.service >> "$ACTIVE"
+fi
+PATH="${PATH#"${0%/*}:"}" exec systemctl "$@"
+""")
+os.chmod(os.path.join(XSBIN, "systemctl"), 0o755)
+with open(ACTIVE) as f:
+    act_before = f.read()
+XUP = (f'export PATH="{XSBIN}:$PATH" XRAY_CONF; server_exists() {{ return 0; }}; peers_sync() {{ :; }}; peers_seed() {{ :; }}; ')
+rc, out, err = bash(XRAY_ENV + XUP + 'py xray-tun-probe /dev/null 2>/dev/null; '
+                    'python3 - "$XRAY_CONF" <<"EOF"\nimport json, sys\nc = json.load(open(sys.argv[1]))\n'
+                    'for i in c.get("inbounds", []):\n    if i.get("protocol") == "tun": i.get("settings", {}).pop("name", None)\n'
+                    'json.dump(c, open(sys.argv[1], "w"))\nEOF\n'
+                    'xray_up; echo "rc=$?"')
+links = open(LINKS).read().split()
+chk("Xray 26.7+: туннель включается — у входа tun имя xray0, интерфейс xray0, без utunN",
+    "rc=0" in out and "Xray включён" in out and "xray0" in links and not any(x.startswith("utun") for x in links),
+    [out[-400:], err[-300:], links])
+bash(XRAY_ENV + XUP + "xray_down quiet")
+open(LINKS, "w").close()
+with open(ACTIVE, "w") as f:
+    f.write(act_before)
+
+# Xray включён, а не работает: «трафик не идёт» (маршруты не дождались выхода) и «не запущен»
+XST = 'mkdir -p "$XRAY_DIR"; echo active > "$XRAY_STATE"; '
+rc, out, _ = bash('rm -f "$XRAY_STATE"; xray_fail; echo "rc=$?"')
+chk("Xray выключен — сбоя нет", out.strip() == "rc=1", out)
+rc, out, _ = bash(XST + 'xray_fail; echo "rc=$?"')
+chk("Xray включён, а не запущен (xray0 нет) — сбой «down»", out.split() == ["down", "rc=0"], out)
+with open(LINKS, "a") as f:
+    f.write("xray0\n")
+rc, out, _ = bash(XST + 'xray_fail; echo "rc=$?"')
+chk("Xray запущен, маршруты ждут или работают — не сбой", out.strip() == "rc=1", out)
+with open(ACTIVE + ".failed", "w") as f:
+    f.write("awg-xray-routing.service\n")
+rc, out, _ = bash(XST + 'xray_fail; echo "rc=$?"')
+chk("Xray запущен, а служба маршрутов не дождалась трафика — сбой «notraffic»", out.split() == ["notraffic", "rc=0"], out)
+rc, out, _ = bash(XST + 'xray_installed() { return 0; }; xray_tags() { echo vl1; }; xray_status')
+chk("статус Xray: «включён, но через выход трафик не идёт», что проверить — ссылку и «Диагностику»",
+    "через выход трафик не идёт" in out and "Проверь ссылку выхода" in out and "устареть" in out and "Диагностика" in out
+    and "Клиентов" not in out, out)
+bash(XST)
+rc, out, _ = bash("api_main status")
+t = (json.loads(out.strip().splitlines()[-1]).get("data") or {}).get("tunnels") or {}
+chk("сводка для оповещений: tunnels.xray_fail = notraffic, режим «блокировать» — нет",
+    t.get("xray_fail") == "notraffic" and t.get("xray_block") is False, t)
+rc, out, _ = bash("api_main xray status")
+r = json.loads(out.strip().splitlines()[-1])
+chk("api xray status: fail = notraffic", (r.get("data") or {}).get("fail") == "notraffic", r.get("data"))
+with open(ACTIVE, "a") as f:
+    f.write("awg-xray-routing.service\n")
+def xprobe(pre=""):
+    _, o, _ = bash(pre + "api_main xray probe")
+    try:
+        return json.loads(o.strip().splitlines()[-1]).get("data")
+    except (ValueError, IndexError):
+        return o
+
+
+chk("api xray probe: Xray и маршруты работают, ответ через SOCKS Xray есть",
+    xprobe() == {"up": True, "ok": True, "why": ""}, xprobe())
+chk("api xray probe: выход отвалился на ходу — up, но ok нет и ответ curl",
+    xprobe("socks_probe() { echo 000; return 1; }; ") == {"up": True, "ok": False, "why": "000"},
+    xprobe("socks_probe() { echo 000; return 1; }; "))
+rc, out, _ = bash('journalctl() { echo "journalctl $*"; }; _api_log xray 30')
+chk("журнал Xray в панели и боте — вместе со службой маршрутов (там «трафик не идёт»)",
+    "journalctl -u awg-xray.service -u awg-xray-routing.service -n 30 --no-pager" in out, out)
+rc, out, _ = bash('_xray_emit_routing && cat "$XRAY_ROUTING_SCRIPT"')
+chk("служба маршрутов Xray: «трафик не идёт» — с подсказкой проверить ссылку и «Диагностику»",
+    "трафик не идёт" in out and 'XRAY_CHECK_HINT="проверь ссылку выхода' in out and "Туннели → Xray → Диагностика" in out, out[-600:])
+bash(XRAY_ENV + XUP + "xray_down quiet")
+os.remove(ACTIVE + ".failed")
+open(LINKS, "w").close()
+with open(ACTIVE, "w") as f:
+    f.write(act_before)
+rc, out, _ = bash(XRAY_ENV + XUP + 'socks_probe() { echo 000; return 1; }; xray_up; echo "rc=$?"')
+chk("включение Xray: выход не пускает — не включаю и подсказка: проверь ссылку, «Диагностика»",
+    "rc=1" in out and "Через Xray трафик не идёт (ответ: 000)" in out and "Проверь ссылку выхода" in out, out[-600:])
+bash(XRAY_ENV + XUP + "xray_down quiet")
+open(LINKS, "w").close()
+with open(ACTIVE, "w") as f:
+    f.write(act_before)
 rc, out, _ = bash("XRAY_STUB_OLD=1; export XRAY_STUB_OLD; " + XRAY_ENV
                   + "xray_add_link 'hysteria2://secret@h2.example.site:443?sni=h2.example.site#H2'")
 chk("Xray без Hysteria2: выход отклонён с подсказкой обновить Xray", rc != 0 and "обнови Xray" in out, out)
@@ -329,6 +451,13 @@ chk("Hysteria2 — в формате Xray 26: hysteria v2, пароль, SNI, h3
     and st["tlsSettings"]["serverName"] == "h2.example.site" and st["tlsSettings"]["alpn"] == ["h3"]
     and st["tlsSettings"]["echConfigList"] == "AGb+DQBi" and st["tlsSettings"]["pinnedPeerCertSha256"].count(",") == 1,
     [rc, out[-600:]])
+rc, out, _ = bash(XRAY_ENV + 'py xray-outs "$XRAY_CONF" | py json-rows tag proto sec net host port:n')
+outs = {o["tag"]: o for o in json.loads(out)} if rc == 0 and out.startswith("[") else {}
+chk("xray-outs — выходы для карточек: протокол, защита, транспорт, адрес (без direct и block)",
+    outs.get("proxy_dash_example_site") == {"tag": "proxy_dash_example_site", "proto": "vless", "sec": "tls", "net": "tcp",
+                                            "host": "dash.example.site", "port": 8443}
+    and outs.get("proxy_h2_example_site", {}).get("host") == "h2.example.site"
+    and outs["proxy_h2_example_site"]["net"] == "hysteria" and "direct" not in outs and "block" not in outs, out)
 bash(XRAY_ENV + "xray_del_tag proxy_h2_example_site >/dev/null")
 rc, out, _ = bash(XRAY_ENV + "xray_add_link 'vless://11111111-2222-3333-4444-555555555555@x.example.site:443?security=tls&type=tcp#dup'"
                   " >/dev/null; xray_add_link 'vless://11111111-2222-3333-4444-555555555555@x.example.site:443?security=tls&type=tcp#dup'")
@@ -382,10 +511,39 @@ chk("свой выход клиенту — строка «IP|выход», ос
     rc == 0 and f"{IP1}|{XT[1]}" in out.split() and IP2 in out.split(), out)
 rc, out, _ = bash(XRAY_ENV + '_xray_prepare; python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))[\'routing\'][\'rules\']))" "$XRAY_CONF"')
 rules = json.loads(out.strip().splitlines()[-1]) if rc == 0 and out.strip() else []
-own = [r for r in rules if r.get("ruleTag") == "client-out"]
+own = [r for r in rules if str(r.get("ruleTag")).startswith("client-out")]
 chk("в конфиге Xray — правило по адресу клиента перед общим",
     own and own[0]["source"] == [IP1] and own[0]["outboundTag"] == XT[1] and own[0]["inboundTag"] == ["tun-in"]
-    and rules.index(own[0]) < next(i for i, r in enumerate(rules) if r.get("ruleTag") != "client-out" and r.get("inboundTag")), rules)
+    and rules.index(own[0]) < next(i for i, r in enumerate(rules) if r not in own and r.get("inboundTag")), rules)
+rc, out, _ = bash(XRAY_ENV + f"xray_client_out {C2} {XT[0]} >/dev/null && _xray_prepare && xray_test && echo TEST-OK; "
+                  'python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))[\'routing\'][\'rules\']))" "$XRAY_CONF"')
+rules = json.loads(out.strip().splitlines()[-1]) if out.strip() else []
+own = [r.get("ruleTag") for r in rules if str(r.get("ruleTag")).startswith("client-out")]
+chk("два клиента на разных выходах — у правил разные ruleTag, Xray 26.9+ конфиг принимает",
+    "TEST-OK" in out and own == ["client-out-1", "client-out-2"], out)
+rc, out, _ = bash(XRAY_ENV + f"xray_client_out {C2} default >/dev/null && _xray_prepare")
+
+# Обновление Xray при работающем туннеле: конфиг, который новый бинарь не
+# принимает, туннель не роняет — возвращается прежний бинарь
+XUP = os.path.join(TMP, "xray-up")
+os.makedirs(XUP, exist_ok=True)
+for ver, test in (("26.99.1", 'echo "Failed to start: main: unknown new thing"; exit 23'), ("26.99.2", "exit 0")):
+    with open(os.path.join(XUP, "xray"), "w") as f:
+        f.write('#!/usr/bin/env bash\n[[ "$1" == version ]] && { echo "Xray %s (Xray, Penetrates Everything.)"; exit 0; }\n%s\n' % (ver, test))
+    os.chmod(os.path.join(XUP, "xray"), 0o755)
+    with zipfile.ZipFile(os.path.join(XUP, ver + ".zip"), "w") as z:
+        z.write(os.path.join(XUP, "xray"), "xray")
+XUP_ENV = (XRAY_ENV + f'cp "{XRAY_STUB}" "{XUP}/bin"; XRAY_BIN="{XUP}/bin"; XRAY_ASSET_DIR="{XUP}/assets"; mkdir -p "$XRAY_ASSET_DIR"; '
+           'xray_is_up() { return 0; }; xray_restart() { echo RESTARTED; }; ')
+rc, out, _ = bash(XUP_ENV + f'gh_fetch() {{ [[ "$1" == *.dgst ]] && return 1; cp "{XUP}/26.99.1.zip" "$2"; }}; '
+                  'xray_install update; echo rc=$?; "$XRAY_BIN" version')
+chk("обновление Xray: новый не принял конфиг — прежний бинарь на месте, туннель не перезапускался",
+    "rc=1" in out and "unknown new thing" in out and "Вернул прежний Xray: Xray 26.3.27" in out
+    and "RESTARTED" not in out and out.strip().splitlines()[-1].startswith("Xray 26.3.27"), out)
+rc, out, _ = bash(XUP_ENV + f'gh_fetch() {{ [[ "$1" == *.dgst ]] && return 1; cp "{XUP}/26.99.2.zip" "$2"; }}; '
+                  'xray_install update; echo rc=$?; "$XRAY_BIN" version')
+chk("обновление Xray: новый принял конфиг — туннель перезапускается на нём",
+    "RESTARTED" in out and out.strip().splitlines()[-1].startswith("Xray 26.99.2"), out)
 rc, out, _ = bash(XRAY_ENV + f"tunnel_client xray all >/dev/null; tunnel_client xray {C1} on >/dev/null; cat \"$XRAY_PEERS\"")
 chk("«все клиенты» и включение клиента свой выход не сбрасывают", f"{IP1}|{XT[1]}" in out.split(), out)
 rc, out, _ = bash(XRAY_ENV + f"xray_main_set {XT[1]} && py xray-main-get \"$XRAY_CONF\"")
@@ -448,6 +606,15 @@ mains = [r for r in xf["routing"]["rules"] if r.get("inboundTag")]
 chk("Xray: чужой тег tun — одно общее правило, выход по умолчанию меняется",
     rc == 0 and out.strip() == "B" and len(mains) == 1 and mains[0] == {"type": "field", "inboundTag": ["tun-in"], "outboundTag": "B"}
     and xf["inbounds"][0]["tag"] == "tun-in", [out, xf])
+chk("Xray: у входа tun имя xray0 и в старом конфиге без имени — Xray 26.x иначе называет его utunN",
+    xf["inbounds"][0]["settings"].get("name") == "xray0", xf["inbounds"][0])
+with open(XF, "w") as f:
+    json.dump({"inbounds": [{"protocol": "tun", "tag": "tun-in", "settings": {"name": "utun42", "mtu": 1400}}],
+               "outbounds": [{"protocol": "vless", "tag": "A"}]}, f)
+rc, out, _ = bash(f'py xray-prepare "{XF}" native')
+xf = json.load(open(XF))
+chk("Xray: чужое имя устройства — снова xray0, остальные настройки входа на месте",
+    rc == 0 and xf["inbounds"][0]["settings"] == {"name": "xray0", "mtu": 1400}, xf["inbounds"][0])
 bash("client_remove xc1 >/dev/null 2>&1")
 
 # ── 4. Служебные скрипты ──────────────────────────────────
@@ -477,8 +644,8 @@ _dns_emit_helpers && _cascade_persist && _exits_write_unit && expire_install >/d
 emit_script "$T2S_ROUTING_SCRIPT" 't2s_routing_run "$@"' T2S_IF T2S_TABLE T2S_ADDR "${{RT_FUNCS[@]}}" t2s_routing_run
 _xray_emit_routing
 emit_script "$WGOBF_FW" 'wgobf_fw_run "$@"' WGOBF_STATE WGOBF_TAG WGOBF_IF ipt_del_grep ipt_del_tagged wgobf_get wgobf_fw_run
-emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${{RT_FUNCS[@]}}" warp_wg_bringup
-emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE WARP_BACKEND_FILE WARP_HEALTH_LOG "${{RT_FUNCS[@]}}" warp_health_run
+emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${{RT_FUNCS[@]}}" warp_awg_params warp_wg_bringup
+_warp_health_emit
 emit_script "$USQUE_UP_HOOK" 'usque_on_connect' WARP_IF WARP_TABLE WARP_PEERS USQUE_LOG "${{RT_FUNCS[@]}}" usque_on_connect
 ls "{ROOT}/scripts"''')
 scripts = out.split()
@@ -516,18 +683,54 @@ with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
     f.write("active\ntun_mode=tun2socks\n")
 run_and_check("Xray: клиенты из списка в таблицу 201", "XRAY_ROUTING_SCRIPT", "start",
               must=[r"ip route replace default dev xray0 table 201", r"-A POSTROUTING .* -o xray0 -j MASQUERADE"])
+with open(os.path.join(ROOT, "xray.peers.wgobf"), "w") as f:
+    f.write("10.77.1.6|A\n")
+run_and_check("Xray (tun2socks): клиенты обфускатора в таблицу 201, их NAT не трогаем", "XRAY_ROUTING_SCRIPT", "start",
+              must=[r"ip rule add from 10\.77\.1\.6 lookup 201 priority 201"],
+              must_not=[r"-I POSTROUTING 1 -s 10\.77\.1\.0/24 -o xray0 -j RETURN"])
 with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
     f.write("active\ntun_mode=native\n")
-run_and_check("Xray с inbound tun: без NAT — Xray видит адрес клиента", "XRAY_ROUTING_SCRIPT", "start",
-              must=[r"ip route replace default dev xray0 table 201", r"-D POSTROUTING .* -o xray0 -j MASQUERADE"],
+run_and_check("Xray с inbound tun: без NAT — Xray видит адрес клиента (и клиента обфускатора)", "XRAY_ROUTING_SCRIPT", "start",
+              must=[r"ip route replace default dev xray0 table 201", r"-D POSTROUTING .* -o xray0 -j MASQUERADE",
+                    r"ip rule add from 10\.77\.1\.6 lookup 201 priority 201",
+                    r"-t nat -I POSTROUTING 1 -s 10\.77\.1\.0/24 -o xray0 -j RETURN -m comment --comment awg2-tun-xray0"],
               must_not=[r"-A POSTROUTING .* -o xray0 -j MASQUERADE"])
 os.remove(os.path.join(ROOT, "etc/xray/state"))
-run_and_check("Exit-ноды: ECMP и персональная нода", "EXITS_SCRIPT", "start",
+os.remove(os.path.join(ROOT, "xray.peers.wgobf"))
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_peers.list.wgobf"), "w") as f:
+    f.write("10.77.1.7|nl\n10.77.1.8\n10.77.1.9|gone\n")
+run_and_check("Exit-ноды: ECMP и персональная нода (и у клиентов обфускатора)", "EXITS_SCRIPT", "start",
               must=[r"nexthop dev awg-exit-de weight 1 nexthop dev awg-exit-nl weight 1",
                     r"ip route replace default dev awg-exit-nl table 211",
                     r"ip rule add from 10\.23\.45\.2 lookup 211 priority 202",
-                    r"ip rule add from 10\.23\.45\.3 lookup 202 priority 202"])
+                    r"ip rule add from 10\.23\.45\.3 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.7 lookup 211 priority 202",
+                    r"ip rule add from 10\.77\.1\.8 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.9 lookup 202 priority 202"])
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state"), "w") as f:
+    f.write("active\nmode=all\nbalancer=ecmp\nsingle_exit=\n")
+run_and_check("Exit-ноды «все клиенты AWG»: подсеть awg0 целиком, клиенты обфускатора — своим списком", "EXITS_SCRIPT", "start",
+              must=[r"ip rule add from 10\.23\.45\.0/24 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.7 lookup 211 priority 202",
+                    r"ip rule add from 10\.77\.1\.8 lookup 202 priority 202"],
+              must_not=[r"from 10\.23\.45\.2 lookup"])
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state"), "w") as f:
+    f.write("active\nmode=peers\nbalancer=ecmp\nsingle_exit=\n")
+os.remove(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_peers.list.wgobf"))
 run_and_check("Exit-ноды: остановка", "EXITS_SCRIPT", "stop", must_not=[r"-A "])
+run_and_check("Exit-ноды: проход сторожа — пробы через ноды, без «command not found»", "EXITS_SCRIPT", "health",
+              must=[r"ip link show awg-exit-de", r"ip link show awg-exit-nl"])
+hu = open(os.path.join(ROOT, "units", "awg2-exits-health.timer")).read()
+hs = open(os.path.join(ROOT, "units", "awg2-exits-health.service")).read()
+chk("сторож exit-нод: таймер раз в 30 с, служба зовёт «health» скрипта маршрутов",
+    "OnUnitActiveSec=30" in hu and re.search(r"(?m)^ExecStart=\S+ health$", hs), [hu, hs])
+# Клиенты WG + обфускатора в WARP: список «.wgobf» рядом со списком WARP читает тот же rt_up
+rc, out, _ = bash('echo 10.23.45.2 > "$WARP_PEERS"; printf "10.77.1.5\\n" > "$WARP_PEERS.wgobf"; echo "$WARP_PEERS"')
+run_and_check("WARP (хук usque): клиенты AWG и обфускатора — в таблицу 200, MSS и для wgobf0", "USQUE_UP_HOOK",
+              must=[r"ip rule add from 10\.23\.45\.2 lookup 200 priority 200",
+                    r"ip rule add from 10\.77\.1\.5 lookup 200 priority 200",
+                    r"-i warp0 -o wgobf0 -p tcp .*TCPMSS"])
+bash('rm -f "$WARP_PEERS" "$WARP_PEERS.wgobf"')
 run_and_check("WG+обфускатор: правила по метке", "WGOBF_FW", "up",
               must=[r"-I INPUT 1 -p udp --dport 40001 ! -i lo -j DROP -m comment --comment awg-wgobf",
                     r"-t nat -A POSTROUTING -s 10\.77\.1\.0/24 ! -o wgobf0 -j MASQUERADE"])
@@ -538,9 +741,153 @@ with open(conf) as f:
 with open(LINKS, "w") as f:
     f.write("awg0\n")
 run_and_check("WARP: подъём warp0 только с IPv4", "WARP_AUTOSTART_SCRIPT",
-              must=[r"ip link add dev warp0 type wireguard", r"ip -4 addr add 172\.16\.0\.2/32 dev warp0",
+              must=[r"ip link add dev warp0 type wireguard", r"(?m)^wg setconf warp0", r"ip -4 addr add 172\.16\.0\.2/32 dev warp0",
                     r"ip route replace default dev warp0 src 172\.16\.0\.2 table 200"],
-              must_not=[r"2606::1"])
+              must_not=[r"2606::1", r"awg setconf", r"type amneziawg"])
+# Профиль «WARP для России» с параметрами AmneziaWG: чистый WireGuard к Cloudflare
+# оттуда режут, поэтому warp0 — amneziawg, и параметры уходят в awg setconf
+with open(os.path.join(TMP, "warp0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = P\nJc = 4\nJmin = 40\nJmax = 70\nS1 = 0\nS2 = 0\nH1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\n"
+            "I1 = <b 0xc2000000011419fa>\r\nAddress = 172.16.0.2/32\nMTU = 1280\n[Peer]\nPublicKey = Q\nEndpoint = 162.159.192.1:2408\n")
+run_and_check("WARP: профиль с параметрами AmneziaWG — warp0 поднимается через AmneziaWG", "WARP_AUTOSTART_SCRIPT",
+              must=[r"ip link add dev warp0 type amneziawg", r"awg setconf warp0", r"ip -4 addr add 172\.16\.0\.2/32 dev warp0"],
+              must_not=[r"type wireguard", r"(?m)^wg setconf warp0"])
+rc, out, _ = bash(f'WARP_CONF="{TMP}/warp0.conf"; warp_awg_params')
+chk("WARP: параметры AmneziaWG из профиля — все и без \\r, ключи и адреса не попадают",
+    out.splitlines() == ["Jc = 4", "Jmin = 40", "Jmax = 70", "S1 = 0", "S2 = 0", "H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4",
+                         "I1 = <b 0xc2000000011419fa>"], out)
+# Прокси до Telegram: выходы проверяются разом — мёртвые exit-ноды по 8 с
+# каждая растягивали поиск на полминуты
+rc, out, _ = bash('xray_port_owners() { echo "xray (pid 1)"; }; t2s_proxy() { echo 127.0.0.1:1081; }; '
+                  'bot_proxy_probe() { sleep 2; [[ "$1" == *10808 ]]; }; s=$SECONDS; api_main bot proxy candidates; echo "took=$((SECONDS - s))"')
+cand = json.loads(out.strip().splitlines()[-2]) if rc == 0 else {}
+chk("прокси до Telegram: выходы проверяются разом, порядок и ответы на месте",
+    [(r["url"], r["ok"]) for r in cand.get("data") or []] == [("socks5://127.0.0.1:10808", True), ("socks5://127.0.0.1:1081", False)]
+    and int(out.strip().splitlines()[-1].split("=")[1]) < 4, out)
+
+# Профиль, скопированный с телефона: «[» в начале потерялась, \r, «Ключ=значение»,
+# лишние ключи генератора — импорт чинит разметку, warp0 поднимается из него
+WIMP = os.path.join(TMP, "warp-import.conf")
+with open(WIMP, "w") as f:
+    f.write("Interface]\r\nPrivateKey=PRIVKEYTEST=\r\nAddress = 172.16.0.2, 2606:4700::2\r\n  MTU = 1280\r\nS3 = 0\r\nJc = 4\r\n"
+            "I1 = <b 0xc40000000101>\r\nRandomTrailers = on\r\n\r\npeer\r\nPublicKey = PUBKEYTEST=\r\nEndpoint = 192.0.2.1:1074\r\n")
+rc, out, err = bash(f'_warp_deps() {{ return 0; }}; mkdir -p "$(dirname "$WARP_CONF")"; warp_import < "{WIMP}" && '
+                    'cat "$WARP_CONF" && echo "@@" && warp_awg_params && echo "@@" && awk -F" = " "/^PrivateKey/{{print \\$2}}" "$WARP_CONF"')
+chk("импорт WARP: «Interface]» без скобки, \\r и «Ключ=значение» — профиль принят и разобран",
+    rc == 0 and "[Interface]" in out and "[Peer]" in out and "\r" not in out
+    and out.split("@@")[1].split() == ["S3", "=", "0", "Jc", "=", "4", "I1", "=", "<b", "0xc40000000101>"]
+    and out.split("@@")[2].strip() == "PRIVKEYTEST=", [out, err])
+rm_warp = 'rm -f "$WARP_CONF" "$WARP_PROFILE" "$WARP_ACCOUNT"'
+bash(rm_warp)
+rc, out, _ = bash('mkdir -p "$(dirname "$WARP_STATE")"; touch "$WARP_STATE"; warp_failed && echo F; '
+                  'echo warp0 >> "$LINKS"; warp_failed || echo U; sed -i "/^warp0$/d" "$LINKS"; '
+                  'rm -f "$WARP_STATE"; warp_failed || echo OFF')
+chk("WARP: «упал» — включён, а warp0 нет; поднят или выключен руками — не сбой", out.split() == ["F", "U", "OFF"], out)
+rc, out, _ = bash('ip() { [[ "$*" == "-d link show warp0" ]] && echo "5: warp0: <POINTOPOINT> amneziawg"; }; warp_tool; '
+                  'ip() { echo "5: warp0: <POINTOPOINT> wireguard"; }; warp_tool')
+chk("WARP: с warp0 из профиля AWG говорим через awg, с обычным — через wg", out.split() == ["awg", "wg"], out)
+with open(os.path.join(TMP, "warp0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32, 2606::1/128\nMTU = 1280\n[Peer]\nPublicKey = Q\nEndpoint = 162.159.192.1:2408\n")
+
+# Health-check WARP: заглушки ping (HC_PING — файл: есть — Cloudflare отвечает) и
+# ip с состоянием warp0 (link add/del — в LINKS) и маршрута таблицы 200 (файл HC_RT)
+HCBIN = os.path.join(TMP, "hcbin")
+os.makedirs(HCBIN, exist_ok=True)
+HC_PING, HC_RT = os.path.join(TMP, "hc-ping-ok"), os.path.join(TMP, "hc-rt")
+HC_STUBS = {
+    "ping": r"""echo "ping $*" >> "$CALLS"; [[ -f "$HC_PING" ]]""",
+    "ip": r"""case "$*" in
+  "link add dev warp0"*) echo warp0 >> "$LINKS" ;;
+  "link del warp0") sed -i "/^warp0$/d" "$LINKS" ;;
+  "-4 -o addr show dev warp0") echo "ip $*" >> "$CALLS"; echo "9: warp0    inet 172.16.0.2/32 scope global warp0"; exit 0 ;;
+  "route show table 200") echo "ip $*" >> "$CALLS"; [[ -f "$HC_RT" ]] && echo "default dev warp0 scope link"; exit 0 ;;
+  "route replace default dev warp0"*"table 200") touch "$HC_RT" ;;
+  "route flush table 200") rm -f "$HC_RT" ;;
+esac
+PATH="${PATH#"${0%/*}:"}" exec ip "$@"
+""",
+}
+for name, body in HC_STUBS.items():
+    with open(os.path.join(HCBIN, name), "w") as f:
+        f.write("#!/usr/bin/env bash\n" + body + "\n")
+    os.chmod(os.path.join(HCBIN, name), 0o755)
+HCPRE = f'export PATH="{HCBIN}:$PATH" HC_PING="{HC_PING}" HC_RT="{HC_RT}"; '
+HCF = {k: os.path.join(ROOT, n) for k, n in (("fails", "warp-fails"), ("retry", "warp-retry"), ("log", "warp-health.log"))}
+
+
+def hc_run(ping_ok, n=1):
+    if ping_ok:
+        open(HC_PING, "w").close()
+    elif os.path.exists(HC_PING):
+        os.remove(HC_PING)
+    reset_calls()
+    for _ in range(n):
+        bash(HCPRE + 'bash "$WARP_HEALTH_SCRIPT"')
+    return calls()
+
+
+def hc_read(k):
+    try:
+        return open(HCF[k]).read().strip()
+    except OSError:
+        return None
+
+
+rc, out, err = bash(f'WARP_CONF="{TMP}/warp0.conf"; _warp_health_emit; mkdir -p "$(dirname "$WARP_STATE")"; '
+                    'touch "$WARP_STATE"; rm -f "$WARP_STATE.failed" "$WARP_BACKEND_FILE"; echo "$WARP_STATE"')
+WSTATE = out.strip()
+with open(LINKS, "w") as f:
+    f.write("awg0\nwarp0\n")
+open(HC_RT, "w").close()
+log = hc_run(True)
+chk("health-check: WARP отвечает — счётчик в ноль, ничего не трогает",
+    rc == 0 and hc_read("fails") == "0" and "link del" not in log and "-I warp0 1.1.1.1" in log, [err, log])
+log = hc_run(False, 2)
+chk("два провала подряд — только счёт, клиенты в туннеле",
+    hc_read("fails") == "2" and "link del" not in log and not os.path.exists(WSTATE + ".failed"), log)
+log = hc_run(False)
+chk("третий провал — клиенты напрямую: маршруты сняты, warp0 убран, WARP остаётся включённым с меткой",
+    "ip link del warp0" in log and "route flush table 200" in log and os.path.exists(WSTATE)
+    and os.path.exists(WSTATE + ".failed") and "FAILOVER" in (open(HCF["log"]).read()), log)
+log = hc_run(False)
+chk("после отказа — пробует вернуть WARP без клиентов: warp0 поднят и убран, маршрутов клиентов нет",
+    "ip link add dev warp0" in log and "ip link del warp0" in log and "route replace default dev warp0" not in log
+    and "lookup 200" not in log.replace("ip rule del lookup 200", "") and hc_read("retry") == "1"
+    and os.path.exists(WSTATE + ".failed") and "RETRY 1" in open(HCF["log"]).read(), log)
+hc_run(False, 9)
+log = hc_run(False)
+chk("первые 10 попыток — каждую минуту, дальше — раз в 5 минут (11-я пропущена)",
+    hc_read("retry") == "11" and "link add" not in log, [hc_read("retry"), log])
+hc_run(False, 3)
+log = hc_run(False)
+chk("15-я — снова попытка: и через час пробует, пока не выключат", hc_read("retry") == "15" and "ip link add dev warp0" in log,
+    [hc_read("retry"), log])
+with open(os.path.join(ROOT, "warp-retry"), "w") as f:
+    f.write("19")
+with open(LINKS, "a") as f:
+    f.write("xray0\n")
+log = hc_run(True)
+chk("пока WARP лежал, включили Xray — WARP не возвращает, чтобы не мешать",
+    "link add" not in log and os.path.exists(WSTATE + ".failed"), log)
+with open(LINKS, "w") as f:
+    f.write("awg0\n")
+with open(os.path.join(ROOT, "warp-retry"), "w") as f:
+    f.write("19")
+log = hc_run(True)
+chk("Cloudflare ответил — WARP вернулся: маршруты клиентов с адресом warp0, метка и счётчики сброшены",
+    "ip link add dev warp0" in log and "ip route replace default dev warp0 src 172.16.0.2 table 200" in log
+    and "ip link del" not in log and not os.path.exists(WSTATE + ".failed") and hc_read("retry") is None
+    and hc_read("fails") == "0" and "RECOVERED" in open(HCF["log"]).read(), log)
+os.remove(HC_RT)
+log = hc_run(True)
+chk("warp0 есть, а маршрутов клиентов нет (попытку прервали) — доставляет их",
+    "ip route replace default dev warp0 src 172.16.0.2 table 200" in log, log)
+with open(LINKS, "w") as f:
+    f.write("awg0\n")
+os.remove(WSTATE)
+log = hc_run(True)
+chk("WARP выключен руками — health-check его не поднимает", "link add" not in log and "route replace" not in log, log)
+bash('rm -f "$WARP_STATE.failed"')
 
 # ── 5. Разбор iptables-save ───────────────────────────────
 print("iptables-save")
@@ -605,6 +952,18 @@ chk("фоновая проверка обновлений не держит от
 d = r.get("data") or {}
 chk("api status", r.get("ok") and d["server"]["exists"] and d["server"]["clients"] == 2
     and d["server"]["proto"] == "2.0" and d["tunnels"]["warp"] == "none", r)
+open(CALLS, "w").close()
+r = api("status")
+with open(CALLS) as f:
+    n = sum(1 for ln in f if ln.startswith("ip -4 -o addr show"))
+chk("api status: адрес сервера узнаётся один раз (не в каждой подоболочке)", r.get("ok") and n == 1, n)
+r = api("tunnels", "status")
+chk("api tunnels status — счётчики интерфейсов туннелей (поднятых нет — пусто)",
+    r.get("ok") and (r.get("data") or {}).get("ifs") == [], r)
+r = api("warp", "status")
+d = r.get("data") or {}
+chk("api warp status — интерфейс и счётчики для карточки",
+    r.get("ok") and d.get("iface") == "warp0" and d.get("rx") == 0 and d.get("hs") == 0 and "endpoint" in d, r)
 r = api("clients", "list")
 rows = r.get("data") or []
 chk("api clients list", [c["name"] for c in rows] == ["alice", "bob"] and rows[0]["ip"] == "10.23.45.2"
@@ -757,7 +1116,7 @@ a = cl("alice")
 chk("лимит меньше израсходованного — сразу блок", r.get("ok") and a.get("blocked") and a.get("blocked_by") == "traffic"
     and a.get("limit") == 2**20 and a.get("period") == "month" and a.get("used", 0) >= 2**20, [r, a])
 rc, out, _ = bash('clients_tsv | grep "^alice"')
-chk("блок за трафик: адрес в orig_ips, метка blocked_by", "127.0.0.2/32" in out and out.rstrip("\n").endswith("\ttraffic"),
+chk("блок за трафик: адрес в orig_ips, метка blocked_by", "127.0.0.2/32" in out and out.split("\t")[7] == "traffic",
     repr(out))
 rc, out, _ = bash('client_expire_set alice $(( $(date +%s) + 86400 )) >/dev/null; clients_tsv | grep "^alice"')
 chk("новый срок блок за трафик не снимает", "\t127.0.0.2/32\t" in out, repr(out))
@@ -769,6 +1128,9 @@ r = api("traffic", "daily")
 d = r.get("data") or {}
 chk("api traffic daily — сервер за 30 дней с разбивкой по клиентам", r.get("ok") and len(d.get("days", [])) == 30
     and d["days"][-1] == day and d.get("total") == 5 * 2**20 + 200 and d["clients"][0]["name"] == "alice", r)
+al = (d.get("clients") or [{}])[0]
+chk("api traffic daily — у клиента ряд по дням для мини-графика", len(al.get("d") or []) == 30
+    and sum(al["d"]) == al["rx"] + al["tx"], al)
 r = api("traffic", "daily", "alice", "7")
 chk("api traffic daily ИМЯ ДНЕЙ", r.get("ok") and len(r["data"]["days"]) == 7 and r["data"]["name"] == "alice"
     and "clients" not in r["data"], r)
@@ -849,6 +1211,188 @@ tick()
 chk("пустой снимок: накопленное до учёта не идёт в сегодня", cl("alice").get("today") == 0, cl("alice"))
 rc, out, _ = bash('ls "$EXPIRE_STATE_DIR" | grep "^transfer"')
 chk("снимки счётчиков не остаются — только последний, для сторожа таймера", out.split() == ["transfer"], out)
+# ── Скорость клиентов и мягкий лимит ──
+print("Скорость клиентов")
+with open(LINKS, "a") as f:
+    f.write("awg0\n")
+TCB = CALLS + ".tcbusy"
+TCF = CALLS + ".tcfail"
+rc, out, _ = bash("""f=$(mktemp); cat > "$f" <<'EOC'
+[Interface]
+PrivateKey = x
+
+[Peer]
+# s1
+# speed=20
+PublicKey = P1=
+AllowedIPs = 10.9.0.2/32, fd00::2/128
+
+[Peer]
+# s2
+# speed=50
+# limit_slow=2
+# slowed_by=traffic
+PublicKey = P2=
+AllowedIPs = 10.9.0.3/32
+
+[Peer]
+# s3
+# limit_slow=5
+PublicKey = P3=
+AllowedIPs = 10.9.0.4/32
+
+[Peer]
+# s4
+# speed=10
+# orig_ips=10.9.0.5/32
+PublicKey = P4=
+AllowedIPs = 127.0.0.2/32
+
+[Peer]
+# s5
+# speed=12x
+PublicKey = P5=
+AllowedIPs = 10.9.0.6/32 junk
+
+[Peer]
+# s6
+# speed=²
+PublicKey = P6=
+AllowedIPs = 10.9.0.7/32
+EOC
+py speed-plan "$f" 127.0.0.2/32""")
+chk("план скорости: своя скорость, замедленный — меньшее из двух, IPv6, без заблокированных и мусора (и «²»)",
+    out.splitlines() == ["10.9.0.2/32\t20", "fd00::2/128\t20", "10.9.0.3/32\t2"], repr(out))
+r = api("client", "speed", "alice", "20")
+reset_calls()
+r = api("client", "speed", "alice", "20")
+c = calls()
+chk("api client speed: повторно то же — tc не трогается", r.get("ok") and "tc -batch" not in c, [r, c])
+api("client", "speed", "alice", "off")
+reset_calls()
+r = api("client", "speed", "alice", "25")
+c = calls()
+a = cl("alice")
+ipa = a.get("ip")
+chk("api client speed 25: HTB на awg0, вход — в ifb, полоса по адресу клиента в обе стороны",
+    r.get("ok") and a.get("speed") == 25 and "tc> qdisc add dev awg0 root handle a2: htb default 1" in c
+    and f"tc> filter add dev awg0 parent a2: protocol ip prio 1 u32 match ip dst {ipa}/32 flowid a2:2" in c
+    and f"match ip src {ipa}/32 action mirred egress redirect dev awg0-ifb" in c
+    and "tc> class add dev awg0-ifb parent a2: classid a2:2 htb rate 25mbit ceil 25mbit" in c
+    and "ip link add awg0-ifb type ifb" in c, [r, a, c])
+rc, out, _ = bash('grep -c "^# speed=25" "$SERVER_CONF"; cat "$EXPIRE_STATE_DIR/speed"')
+chk("скорость — меткой у клиента в конфиге сервера; план записан", out.split("\n")[0] == "1" and f"{ipa}/32\t25" in out, out)
+for bad in ("0.5", "-3", "много", "20000", "99999999"):
+    r = api("client", "speed", "alice", bad)
+    if r.get("ok"):
+        break
+chk("api client speed: не число, дробь, больше 10000 — отказ", r.get("ok") is False and "Мбит/с" in (r.get("error") or ""), [bad, r])
+r = api("client", "speed", "alice", "020")
+chk("api client speed «020» — 20, а не восьмеричное", r.get("ok") and cl("alice").get("speed") == 20, cl("alice"))
+r = api("client", "speed", "nobody", "5")
+chk("api client speed: нет клиента", r.get("ok") is False, r)
+# Чужая очередь на awg0 — не трогаем
+api("client", "speed", "alice", "off")
+with open(TCB, "w") as f:
+    f.write("qdisc cake 8001: root refcnt 2 bandwidth 100Mbit\n")
+reset_calls()
+r = api("client", "speed", "alice", "30")
+os.remove(TCB)
+chk("своя очередь tc на awg0 (поставлена руками) — не трогаем, честная ошибка",
+    r.get("ok") is False and "своя очередь" in (r.get("error") or "") and "tc -batch" not in calls(), [r, calls()])
+# Ядро без fq_codel — ставится sfq; без ifb и полисера — хотя бы скачивание
+with open(TCF, "w") as f:
+    f.write("Error: Specified qdisc kind is unknown.\n")
+reset_calls()
+rc, out, _ = bash('speed_apply; echo "rc=$? $SPEED_ERR"')
+os.remove(TCF)
+c = calls()
+chk("tc отверг всё — перебраны очереди (fq_codel, sfq, pfifo) и режимы отдачи (ifb, полисер, без), ошибка с текстом tc",
+    "rc=1 tc: Error: Specified qdisc kind is unknown." in out and "sfq perturb 10" in c and "pfifo limit 1000" in c
+    and "police rate 30mbit" in c and c.count("tc -batch") == 9 and "tc qdisc del dev awg0 ingress" in c, [out, c[-300:]])
+reset_calls()
+rc, out, _ = bash('speed_apply; echo "rc=$?"; tc qdisc show dev awg0 root')
+chk("после ошибки — следующий проход ставит заново", "rc=0" in out and "htb a2:" in out, out)
+# Перезапуск awg0: корень снова «по умолчанию» — таймер ставит заново
+reset_calls()
+rc, out, _ = bash('rm -f "$CALLS.tcroot"; speed_check; tc qdisc show dev awg0 root')
+chk("перезапуск awg0 (правила tc пропали) — проход таймера ставит их заново", "htb a2:" in out and "tc -batch" in calls(), out)
+reset_calls()
+bash('speed_check')
+chk("проход таймера: ничего не изменилось — tc не трогается", "tc -batch" not in calls(), calls())
+# Ограничений не осталось — правила снимаются, ifb удаляется
+with open(LINKS, "a") as f:
+    f.write("awg0-ifb\n")
+reset_calls()
+r = api("client", "speed", "alice", "off")
+c = calls()
+rc, out, _ = bash('ls "$EXPIRE_STATE_DIR" | grep "^speed" ; tc qdisc show dev awg0 root')
+chk("speed off у последнего — tc снят (корень, вход, ifb), состояние стёрто",
+    r.get("ok") and "tc qdisc del dev awg0 root" in c and "tc qdisc del dev awg0 ingress" in c
+    and "ip link del awg0-ifb" in c and "noqueue" in out and "speed" not in out.split("qdisc")[0], [c, out])
+reset_calls()
+bash('speed_check')
+chk("ограничений нет — проход таймера tc не зовёт", "tc " not in calls(), calls())
+# Мягкий лимит: исчерпал — замедлен, не заблокирован
+dump_with({"alice": (100, 100), "bob": (10, 10)})
+tick()
+r = api("client", "limit-mode", "alice", "2")
+chk("api client limit-mode 2", r.get("ok") and cl("alice").get("limit_slow") == 2, [r, cl("alice")])
+api("client", "limit", "alice", "1M", "total")
+dump_with({"alice": (100 + 3 * 2**20, 100), "bob": (10, 10)})
+reset_calls()
+with open(os.path.join(ROOT, "bot.conf"), "w") as f:
+    f.write('BOT_TOKEN="1:AA"\nADMIN_ID=11\n')
+rc, out, _ = bash('curl() { cat >> "$CALLS"; }; traffic_tick; tail -2 "$EXPIRE_LOG"')
+a = cl("alice")
+c = calls()
+chk("мягкий лимит: исчерпал — замедлен до 2 Мбит/с, не заблокирован, админу — сообщение",
+    not a.get("blocked") and a.get("slowed") and "rate 2mbit" in c and "замедлен до 2 Мбит/с" in c
+    and "slow: alice до 2 Мбит/с" in out, [a, out, c[-600:]])
+api("client", "speed", "alice", "1")
+rc, out, _ = bash('cat "$EXPIRE_STATE_DIR/speed"')
+chk("своя скорость меньше «замедления» — действует меньшая", out.strip().endswith("\t1"), out)
+api("client", "speed", "alice", "off")
+# Режим «блокировать» у замедленного — блок
+reset_calls()
+r = api("client", "limit-mode", "alice", "block")
+a = cl("alice")
+chk("limit-mode block у замедленного — блок вместо замедления, tc снят", r.get("ok") and a.get("blocked_by") == "traffic"
+    and not a.get("slowed") and "tc qdisc del dev awg0 root" in calls(), [r, a])
+# И обратно: заблокированный за трафик при «замедлять» — разблокирован и замедлен
+r = api("client", "limit-mode", "alice", "5")
+a = cl("alice")
+chk("limit-mode 5 у заблокированного за трафик — разблокирован и замедлен до 5", r.get("ok") and not a.get("blocked")
+    and a.get("slowed") and a.get("ip") == ipa, [r, a])
+r = api("client", "limit-mode", "alice", "ноль")
+chk("api client limit-mode: не block и не число — отказ", r.get("ok") is False, r)
+# Лимит снят — снова полная скорость
+reset_calls()
+rc, out, _ = bash('curl() { cat >> "$CALLS"; }; client_limit_set alice off >/dev/null; tail -1 "$EXPIRE_LOG"')
+a = cl("alice")
+chk("лимит снят — замедление снято, сообщение «снова полная скорость», tc снят",
+    not a.get("slowed") and "unslow: alice" in out and "снова полная скорость" in calls()
+    and "tc qdisc del dev awg0 root" in calls(), [a, out])
+os.remove(os.path.join(ROOT, "bot.conf"))
+# Скрипт таймера несёт функции скорости
+api("client", "speed", "bob", "7")
+bash('rm -f "$CALLS.tcroot"')
+reset_calls()
+r = subprocess.run(["bash", SCR("EXPIRE_BIN")], capture_output=True, text=True, timeout=60, cwd="/",
+                   env={k: v for k, v in ENV.items() if k in ("PATH", "CALLS", "LINKS", "ACTIVE", "IPT_SAVE", "AWG_DUMP")})
+chk("скрипт таймера: правила скорости ставит сам, без ошибок", r.returncode == 0 and not r.stderr.strip()
+    and "rate 7mbit" in calls(), [r.stderr[-400:], calls()[-400:]])
+rc, out, _ = bash('clients_tsv | grep "^bob" | cut -f9')
+chk("clients_tsv: скорость — 9-й столбец", out.strip() == "7", repr(out))
+api("client", "limit-mode", "alice", "block")
+api("client", "speed", "bob", "off")
+with open(LINKS) as f:
+    links = f.read()
+with open(LINKS, "w") as f:
+    f.write(links.replace("awg0\n", "", 1).replace("awg0-ifb\n", ""))
+# Счётчики — к прежним: дальше тесты считают прирост от них
+dump_with({"alice": (100, 100), "bob": (10, 10)})
+tick()
 # Размер лимита: «500B» — не 500 ГБ; переполнение и не-ASCII цифры — ошибка
 rc, out, _ = bash('for v in 500B 500iB 2000000T 9999999T "١٢G" 0.0001K; do py size-parse "$v" >/dev/null 2>&1 && echo "$v"; done; '
                   'for v in 500MB 1.5T 50 2GiB 1024T; do py size-parse "$v" >/dev/null 2>&1 || echo "!$v"; done')
@@ -1348,6 +1892,79 @@ with open(EXIT2) as f:
     ex2 = f.read()
 chk("exit-нода из бэкапа — без хуков, с Table = off", "PostUp" not in ex2 and "Table = off" in ex2
     and not os.path.exists(os.path.join(AWGD, "x.conf")), ex2)
+nodes = {n["name"]: n for n in (api("exits", "status").get("data") or {}).get("nodes") or []}
+chk("api exits status — у ноды адрес, протокол и счётчики",
+    nodes.get("n2", {}).get("endpoint") == "1.2.3.4:51820" and nodes["n2"]["proto"] == "wg"
+    and nodes["n2"]["up"] is False and nodes["n2"]["rx"] == 0 and nodes["n2"]["hs"] == 0, nodes)
+# Поднятая нода: проверка выхода в интернет через неё (curl) — только по «status check»
+with open(LINKS) as f:
+    links0 = f.read()
+with open(LINKS, "a") as f:
+    f.write("awg-exit-n2\n")
+t0 = time.time()
+r = api("exits", "status", env={"PATH": SLOW + ":" + ENV["PATH"]})
+chk("api exits status не ждёт проверку выхода через ноды (её зовут список клиентов и обзор)",
+    r.get("ok") and time.time() - t0 < 4 and "интернет" not in r.get("log", ""), [time.time() - t0, r.get("log", "")[-300:]])
+r = api("exits", "status", "check")
+chk("api exits status check — с проверкой выхода в интернет через ноду", r.get("ok") and "интернет" in r.get("log", ""),
+    r.get("log", "")[-300:])
+# Сторож exit-нод: порядок общего выхода, состояние нод, сводка для оповещений бота
+EXST, HD = os.path.join(AWGD, "exits_state"), os.path.join(ROOT, "run/exits-health")
+st_was = open(EXST).read() if os.path.exists(EXST) else None
+with open(os.path.join(AWGD, "awg-exit-n3.conf"), "w") as f:
+    f.write("[Interface]\nTable = off\n[Peer]\nEndpoint = 5.6.7.8:51820\n")
+with open(LINKS, "a") as f:
+    f.write("awg-exit-n3\n")
+with open(EXST, "w") as f:
+    f.write("inactive\nmode=peers\nbalancer=single\nsingle_exit=\norder=\n")
+r = api("exits", "order", "n3", "n2")
+d = api("exits", "status").get("data") or {}
+st = open(EXST).read()
+chk("exits order: первая — основная, дальше запасные; в статусе порядок и общий выход",
+    r.get("ok") and "single_exit=n3" in st and "order=n2" in st and (d.get("order") or [])[:2] == ["n3", "n2"]
+    and "Порядок общего выхода: n3 → n2" in r.get("log", ""), [r.get("log", "")[-300:], st, d.get("order")])
+r1, r2 = api("exits", "order", "zz"), api("exits", "order")
+chk("exits order: нет такой ноды или пусто — отказ, порядок прежний",
+    r1.get("ok") is False and r2.get("ok") is False
+    and ((api("exits", "status").get("data") or {}).get("order") or [])[:2] == ["n3", "n2"],
+    [r1, r2])
+os.makedirs(HD, exist_ok=True)
+with open(os.path.join(HD, "n3"), "w") as f:
+    f.write("down 3 0 1791500000 nonet\n")
+nodes = {n["name"]: n for n in (api("exits", "status").get("data") or {}).get("nodes") or []}
+rc, out, _ = bash("exits_dead_list; exits_order | paste -sd' '; exits_live_nodes | paste -sd' '")
+chk("нода упала у сторожа: в статусе health=down, с какого времени и причина; живые — без неё, порядок прежний",
+    nodes.get("n3", {}).get("health") == "down" and nodes["n3"].get("why") == "nonet" and nodes["n3"].get("since") == 1791500000
+    and nodes.get("n2", {}).get("health") == "" and out.split("\n")[0] == "n3:nonet"
+    and out.split("\n")[1].startswith("n3 n2") and out.split("\n")[2] == "n2", [nodes, out])
+rc, out, _ = bash("_exits_node_line n3")
+chk("статус ноды в журнале экрана: не отвечает с …, причина, выпала из общего выхода",
+    "не отвечает с" in out and "выхода в интернет нет" in out and "выпала из общего выхода" in out, out)
+with open(ACTIVE, "a") as f:
+    f.write("awg-exits-routing.service\nawg2-exits-health.timer\n")
+t = (api("status").get("data") or {}).get("tunnels") or {}
+rc, out, _ = bash("exits_status")
+chk("сводка для оповещений: упавшие ноды «нода:причина», общий выход сейчас — первая живая по порядку",
+    t.get("exits_dead") == "n3:nonet" and t.get("exits_active") == "n2", t)
+chk("статус exit-нод: порядок, общий выход сейчас, сторож запущен",
+    "по порядку: n3 → n2" in out and "Общий выход: " in out and "n2" in out and "Сторож" in out and "раз в 30 с" in out, out)
+reset_calls()
+r = api("exits", "order", "n2", "n3")
+chk("exits order при работающих нодах — на ходу (refresh), без перезапуска маршрутов",
+    r.get("ok") and "ip route replace default dev awg-exit-n2 table 202" in calls(), [calls()[-500:], r.get("log", "")[-300:]])
+os.remove(os.path.join(HD, "n3"))
+os.remove(os.path.join(AWGD, "awg-exit-n3.conf"))
+with open(ACTIVE) as f:
+    act = f.read()
+with open(ACTIVE, "w") as f:
+    f.write(act.replace("awg-exits-routing.service\nawg2-exits-health.timer\n", ""))
+if st_was is None:
+    os.remove(EXST)
+else:
+    with open(EXST, "w") as f:
+        f.write(st_was)
+with open(LINKS, "w") as f:
+    f.write(links0)
 with open(os.path.join(ROOT, "etc/awg-cascade/rules.conf")) as f:
     rules = f.read()
 chk("каскад из бэкапа — только с проверками добавления: публичная цель, порты, вход не занят, без дублей",
@@ -1548,6 +2165,16 @@ rc, out, _ = bash(KG + 'mod_built_for() { [[ $1 == 6.8.0-100-generic ]]; }; kern
 chk("новое ядро без модуля — в списке, старое — нет", out == "6.8.0-110-generic нет-заголовков\n--\n6.8.0-110-generic (нет заголовков)\n", out)
 rc, out, _ = bash(KG + 'mod_built_for() { true; }; kernel_gap; echo "[$(kernel_gap_line)]"')
 chk("модуль собран под все ядра — пусто", out == "[]\n", out)
+# Сборка в памяти и исходники: исходники новее .ko — «прежняя сборка», старше или их нет — нет
+MS = ('MOD_SRC_DIR="$STATE_DIR/modsrc2"; mkdir -p "$MOD_SRC_DIR"; mod_loaded() { true; }; '
+      'KO="$STATE_DIR/fake.ko"; touch -d "2026-01-02" "$KO"; '
+      'modinfo() { [[ $1 == -n ]] && echo "$KO"; return 0; }; ')
+rc, out, _ = bash(MS + 'mod_stale && echo stale || echo fresh; touch -d "2026-01-01" "$MOD_SRC_DIR/a.c" "$MOD_SRC_DIR/b.h"; '
+                  'mod_stale && echo stale || echo fresh; touch -d "2026-01-03" "$MOD_SRC_DIR/b.h"; mod_stale && echo stale || echo fresh')
+chk("mod_stale: исходников нет / старше .ko / один новее .ko", out == "fresh\nfresh\nstale\n", out)
+rc, out, _ = bash(KG + 'mod_built_for() { true; }; mod_stale() { false; }; reboot_reason; components_summary')
+chk("новое ядро — коротко: номер без «-generic» и «нужна перезагрузка» (и в шапке меню)",
+    out.splitlines()[0] == "новое ядро 6.8.0-110 — нужна перезагрузка" and "▲ новое ядро 6.8.0-110 — нужна перезагрузка" in out, out)
 rc, out, _ = bash(KG + 'mod_built_for() { [[ $1 == 6.8.0-100-generic ]]; }; components_summary')
 chk("шапка меню предупреждает о ядре без модуля", "6.8.0-110-generic" in out and "Пересобрать" in out, out)
 rc, out, _ = bash(KG + 'mod_built_for() { false; }; mod_loaded() { false; }; components_summary')
@@ -1564,16 +2191,17 @@ chk("api status: uptime — секунды работы системы", isinsta
 print("Страна сервера — флаг в шапке панели")
 rc, out, _ = bash('curl() { printf "fl=1\\nip=203.0.113.10\\nloc=NL\\nwarp=off\\n"; }; country_refresh; cat "$COUNTRY_CACHE"; server_country')
 o = out.split()
-chk("страна — из cloudflare cdn-cgi/trace (loc=), в кэш со временем", len(o) == 3 and o[0] == "NL" and o[1].isdigit() and o[2] == "NL", out)
+chk("страна — из ответов сервисов (loc=NL у всех), в кэш со временем, версией формата и голосами",
+    len(o) == 5 and o[0] == "NL" and o[1].isdigit() and o[2] == "2" and o[3].startswith("NL=") and o[4] == "NL", out)
 r = api("status")
 chk("api status: country — код страны из кэша", (r.get("data") or {}).get("country") == "NL", r.get("data"))
 rc, out, _ = bash('rm -f "$COUNTRY_CACHE"; curl() { return 28; }; country_refresh; cat "$COUNTRY_CACHE"; echo "[$(server_country)]"')
-chk("Cloudflare не ответил — пометка «-», страна пустая (флага нет)", out.split()[0] == "-" and out.strip().endswith("[]"), out)
+chk("ни один сервис не ответил — пометка «-», страна пустая (флага нет)", out.split()[0] == "-" and out.strip().endswith("[]"), out)
 # Один сбой не стирает уже известную страну (флаг не пропадает на час); метка такая, что повтор — через час
 rc, out, _ = bash('echo "NL $(( $(date +%s) - 90000 ))" > "$COUNTRY_CACHE"; curl() { return 28; }; country_refresh; '
-                  'read -r cc ts < "$COUNTRY_CACHE"; echo "$cc $(( $(date +%s) - ts )) [$(server_country)]"')
+                  'read -r cc ts _ < "$COUNTRY_CACHE"; echo "$cc $(( $(date +%s) - ts )) [$(server_country)]"')
 o = out.split()
-chk("Cloudflare не ответил, а страна уже известна — остаётся, повтор через час (не через сутки)",
+chk("сервисы не ответили, а страна уже известна — остаётся, повтор через час (не через сутки)",
     len(o) == 3 and o[0] == "NL" and o[2] == "[NL]" and o[1].isdigit() and 82700 <= int(o[1]) <= 82900, out)
 rc, out, _ = bash('rm -f "$COUNTRY_CACHE"; curl() { printf "loc=XX\\n"; }; country_refresh; echo "[$(server_country)]"; '
                   'printf "<b>\\n" > "$COUNTRY_CACHE"; echo "[$(server_country)]"')
@@ -1583,14 +2211,101 @@ for cache, age, want, what in (("NL", 3600, False, "узнали час наза
                                ("NL", 90000, True, "узнали больше суток назад — спрашивает"),
                                ("-", 600, False, "не узнали 10 мин назад — ждёт"),
                                ("-", 3700, True, "не узнали больше часа назад — спрашивает снова")):
-    rc, out, _ = bash(CR + f'echo "{cache} $(( $(date +%s) - {age} ))" > "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; '
+    rc, out, _ = bash(CR + f'echo "{cache} $(( $(date +%s) - {age} )) 2" > "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; '
                       '[[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
     chk(f"страна: {what}", out.strip().endswith("ASK" if want else "SKIP"), out)
+rc, out, _ = bash(CR + 'echo "NL $(( $(date +%s) - 3600 ))" > "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; '
+                  '[[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
+chk("страна: кэш прежнего формата (один сервис) — пересчитывается сразу, а не через сутки", out.strip().endswith("ASK"), out)
 rc, out, err = bash(CR + 'rm -f "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; [[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
 chk("страна: кэша ещё нет — спрашивает, без ошибок в stderr", out.strip().endswith("ASK") and not err.strip(), [out, err])
 rc, out, _ = bash('AWG_NO_UPDATE_CHECK=1; country_refresh() { touch "$STATE_DIR/cr"; }; rm -f "$STATE_DIR/cr" "$COUNTRY_CACHE"; '
                   'country_refresh_async; sleep 0.3; [[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
 chk("страна: в тестах и без сети (AWG_NO_UPDATE_CHECK) — не спрашивает", out.strip().endswith("SKIP"), out)
+
+print("Страна сервера — несколько сервисов, побеждает большинство")
+import shlex
+
+
+def cstub(**ans):
+    """curl, отвечающий по имени сервиса: текст — ответ, None — сбой, нет ключа — сбой."""
+    arms = []
+    for key, pat in (("cloudflare", "*cloudflare*"), ("ipinfo", "*ipinfo*"), ("ipapi", "*ipapi*"), ("countryis", "*country.is*"),
+                     ("geojs", "*geojs*"), ("ipwhois", "*ipwho.is*"), ("ifconfig", "*ifconfig*")):
+        body = ans.get(key)
+        arms.append(f"{pat}) " + ("return 22" if body is None else f"printf '%s\\n' {shlex.quote(body)}") + " ;;")
+    return ('curl() { local u="${@: -1}"; echo "$u" >> "$STATE_DIR/curl-urls"; ' + ans.get("_pre", "") + 'case "$u" in '
+            + " ".join(arms) + " *) return 22 ;; esac; }; ")
+
+
+CRF = 'rm -f "$COUNTRY_CACHE" "$STATE_DIR/curl-urls"; country_refresh; cat "$COUNTRY_CACHE"'
+# Хостер из Нидерландов, база Cloudflare и ещё одного сервиса говорят «Германия»
+rc, out, _ = bash(cstub(cloudflare="fl=1\nloc=DE\nwarp=off", ipinfo="NL", ipapi="NL", countryis='{"ip":"203.0.113.10","country":"NL"}',
+                        geojs='[{"name":"Netherlands","country":"NL"}]', ipwhois='{"country_code":"DE"}') + CRF)
+chk("DE у двух сервисов, NL у четырёх — берётся большинство (NL), голоса в кэше", out.split()[0] == "NL" and out.split()[3] == "NL=4,DE=2", out)
+# Равенство: побеждает тот, кто встретился раньше (Cloudflare — первый в списке)
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="NL", countryis='{"country":"DE"}') + CRF)
+chk("два против двух — выше в списке (Cloudflare): DE", out.split()[0] == "DE", out)
+rc, out, _ = bash(cstub(ipinfo="NL", ipapi="DE", countryis='{"country":"DE"}', geojs='[{"country":"NL"}]') + CRF)
+chk("два против двух без Cloudflare — тот, кто встретился раньше: NL", out.split()[0] == "NL", out)
+# Один ответ — берётся он (лучше, чем без флага)
+rc, out, _ = bash(cstub(ipinfo="AT") + CRF)
+chk("ответил один сервис — страна от него", out.split()[0] == "AT", out)
+# Все разные: большинства нет — известная страна не меняется, а неизвестная берётся по порядку
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="FR") + 'echo "AT $(( $(date +%s) - 90000 )) 2" > "$COUNTRY_CACHE"; country_refresh; '
+                  'read -r cc ts _ < "$COUNTRY_CACHE"; echo "$cc $(( $(date +%s) - ts ))"')
+o = out.split()
+chk("все сервисы разошлись — прежняя страна остаётся, повтор через час", o[0] == "AT" and 82700 <= int(o[1]) <= 82900, out)
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="FR") + CRF)
+chk("все разошлись, страны ещё нет — берётся по порядку списка (Cloudflare)", out.split()[0] == "DE", out)
+# Мусор и «не страна» не считаются голосами
+rc, out, _ = bash(cstub(cloudflare="loc=XX", ipinfo="Too many requests", ipapi="<html><body>429</body></html>", countryis='{"error":"rate limit"}',
+                        geojs='[{"name":"Austria","country":"AT"}]', ipwhois='{"success":false,"country_code":"EU"}', ifconfig="at") + CRF)
+chk("XX, EU, ошибки и HTML — не голоса; остальные (AT, at) — страна AT", out.split()[0] == "AT" and out.split()[3] == "AT=2", out)
+rc, out, _ = bash(cstub(ipinfo="UK", ipapi="GB") + CRF)
+chk("UK и GB — одна страна (GB)", out.split()[0] == "GB" and out.split()[3] == "GB=2", out)
+# Все спрашивают про один адрес сервера; без адреса — запросы без него, сервис «только по адресу» пропускается
+rc, out, _ = bash(cstub(ipinfo="NL", ipapi="NL") + CRF + '; cat "$STATE_DIR/curl-urls"')
+chk("в запросы подставлен адрес сервера", "https://ipinfo.io/203.0.113.10/country" in out and "https://ipwho.is/203.0.113.10?fields=country_code" in out
+    and "{IP}" not in out and "https://cloudflare.com/cdn-cgi/trace" in out, out)
+rc, out, _ = bash("public_ip_cached() { :; }; " + cstub(ipinfo="NL", ipapi="NL") + CRF + '; cat "$STATE_DIR/curl-urls"')
+chk("адрес сервера неизвестен — запросы без него, ipwho.is пропущен", "https://ipinfo.io/country" in out and "ipwho.is" not in out
+    and "{IP}" not in out and out.split()[0] == "NL", out)
+# Сервисы опрашиваются одновременно: семь по секунде — не семь секунд
+rc, out, _ = bash(cstub(cloudflare="loc=NL", ipinfo="NL", ipapi="NL", countryis='{"country":"NL"}', geojs='[{"country":"NL"}]',
+                        ipwhois='{"country_code":"NL"}', ifconfig="NL", _pre="sleep 1; ")
+                  + 't0=$(date +%s%N); ' + CRF + '; echo "ms=$(( ($(date +%s%N) - t0) / 1000000 ))"')
+ms = int(out.split("ms=")[-1])
+chk("семь сервисов по секунде отвечают одновременно (<3 с)", out.split()[0] == "NL" and ms < 3000, [out, ms])
+# Смена страны — в журнал, с голосами
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="NL") + 'echo "DE $(date +%s) 2" > "$COUNTRY_CACHE"; country_refresh; '
+                  'grep -h "страна сервера" "$LOG_FILE" "$AWG_LOG" 2>/dev/null | tail -1; cat "$COUNTRY_CACHE"')
+chk("страна сменилась (DE → NL) — кэш обновлён", "NL " in out.split("\n")[-2] + " ", out)
+# Временный каталог ответов за собой убирается
+rc, out, _ = bash(cstub(ipinfo="NL", ipapi="NL") + CRF + '; ls -d /tmp/awg2.country.* 2>/dev/null | wc -l')
+chk("временные файлы ответов убраны", out.strip().endswith("0"), out)
+
+print("Страна сервера вручную — главнее геосервисов")
+bash('rm -f "$COUNTRY_MANUAL"; echo "NL $(date +%s) 2 NL=4,DE=2" > "$COUNTRY_CACHE"')
+r = api("status")
+d = r.get("data") or {}
+chk("api status: страна по геосервисам, не вручную, голоса", d.get("country") == "NL" and d.get("country_auto") == "NL"
+    and d.get("country_manual") is False and d.get("country_votes") == "NL=4,DE=2", d)
+r = api("country", "set", "at")
+d = (api("status").get("data") or {})
+chk("country set at — флаг AT (регистр не важен), геосервисы помнятся отдельно",
+    r.get("ok") and d.get("country") == "AT" and d.get("country_manual") is True and d.get("country_auto") == "NL", [r, d])
+rc, out, _ = bash('echo "DE $(date +%s) 2 DE=5" > "$COUNTRY_CACHE"; server_country')
+chk("ручная страна не перебивается новой проверкой геосервисов", out.strip() == "AT", out)
+for bad in ("A1", "AUT", "a-", "../x"):
+    r = api("country", "set", bad)
+    chk(f"country set {bad!r} — отказ, ручная страна прежняя", not r.get("ok") and (api("status").get("data") or {}).get("country") == "AT", r)
+r = api("country", "set", "auto")
+d = (api("status").get("data") or {})
+chk("country set auto — снова по геосервисам", r.get("ok") and d.get("country") == "DE" and d.get("country_manual") is False, [r, d])
+r = api("country")
+chk("api country без команды — подсказка, rc 2", not r.get("ok") and r.get("_rc") == 2, r)
+bash('rm -f "$COUNTRY_MANUAL" "$COUNTRY_CACHE"')
 
 print("Домен мимикрии по региону")
 STUBSCAN = 'scan_domains() { shift; SCAN_OK=("$@"); }; '
@@ -1789,6 +2504,248 @@ bsum, _, ver = rest.partition("--")
 chk("служебные скрипты пересобираются и для новой сборки той же версии",
     len(bsum) == 16 and ver.startswith("v1.") and mark == f"{ver} {bsum}", out)
 
+# Xray 26.7+ без имени у входа tun поднимает utunN: обновление awg2 сразу
+# ставит имя xray0 в готовый конфиг — служба переживёт перезапуск на новом Xray
+XCF = os.path.join(ROOT, "etc/xray/config.json")
+os.makedirs(os.path.dirname(XCF), exist_ok=True)
+had_xcf = open(XCF).read() if os.path.exists(XCF) else None
+with open(XCF, "w") as f:
+    json.dump({"inbounds": [{"protocol": "socks", "tag": "socks-in", "port": 10808},
+                            {"protocol": "tun", "tag": "tun-in", "settings": {"mtu": 1200}}],
+               "outbounds": [{"protocol": "vless", "tag": "A"}, {"protocol": "vless", "tag": "B"}],
+               "routing": {"rules": [
+                   {"ruleTag": "ru-direct", "domain": ["domain:ru"], "outboundTag": "direct"},
+                   {"ruleTag": "ru-direct", "ip": ["ext:geoip_RU.dat:ru"], "outboundTag": "direct"},
+                   {"ruleTag": "client-out", "inboundTag": ["tun-in"], "source": ["10.0.0.2"], "outboundTag": "A"},
+                   {"ruleTag": "client-out", "inboundTag": ["tun-in"], "source": ["10.0.0.3"], "outboundTag": "B"},
+                   {"ruleTag": "mine", "domain": ["a.example"], "outboundTag": "A"},
+                   {"ruleTag": "mine", "domain": ["b.example"], "outboundTag": "B"},
+                   {"ruleTag": "mine-2", "domain": ["c.example"], "outboundTag": "B"},
+                   {"inboundTag": ["tun-in"], "outboundTag": "A"}]}}, f)
+rc, out, _ = bash('server_exists() { return 1; }; cascade_count() { echo 0; }; wgobf_installed() { return 1; }; '
+                  'MOD_SRC_DIR=/nonexistent; echo old > "$STATE_DIR/version"; helpers_refresh')
+xcf = json.load(open(XCF))
+chk("обновление awg2: у входа tun готового конфига Xray — имя xray0, остальное на месте",
+    xcf["inbounds"][1]["settings"] == {"mtu": 1200, "name": "xray0"} and xcf["inbounds"][0] == {"protocol": "socks", "tag": "socks-in", "port": 10808},
+    xcf)
+chk("обновление awg2: повторы ruleTag (Xray 26.9+ их не принимает) — разные теги, правила на месте",
+    [r.get("ruleTag") for r in xcf["routing"]["rules"]]
+    == ["ru-direct", "ru-direct-ip", "client-out-1", "client-out-2", "mine", "mine-3", "mine-2", None]
+    and [r.get("outboundTag") for r in xcf["routing"]["rules"]] == ["direct", "direct", "A", "B", "A", "B", "B", "A"],
+    xcf["routing"])
+os.utime(XCF, (1, 1))
+rc, out, err = bash(f'py xray-compat "{XCF}"; echo rc=$?')
+chk("xray-compat: исправленный конфиг повторно не переписывается", "rc=0" in out and os.stat(XCF).st_mtime == 1, [out, err])
+for body in ('{"inbounds": [{"protocol": "socks", "tag": "socks-in"}]}', "не json {", '{"inbounds": [{"protocol": "tun", "settings": {"name": "xray0"}}]}'):
+    with open(XCF, "w") as f:
+        f.write(body)
+    os.utime(XCF, (1, 1))
+    rc, out, err = bash(f'py xray-compat "{XCF}"; echo rc=$?')
+    chk(f"xray-compat: без tun, не JSON или уже xray0 — файл не трогает ({body[:24]})",
+        "rc=0" in out and open(XCF).read() == body and os.stat(XCF).st_mtime == 1, [out, err])
+if had_xcf is None:
+    os.remove(XCF)
+else:
+    with open(XCF, "w") as f:
+        f.write(had_xcf)
+
+print("\n── Точки входа (каскад) ──")
+EDIR = os.path.join(TMP, "entry")
+os.makedirs(os.path.join(EDIR, "c"), exist_ok=True)
+with open(os.path.join(EDIR, "awg0.conf"), "w") as f:
+    f.write(OLD20)
+EENV = (f'SERVER_CONF="{EDIR}/awg0.conf"; CLIENT_DIR="{EDIR}/c"; public_ip_cached() {{ echo 198.51.100.7; }}; '
+        'entry_probe() { return 0; }; ')
+EFAIL = EENV.replace("entry_probe() { return 0; }", "entry_probe() { return 1; }")
+EP = lambda n: next((l.split(" = ", 1)[1] for l in open(os.path.join(EDIR, "c", n + "_awg2.conf")).read().splitlines()  # noqa: E731
+                     if l.startswith("Endpoint = ")), None)
+
+
+def ejson(cmd):
+    rc, out, err = bash(EENV + cmd)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"ok": False, "error": out + err}
+
+
+rc, out, _ = bash(EENV + "client_create carol >/dev/null && client_create dave >/dev/null && echo ok")
+chk("точки входа: клиенты для проверки созданы", "ok" in out and EP("carol") == "198.51.100.7:51820", out)
+d = ejson("api_main entry list")
+chk("entry list без входов — одна строка «напрямую» с адресом сервера и всеми клиентами",
+    d.get("data") == [{"name": "", "addr": "198.51.100.7:51820", "clients": 4, "default": True, "check": "ok", "checked": 0}], d)
+rc, out, _ = bash(EFAIL + 'api_main entry add "Каскад NL" 203.0.113.5:443')
+d = json.loads(out.strip().splitlines()[-1])
+chk("вход добавляется; провал проверки при добавлении — предупреждение, не ошибка",
+    d.get("ok") and "Точка входа «Каскад NL»: 203.0.113.5:443" in d["log"] and "▲" in d["log"] and "проброс" in d["log"], d)
+d = ejson("api_main entry list")
+row = (d.get("data") or [{}, {}])[1]
+chk("итог проверки — в списке: не доходит", row.get("check") == "fail" and row.get("checked", 0) > 0, row)
+bad = [json.loads(bash(EFAIL + c)[1].strip().splitlines()[-1]) for c in (
+    'api_main client entry carol "Каскад NL"', 'api_main entry all "Каскад NL"', 'api_main entry default "Каскад NL"',
+    'api_main entry clients "Каскад NL" carol,dave')]
+chk("неработающий вход клиентам не выдаётся: ни одному, ни всем, ни новым, ни выбранным",
+    all(not b.get("ok") and "не работает" in b.get("error", "") for b in bad) and EP("carol") == "198.51.100.7:51820"
+    and "проброс" in bad[0].get("log", ""), [b.get("error") for b in bad])
+PROBED = os.path.join(EDIR, "probed")
+rc, out, _ = bash(EFAIL + f'api_main entry check "Каскад NL" >/dev/null; rm -f "{PROBED}"; '
+                  f'entry_probe() {{ echo x >> "{PROBED}"; return 0; }}; api_main client entry dave "Каскад NL" >/dev/null; '
+                  f'wc -l < "{PROBED}"; entry_probe() {{ echo x >> "{PROBED}"; return 1; }}; '
+                  f'api_main client entry dave "Каскад NL" >/dev/null; wc -l < "{PROBED}"; api_main client entry dave direct >/dev/null')
+chk("перед выдачей вход проверяется заново; после удачной проверки 10 минут — без новой",
+    out.split()[-2:] == ["1", "1"], out)
+bad = [ejson(c).get("error", "") for c in ('api_main entry add "каскад nl" 1.2.3.4:5', "api_main entry add direct 1.2.3.4:5",
+                                            "api_main entry add X 1.2.3.4", "api_main entry add Y 300.1.1.1:5",
+                                            "api_main entry add Y 1.2.3.4:70000", 'api_main entry add "a|b" 1.2.3.4:5')]
+chk("вход: занятое имя (без учёта регистра), «direct», без порта, кривой IP и порт, «|» в имени — отказ",
+    "занято" in bad[0] and "занято" in bad[1] and "хост:порт" in bad[2] and "IPv4" in bad[3] and "Порт" in bad[4]
+    and "Имя входа" in bad[5], bad)
+d = ejson('api_main client entry carol "Каскад NL"')
+chk("вход клиента: Endpoint в его конфиге — адрес входа, у остальных прежний",
+    d.get("ok") and d["data"]["endpoint"] == "203.0.113.5:443" and "Endpoint = 203.0.113.5:443" in d["data"]["text"]
+    and EP("carol") == "203.0.113.5:443" and EP("dave") == "198.51.100.7:51820" and "новый конфиг" in d["log"], d)
+d = ejson('api_main client entry carol nosuch')
+chk("вход клиента: несуществующий вход — отказ, конфиг не тронут",
+    not d.get("ok") and "нет" in d.get("error", "") and EP("carol") == "203.0.113.5:443", d)
+d = ejson('api_main entry set "Каскад NL" VPN.example.com:8443')
+chk("новый адрес входа: переписан только у его клиентов, домен — в нижнем регистре",
+    d.get("ok") and EP("carol") == "vpn.example.com:8443" and EP("dave") == "198.51.100.7:51820"
+    and "переписано: 1" in d["log"], d)
+d = ejson("api_main server endpoint dom.example.com")
+chk("смена Endpoint сервера не трогает клиентов на входах",
+    d.get("ok") and EP("carol") == "vpn.example.com:8443" and EP("dave") == "dom.example.com:51820"
+    and "точках входа не тронуты" in d["log"], d)
+ejson("api_main server endpoint ip")
+chk("возврат на IP — снова только клиенты без входа", EP("dave") == "198.51.100.7:51820" and EP("carol") == "vpn.example.com:8443",
+    [EP("dave"), EP("carol")])
+ejson('api_main entry default "Каскад NL"')
+d = ejson("api_main client add erin")
+d2 = ejson("api_main client add fred entry=direct")
+d3 = ejson("api_main client add gus entry=nosuch")
+chk("новые клиенты — через вход по умолчанию; entry=direct — напрямую; неизвестный вход — отказ",
+    d.get("ok") and EP("erin") == "vpn.example.com:8443" and d2.get("ok") and EP("fred") == "198.51.100.7:51820"
+    and not d3.get("ok") and "нет" in d3.get("error", ""), [d.get("error"), d2.get("error"), d3])
+d = ejson("api_main clients list")
+ents = {c["name"]: c.get("entry") for c in d.get("data") or []}
+chk("в clients list — вход клиента (None — напрямую)",
+    ents.get("carol") == "Каскад NL" and ents.get("erin") == "Каскад NL" and ents.get("dave") is None and ents.get("fred") is None, ents)
+d = ejson("api_main entry list")
+chk("entry list: адреса, клиенты на каждом, вход для новых, итог проверки",
+    [{k: r[k] for k in ("name", "addr", "clients", "default", "check")} for r in d.get("data") or []]
+    == [{"name": "", "addr": "198.51.100.7:51820", "clients": 4, "default": False, "check": "ok"},
+        {"name": "Каскад NL", "addr": "vpn.example.com:8443", "clients": 2, "default": True, "check": "ok"}], d)
+ejson("api_main client reissue carol")
+chk("перевыпуск конфига сохраняет вход", EP("carol") == "vpn.example.com:8443", EP("carol"))
+head = open(os.path.join(EDIR, "awg0.conf")).read().split("[Interface]")[0]
+rc, out, _ = bash(EENV + 'conf_iface_get ListenPort; clients_tsv | wc -l')
+chk("входы — метки шапки перед [Interface], разбор конфига не сломан",
+    "# AWG_ENTRY=Каскад NL|vpn.example.com:8443" in head and "# AWG_ENTRY_DEFAULT=Каскад NL" in head
+    and out.split() == ["51820", "6"], [head, out])
+d = ejson("api_main entry all direct")
+chk("все клиенты — напрямую", d.get("ok") and EP("carol") == EP("erin") == "198.51.100.7:51820", d)
+ejson('api_main entry all "Каскад NL"')
+d = ejson('api_main entry del "Каскад NL"')
+conf = open(os.path.join(EDIR, "awg0.conf")).read()
+chk("удаление входа: его клиенты — напрямую, метки клиентов и вход по умолчанию убраны",
+    d.get("ok") and EP("carol") == EP("erin") == EP("fred") == "198.51.100.7:51820"
+    and "entry=" not in conf and "AWG_ENTRY" not in conf, [d, conf[:300]])
+rc, out, _ = bash(EENV + 'client_add zed 10.23.45.30/32 "1.1.1.1" 1320 && grep -c "entry=" "$SERVER_CONF"')
+chk("после удаления входа по умолчанию новые клиенты — напрямую", EP("zed") == "198.51.100.7:51820", [out, EP("zed")])
+# Проверка входа: пакет с меткой — правило raw со строкой, счётчик
+IPT = ('iptables() { case "$*" in *"-I PREROUTING"*) [[ -z "${IPT_FAIL:-}" ]]; return;; '
+       '*"-L PREROUTING"*) [[ -n "${IPT_HIT:-}" ]] && echo "    1    60 ACCEPT 17 -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:51820 STRING /* awg2-entry-check */"; return 0;; esac; }; '
+       'ipt_del_grep() { :; }; ')
+rc, out, _ = bash(f'SERVER_CONF="{EDIR}/awg0.conf"; ' + IPT + 'IPT_HIT=1 entry_probe 192.0.2.1:443; echo a=$?; '
+                  'entry_probe 192.0.2.1:443; echo b=$?; IPT_FAIL=1 entry_probe 192.0.2.1:443; echo c=$?; '
+                  'entry_probe nosuch.invalid:443; echo d=$?')
+chk("проверка входа: пакет вернулся — 0, нет — 1, правило не ставится или адрес не найден — 2",
+    [l for l in out.split() if "=" in l] == ["a=0", "b=1", "c=2", "d=2"], out)
+ejson('api_main entry add Probe 192.0.2.1:443')
+rc, out, _ = bash(EFAIL + "api_main entry check Probe")
+d = json.loads(out.strip().splitlines()[-1])
+chk("entry check: пакеты не дошли — ошибка с подсказкой про проброс", not d.get("ok") and "UDP 443 → 198.51.100.7:51820" in d.get("error", ""), d)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }", "entry_probe() { return 2; }") + "api_main entry check Probe")
+d = json.loads(out.strip().splitlines()[-1])
+chk("entry check: проверить нельзя — предупреждение, не ошибка", d.get("ok") and "проверь клиентом" in d["log"], d)
+rc, out, _ = bash(EENV + "api_main entry check Probe")
+d = json.loads(out.strip().splitlines()[-1])
+chk("entry check: вход работает", d.get("ok") and "Вход работает" in d["log"], d)
+# Выбранные клиенты: незнакомое имя — предупреждение, остальные получают вход
+d = ejson("api_main entry clients Probe carol,erin,nosuch")
+chk("выбранным клиентам — вход; незнакомое имя — предупреждение, в ответе — кому выдан",
+    d.get("ok") and sorted(d.get("data") or []) == ["carol", "erin"] and EP("carol") == EP("erin") == "192.0.2.1:443"
+    and EP("fred") == "198.51.100.7:51820" and "nosuch" in d["log"], d)
+d = ejson("api_main entry clients direct carol")
+chk("выбранным — напрямую", d.get("ok") and EP("carol") == "198.51.100.7:51820" and EP("erin") == "192.0.2.1:443", d)
+d = ejson("api_main entry clients Probe nosuch")
+chk("ни одного знакомого клиента — отказ", not d.get("ok") and "Ни одного" in d.get("error", ""), d)
+
+print("\n── IPv6 сервера — точкой входа ──")
+V6 = "2a01:4f8:c0c:1234::1"
+IP6 = (r'ip() { case "$*" in "-6 route show default") echo "default via fe80::1 dev eth0 proto ra metric 100";; '
+       r'*"-6 -o addr show"*) printf "%s\n" "2: eth0    inet6 2a01:4f8:c0c:1234:aaaa:bbbb:cccc:dddd/64 scope global temporary dynamic" '
+       r'"2: eth0    inet6 fd00::5/64 scope global" "2: eth0    inet6 2a01:4f8:c0c:1234::1/64 scope global dynamic mngtmpaddr" '
+       r'"2: eth0    inet6 2a01:4f8:c0c:1234::2/64 scope global deprecated";; esac; }; ')
+rc, out, _ = bash(IP6 + "public_ip6; _own_ip6 2a01:4f8:c0c:1234::1 && echo OWN; _own_ip6 2a01:4f8:c0c:9999::1 || echo FOREIGN")
+chk("глобальный IPv6 сервера: без временного, ULA и устаревшего; свой адрес узнаётся",
+    out.split() == [V6, "OWN", "FOREIGN"], out)
+bad = [ejson(f"api_main entry add X {a}").get("error", "") for a in ("[fd00::1]:443", "[fe80::1]:443", "[zz::1]:443")]
+chk("IPv6 входа: ULA, link-local и кривой адрес — отказ", "глобальный" in bad[0] and "глобальный" in bad[1] and "IPv6" in bad[2], bad)
+d = ejson("api_main entry add Внешний6 [2A01:4F8:C0C:5678:0:0:0:1]:443")
+chk("[IPv6]:порт — сокращается и в нижнем регистре",
+    d.get("ok") and json.loads(bash(EENV + 'py entry "$SERVER_CONF" get Внешний6')[1] or '""') if False else
+    bash(EENV + 'py entry "$SERVER_CONF" get Внешний6')[1].strip() == "[2a01:4f8:c0c:5678::1]:443", d)
+ejson("api_main entry del Внешний6")
+SELF = (IP6 + f'IPV6_SYSCTL="{EDIR}/v6sysctl"; UFW_DEFAULTS="{EDIR}/ufwdef"; '
+        'ss() { echo "UNCONN 0 0 0.0.0.0:51820 0.0.0.0:*"; echo "UNCONN 0 0 [::]:51820 [::]:*"; }; '
+        'curl() { [[ -z "${NO6:-}" ]]; }; ufw_active() { [[ -n "${UFWON:-}" ]]; }; '
+        'ufw() { echo "Status: active"; echo "51820/udp                  ALLOW       Anywhere"; '
+        '[[ -n "${V4ONLY:-}" ]] || echo "51820/udp (v6)             ALLOW       Anywhere (v6)"; }; ')
+with open(os.path.join(EDIR, "v6sysctl"), "w") as f:
+    f.write("0\n")
+with open(os.path.join(EDIR, "ufwdef"), "w") as f:
+    f.write("IPV6=yes\n")
+cases = {"ok": "", "off": f'echo 1 > "{EDIR}/v6sysctl"; ', "port": "", "nolisten": 'ss() { echo "UNCONN 0 0 0.0.0.0:51820 0.0.0.0:*"; }; ',
+         "ufwno": f'UFWON=1; echo IPV6=no > "{EDIR}/ufwdef"; ', "v4only": "UFWON=1 V4ONLY=1; ", "noroute": "NO6=1; "}
+res = {}
+for k, pre in cases.items():
+    with open(os.path.join(EDIR, "v6sysctl"), "w") as f:
+        f.write("0\n")
+    with open(os.path.join(EDIR, "ufwdef"), "w") as f:
+        f.write("IPV6=yes\n")
+    port = "443" if k == "port" else "51820"
+    rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + pre
+                      + f'entry_probe "[{V6}]:{port}"; echo "rc=$? $ENTRY_PROBE_WHY"')
+    res[k] = out.strip().splitlines()[-1]
+chk("свой IPv6: всё готово — 0; IPv6 выключен, чужой порт, AWG не слушает IPv6, UFW без IPv6, порт только для IPv4, нет маршрута — 1 с причиной",
+    res["ok"] == "rc=0" and "выключен" in res["off"] and "не порт AWG" in res["port"] and "не слушает" in res["nolisten"]
+    and "IPV6=no" in res["ufwno"] and "только для IPv4" in res["v4only"] and "нет выхода" in res["noroute"]
+    and all(v.startswith("rc=1") for k, v in res.items() if k != "ok"), res)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "api_main entry add-ipv6")
+d = json.loads(out.strip().splitlines()[-1])
+chk("entry add-ipv6: вход «IPv6» на [IPv6 сервера]:порт AWG, проверка своего IPv6 пройдена",
+    d.get("ok") and d["data"] == {"name": "IPv6", "addr": f"[{V6}]:51820"} and "Вход работает" in d["log"], d)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "api_main entry add-ipv6")
+d = json.loads(out.strip().splitlines()[-1])
+chk("повторно — не дублируется", d.get("ok") and "уже есть" in d["log"] and d["data"]["name"] == "IPv6", d)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "NO6=1; api_main entry check IPv6; api_main client entry carol IPv6")
+lines = [json.loads(l) for l in out.strip().splitlines() if l.startswith("{")]
+chk("свой IPv6 без маршрута наружу: проверка — с причиной, выдача клиенту — отказ с причиной",
+    not lines[0]["ok"] and "нет выхода в интернет по IPv6" in lines[0]["error"]
+    and not lines[1]["ok"] and "не готов" in lines[1]["error"] and "IPv6" in lines[1]["error"], lines)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "S_FIRST_CLIENT=carol; _server_create_ipv6")
+chk("создание сервера с IPv6: вход для новых и первый клиент — на IPv6", f"[{V6}]:51820" in out and EP("carol") == f"[{V6}]:51820"
+    and json.loads(bash(EENV + "api_main entry list")[1].strip().splitlines()[-1])["data"][-1]["default"], out)
+ejson("api_main entry all direct")
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + 'NO6=1; S_FIRST_CLIENT=dave; _server_create_ipv6')
+chk("создание сервера: IPv6 не готов — причина, клиенты на IPv4", "нет выхода в интернет по IPv6" in out and "IPv4" in out
+    and EP("dave") == "198.51.100.7:51820", out)
+ejson("api_main entry del IPv6")
+rc, out, _ = bash('server_create_ready() { return 0; }; public_ip6() { :; }; server_create_opts endpoint=ipv6 2>&1; echo rc=$?')
+chk("server create endpoint=ipv6 без IPv6 у сервера — отказ", "нет глобального IPv6" in out and "rc=1" in out, out[-300:])
+rc, out, _ = bash(IP6 + 'api_main server info')
+chk("server info: IPv6 сервера", json.loads(out.strip().splitlines()[-1])["data"].get("ipv6") == V6, out[-300:])
+
 print("\n── Веб-панель (awg2) ──")
 WEBC = os.path.join(TMP, "awg-web.conf")
 WEBPRE = (f'WEB_CONF="{WEBC}"; WEB_LOG="{TMP}/awg-web.log"; WEB_DIR="{TMP}/awg-web"; BOT_DIR="{TMP}/awg-bot"; '
@@ -1879,7 +2836,7 @@ chk("api web install (бот): логин admin, пароль сгенериро
 
 print("\n── Антисканер ──")
 # Заглушки с состоянием: ipset (наборы — файлами), iptables/ip6tables (правила
-# INPUT — файлом, -I ставит первым), iptables-save -c (счётчики), curl — отдаёт
+# filter и mangle — файлами, -I ставит первым), iptables-save -c (счётчики), curl — отдаёт
 # списки из каталога ASLISTS. Сеть не нужна.
 ASBIN = os.path.join(TMP, "asbin")
 ASLISTS = os.path.join(TMP, "aslists")
@@ -1902,6 +2859,16 @@ case "$1" in
   add) e="${*:3}"; e="${e% -exist}"; echo "$e" >> "$S/$2" ;;
   swap) [[ -f "$S/$2" && -f "$S/$3" ]] || exit 1; mv "$S/$2" "$S/.t"; mv "$S/$3" "$S/$2"; mv "$S/.t" "$S/$3" ;;
   destroy) [[ -f "$S/$2" ]] || exit 1; mv -f "$S/$2" "$IPSET_DIR/gone/$2" ;;
+  test) [[ -f "$S/$2" ]] || exit 1
+        python3 -c 'import ipaddress, sys
+ip, best = ipaddress.ip_address(sys.argv[2]), None
+for ln in open(sys.argv[1]):
+    p = ln.split()
+    if p and ip in ipaddress.ip_network(p[0], strict=False):
+        n = ipaddress.ip_network(p[0], strict=False)
+        if best is None or n.prefixlen > best[0].prefixlen:
+            best = (n, "nomatch" in p[1:])
+sys.exit(0 if best and not best[1] else 1)' "$S/$2" "$3"; exit ;;
   list) if [[ "$2" == -n ]]; then [[ -f "$S/$3" ]] && echo "$3"; [[ -f "$S/$3" ]]; exit; fi
         [[ -f "$S/$2" ]] || exit 1
         echo "Name: $2"; echo "Members:"
@@ -1912,7 +2879,9 @@ case "$1" in
 esac
 exit 0""",
     "iptables": r"""echo "${0##*/} $*" >> "$CALLS"
-f="$IPT_RULES.${0##*/}"; touch "$f"
+f="$IPT_RULES.${0##*/}"
+if [[ "$1 ${2:-}" == "-t mangle" ]]; then f="$f.mangle"; shift 2; fi
+touch "$f"
 case "$1" in
   -C) shift; c="$1"; shift; grep -qxF -- "$c $*" "$f" ;;
   -I) shift; c="$1"; shift 2; { echo "$c $*"; cat "$f"; } > "$f.n"; mv "$f.n" "$f" ;;
@@ -1922,9 +2891,10 @@ case "$1" in
   -S) echo "-P $2 ACCEPT"; grep "^$2 " "$f" | sed "s/^$2 /-A $2 /" ;;
   *) exit 0 ;;
 esac""",
-    "iptables-save": r"""t="${0##*/}"; t="${t%-save}"
+    "iptables-save": r"""t="${0##*/}"; t="${t%-save}"; f="$IPT_RULES.$t"
+[[ " $* " == *" -t mangle "* ]] && f="$f.mangle"
 if [[ " $* " == *" -c "* ]]; then
-  sed "s/^/[$(cat "$IPT_RULES.$t.cnt" 2>/dev/null || echo 0):0] -A /" "$IPT_RULES.$t" 2>/dev/null
+  sed "s/^/[$(cat "$f.cnt" 2>/dev/null || echo 0):0] -A /" "$f" 2>/dev/null
 else cat "$IPT_SAVE"; fi""",
     "curl": r"""out="" url=""
 while (( $# )); do case "$1" in -o) out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done
@@ -2201,6 +3171,756 @@ chk("выключен — служба при загрузке ничего не
 rc, out, _ = bash(ASPRE + 'antiscan_remove; ls "$ANTISCAN_DIR" "$ANTISCAN_SCRIPT" 2>&1')
 chk("удаление вместе со скриптом: каталог и скрипт убраны", out.count("No such file") == 2, out)
 
+print("\n── WARP: проверка для уведомлений бота ──")
+with open(LINKS, "w") as f:
+    f.write("awg0\nwarp0\n")
+open(HC_PING, "w").close()
+HCENV = {"PATH": HCBIN + ":" + ENV["PATH"], "HC_PING": HC_PING, "HC_RT": HC_RT}
+r = api("warp", "probe", env=HCENV)
+d = r.get("data") or {}
+chk("warp probe: без health-check бот проверяет сам — WARP отвечает",
+    r.get("ok") and d.get("up") is True and d.get("health") is False and d.get("ok") is True and d.get("failover") is False, r)
+os.remove(HC_PING)
+d = api("warp", "probe", env=HCENV).get("data") or {}
+chk("warp probe: не отвечает — ok: false", d.get("ok") is False, d)
+with open(ACTIVE, "a") as f:
+    f.write("awg-warp-healthcheck.timer\n")
+d = api("warp", "probe", env=HCENV).get("data") or {}
+chk("warp probe: с health-check — без пинга, проверяет он", d.get("health") is True and "ok" not in d, d)
+d = api("warp", "probe", "ping", env=HCENV).get("data") or {}
+chk("warp probe ping: бот ждёт конца сбоя — пингует и с health-check", d.get("health") is True and d.get("ok") is False, d)
+with open(ACTIVE) as f:
+    act = f.read().replace("awg-warp-healthcheck.timer\n", "")
+with open(ACTIVE, "w") as f:
+    f.write(act)
+with open(LINKS, "w") as f:
+    f.write("awg0\n")
+rc, out, _ = bash("_api_readonly warp probe && echo RO")
+chk("warp probe — чтение без очереди api", "RO" in out, out)
+
+print("\n── VK и Max мимо VPN ──")
+
+
+def vk_list(n, width=22):
+    return ("# VK\n" + "".join(f"95.{i}.0.0/{width}\n" for i in range(n))
+            + "10.0.0.0/8\n1.0.0.0/4\nfoo bar\n2a00:bdc0::/29\nfe80::/10\n")
+
+
+def mangle(fam=4):
+    try:
+        return open(f"{IPT_RULES}.{'iptables' if fam == 4 else 'ip6tables'}.mangle").read().split("\n")[:-1]
+    except OSError:
+        return []
+
+
+VKRULE = lambda st: (f"PREROUTING -m set --match-set {st} dst -m addrtype ! --dst-type LOCAL "
+                     "-m comment --comment awg2-vkblock -j DROP")
+VKDIR = os.path.join(ROOT, "var/lib/awg2/vkblock")
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(60))
+in4, in6 = ipt(4), ipt(6)
+reset_calls()
+r = api("vkblock", "on", env=ASENV)
+v4 = ipset_set("awg2-vk") or []
+chk("api vkblock on: список скачан, частные и слишком широкие отброшены, DROP в mangle PREROUTING мимо адресов сервера",
+    r.get("ok") and len(v4) == 60 and "95.0.0.0/22" in v4 and not any(x.startswith(("10.", "1.0.")) for x in v4)
+    and mangle(4) == [VKRULE("awg2-vk")], [r, mangle(4), v4[:3]])
+chk("IPv6 — свой набор и правило в ip6tables mangle",
+    ipset_set("awg2-vk6") == ["2a00:bdc0::/29"] and mangle(6) == [VKRULE("awg2-vk6")], [ipset_set("awg2-vk6"), mangle(6)])
+chk("INPUT и FORWARD не тронуты — антисканер и правила сервера отдельно", ipt(4) == in4 and ipt(6) == in6, ipt(4))
+units = os.listdir(os.path.join(ROOT, "units"))
+svc = open(os.path.join(ROOT, "units", "awg2-vkblock.service")).read()
+chk("служба при загрузке — раньше UFW и netfilter-persistent; таймер раз в час",
+    {"awg2-vkblock.service", "awg2-vkblock-update.service", "awg2-vkblock-update.timer"} <= set(units)
+    and "Before=network-pre.target ufw.service netfilter-persistent.service" in svc
+    and "systemctl enable --now awg2-vkblock-update.timer" in calls()
+    and "curl https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-vk.txt" in calls(), units)
+
+with open(f"{IPT_RULES}.iptables.mangle.cnt", "w") as f:
+    f.write("17")
+r = api("vkblock", "status", env=ASENV)
+d = r.get("data") or {}
+chk("api vkblock status: включено, правило на месте, подсети, счётчик отбитых, время списка",
+    r.get("ok") and d.get("enabled") and d.get("active") and d.get("v4") == 60 and d.get("v6") == 1
+    and d.get("dropped") == 17 and d.get("updated", 0) > 0 and d.get("error") == "", d)
+rc, out, _ = bash(ASPRE + "_api_readonly vkblock status && echo RO")
+chk("vkblock status — чтение без очереди api", "RO" in out, out)
+
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(10))
+r = api("vkblock", "update", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("оборванный список прежний не заменяет: ошибка видна, набор прежний",
+    "записей" in (d.get("error") or "") and d.get("v4") == 60 and len(ipset_set("awg2-vk") or []) == 60, [r, d])
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(60, 12))
+api("vkblock", "update", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("слишком широкий охват (подменённый список) — не принят",
+    "охват" in (d.get("error") or "") and "95.0.0.0/22" in (ipset_set("awg2-vk") or []), d)
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(70))
+api("vkblock", "update", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("исправный список: ошибка ушла, набор обновлён", d.get("error") == "" and d.get("v4") == 70, d)
+
+open(f"{IPT_RULES}.iptables.mangle", "w").close()
+reset_calls()
+rc, out, _ = bash(ASPRE + 'vkblock_rules_ok || echo GONE; bash "$VKBLOCK_SCRIPT" heal; echo "rc=$?"')
+chk("правило сбросили — таймер возвращает его без скачивания",
+    "GONE" in out and "rc=0" in out and mangle(4) == [VKRULE("awg2-vk")] and "curl" not in calls(), [out, mangle(4)])
+reset_calls()
+rc, out, _ = bash(ASPRE + 'bash "$VKBLOCK_SCRIPT" heal; echo "rc=$?"')
+chk("правило на месте, список свежий — таймер только проверяет: без скачивания и без изменений",
+    "rc=0" in out and calls() and not any(c.startswith("curl") or " -I " in c or "restore" in c or "swap" in c
+                                          for c in calls()), calls())
+rc, out, _ = bash(ASPRE + 'sed -i "s/^UPDATED=.*/UPDATED=1/" "$VKBLOCK_CONF"; bash "$VKBLOCK_SCRIPT" heal; '
+                  'grep -c "^curl" "$CALLS"')
+chk("список старше суток — таймер обновляет", out.strip().endswith("1"), out)
+
+heal = os.path.join(VKDIR, "heal")
+os.utime(heal, (time.time() - 4 * 3600,) * 2)
+reset_calls()
+bash(ASPRE + "vkblock_watchdog")
+chk("сторож: таймер молчал больше трёх часов — перезапуск",
+    "systemctl start --no-block awg2-vkblock-update.service" in calls(), calls())
+
+r = api("antiscan", "status", env=ASENV)
+chk("антисканер выключен — «VK и Max» от него не зависит",
+    r.get("ok") and not (r.get("data") or {}).get("enabled") and mangle(4) == [VKRULE("awg2-vk")], r)
+
+r = api("vkblock", "off", env=ASENV)
+chk("api vkblock off: правила сняты, наборы удалены",
+    r.get("ok") and mangle(4) == [] and mangle(6) == [] and ipset_set("awg2-vk") is None and ipset_set("awg2-vk6") is None,
+    [r, mangle(4), mangle(6)])
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("выключено — статус и счётчик", d.get("enabled") is False and d.get("active") is False and d.get("dropped") == 0, d)
+rc, out, _ = bash(ASPRE + 'bash "$VKBLOCK_SCRIPT" apply; echo "rc=$?"; ls "$IPSET_DIR/sets"')
+chk("выключено — служба при загрузке ничего не ставит", out.split() == ["rc=0"] and mangle(4) == [], out)
+r = api("vkblock", "update", env=ASENV)
+chk("обновление списка при выключенном — отказ", r.get("ok") is False, r)
+
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(5))
+os.remove(os.path.join(VKDIR, "vk.list"))
+r = api("vkblock", "on", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("включение без годного списка — отказ, выключено, правил нет",
+    r.get("ok") is False and "не получен: в ответе 6 записей — список не принят" in (r.get("error") or "") + (r.get("log") or "")
+    and d.get("enabled") is False and mangle(4) == [], [r, d])
+rc, out, _ = bash(ASPRE + 'vkblock_remove; ls "$VKBLOCK_DIR" "$VKBLOCK_SCRIPT" 2>&1')
+chk("удаление вместе со скриптом: каталог и скрипт убраны", out.count("No such file") == 2, out)
+
+print("\n── РФ напрямую, если туннель упал, куда идёт адрес ──")
+# ip rule / ip route — эмулятор (tests/ipemu.py): правила и таблицы в файлах,
+# route get — по приоритетам правил и меткам, как ядро; живые устройства — LINKS.
+RTBIN = os.path.join(TMP, "rtbin")
+RT_DIR = os.path.join(TMP, "rt")
+os.makedirs(RTBIN)
+shutil.copy(os.path.join(HERE, "ipemu.py"), os.path.join(RTBIN, "ip"))
+os.chmod(os.path.join(RTBIN, "ip"), 0o755)
+with open(os.path.join(RTBIN, "getent"), "w") as f:
+    f.write('#!/usr/bin/env bash\n[[ "$1" == ahostsv4 ]] || exit 2\ncase "$2" in\n'
+            '  bank.example) echo "91.200.1.5      STREAM bank.example"; echo "91.200.1.5      DGRAM" ;;\n'
+            '  two.example) echo "93.184.1.1 STREAM two.example"; echo "93.184.1.2 STREAM" ;;\n'
+            '  *) exit 2 ;;\nesac\n')
+os.chmod(os.path.join(RTBIN, "getent"), 0o755)
+RTENV = dict(ASENV, PATH=RTBIN + ":" + ASENV["PATH"], RT_DIR=RT_DIR)
+RTPRE = ASPRE + f'export PATH="{RTBIN}:$PATH" RT_DIR="{RT_DIR}"; '
+RUD = os.path.join(ROOT, "var/lib/awg2/rudirect")
+RULOG = os.path.join(ROOT, "rudirect.log")
+TFLOG = os.path.join(ROOT, "tunfail.log")
+TFCONF = os.path.join(ROOT, "etc/awg2/tunnel-fail.conf")
+MARK = "0x52550000/0xffff0000"
+
+
+def rbash(code):
+    return bash(RTPRE + code)
+
+
+def rt_rules():
+    try:
+        return sorted(json.load(open(os.path.join(RT_DIR, "rules.json"))), key=lambda x: x["prio"])
+    except (OSError, ValueError):
+        return []
+
+
+def rt_table(t):
+    try:
+        return json.load(open(os.path.join(RT_DIR, f"table.{t}.json")))
+    except (OSError, ValueError):
+        return []
+
+
+def rt_reset():
+    shutil.rmtree(RT_DIR, ignore_errors=True)
+    os.makedirs(RT_DIR)
+
+
+def links(*devs):
+    with open(LINKS, "w") as f:
+        f.write("".join(d + "\n" for d in ("awg0",) + devs))
+
+
+def route_get(src, dst, mark=""):
+    rc, out, err = rbash(f'ip -4 route get {dst} from {src} iif awg0 {"mark " + mark if mark else ""}')
+    return rc, (out + err).strip()
+
+
+def ru_list(n=2500, width=18):
+    out, step = ["# ipverse: RU"], 2 ** (24 - width)
+    for a in (77, 78, 79, 80, 81):
+        for b in range(256):
+            for c in range(0, 256, step):
+                if len(out) > n:
+                    return "\n".join(out) + "\n"
+                out.append(f"{a}.{b}.{c}.0/{width}")
+    return "\n".join(out) + "\n"
+
+
+def rud_status():
+    return api("rudirect", "status", env=RTENV).get("data") or {}
+
+
+def rud_mangle():
+    return [x for x in mangle(4) if "awg2-rudirect" in x]
+
+
+RUD_RULE = lambda dev: (f"PREROUTING -i {dev} -m set --match-set awg2-ru dst -m addrtype ! --dst-type LOCAL "
+                        f"-m comment --comment awg2-rudirect -j MARK --set-xmark {MARK}")
+rt_reset()
+links()
+rc, out, _ = bash("clients_name_ip")
+IPS = dict(ln.split("|", 1) for ln in out.split())
+A, B = IPS["alice"], IPS["bob"]
+open(f"{IPT_RULES}.iptables.mangle", "w").close()
+for fn in ("ipv4-aggregated.txt", "ru-aggregated.zone"):
+    if os.path.exists(os.path.join(ASLISTS, fn)):
+        os.remove(os.path.join(ASLISTS, fn))
+
+# ── РФ напрямую ──
+reset_calls()
+r = api("rudirect", "on", env=RTENV)
+d = rud_status()
+chk("rudirect on без списка: отказ, выключено, правил нет",
+    r.get("ok") is False and "не получен" in (r.get("error") or "") + (r.get("log") or "")
+    and d.get("enabled") is False and rud_mangle() == [] and not any(x["fwmark"] for x in rt_rules()), [r, d])
+
+with open(os.path.join(ASLISTS, "ipv4-aggregated.txt"), "w") as f:
+    f.write(ru_list())
+reset_calls()
+r = api("rudirect", "on", env=RTENV)
+ru = ipset_set("awg2-ru") or []
+chk("rudirect on: список РФ скачан, набор awg2-ru, метка в mangle для awg0 и wgobf0, правило 90 → main",
+    r.get("ok") and len(ru) == 2500 and "77.88.0.0/18" in ru
+    and rud_mangle() == [RUD_RULE("wgobf0"), RUD_RULE("awg0")]
+    and {"prio": 90, "from": "all", "fwmark": MARK, "lookup": "main"} in rt_rules()
+    and "curl https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt" in calls(),
+    [r, rud_mangle(), rt_rules(), len(ru)])
+rbash(f'iptables -t mangle -D {RUD_RULE("wgobf0")}')
+chk("пропала только метка wgobf0 — статус неисправен, таймер возвращает обе метки",
+    rud_status().get("active") is False and rbash('bash "$RUDIRECT_SCRIPT" heal')[0] == 0
+    and rud_mangle() == [RUD_RULE("wgobf0"), RUD_RULE("awg0")], rud_status())
+units = os.listdir(os.path.join(ROOT, "units"))
+svc = open(os.path.join(ROOT, "units", "awg2-rudirect.service")).read()
+chk("служба при загрузке — раньше UFW, таймер раз в час; включены",
+    {"awg2-rudirect.service", "awg2-rudirect-update.service", "awg2-rudirect-update.timer"} <= set(units)
+    and "Before=network-pre.target ufw.service netfilter-persistent.service" in svc
+    and "systemctl enable --now awg2-rudirect-update.timer" in calls(), units)
+with open(f"{IPT_RULES}.iptables.mangle.cnt", "w") as f:
+    f.write("21")
+d = rud_status()
+chk("rudirect status: включено, на месте, сетей РФ, источник, счётчик, свои списки пусты",
+    d.get("enabled") is True and d.get("active") is True and d.get("ru") == 2500 and d.get("mine") == 0
+    and d.get("excl") == 0 and "ipverse" in d.get("src", "") and d.get("packets") == 42 and d.get("updated", 0) > 0
+    and d.get("error") == "" and d.get("direct") == [] and d.get("tunnel") == [], d)
+rc, out, _ = bash(ASPRE + "_api_readonly rudirect status && _api_readonly diag route alice 1.1.1.1 && echo RO")
+chk("rudirect status и diag route — чтение без очереди api", "RO" in out, out)
+
+# Сервер не в России — предупреждение: «РФ напрямую» светит адрес входа российским приложениям
+CC, CCM = os.path.join(ROOT, "var/lib/awg2/country"), os.path.join(ROOT, "var/lib/awg2/country_manual")
+chk("страна не определена — без предупреждения", rud_status().get("abroad") == "", rud_status())
+with open(CC, "w") as f:
+    f.write("NL 1791500000 2 NL=2\n")
+d = rud_status()
+rc, out, _ = rbash("_rudirect_show")
+chk("сервер в NL: в статусе abroad=NL, в меню awg2 — предупреждение и как поправить страну",
+    d.get("abroad") == "NL" and "Сервер не в России (NL)" in out and "блокируют как раз за это" in out
+    and "флагом в шапке панели" in out, [d.get("abroad"), out[-600:]])
+with open(CCM, "w") as f:
+    f.write("RU\n")
+chk("страна вручную — Россия (геобазы ошиблись): предупреждения нет", rud_status().get("abroad") == "", rud_status())
+os.remove(CC)
+os.remove(CCM)
+
+r = api("rudirect", "add", "direct", "https://Bank.Example/login?x=1", env=RTENV)
+d = rud_status()
+chk("свой адрес «всегда напрямую»: из ссылки — домен, разрешён и в наборе",
+    r.get("ok") and d.get("direct") == ["bank.example"] and d.get("mine") == 1 and d.get("ru") == 2500
+    and "91.200.1.5/32" in (ipset_set("awg2-ru") or []), [r, d])
+r = api("rudirect", "add", "tunnel", "77.88.8.0/24", env=RTENV)
+d = rud_status()
+chk("исключение «всегда через туннель» — запись nomatch, перекрывает сеть РФ",
+    r.get("ok") and d.get("tunnel") == ["77.88.8.0/24"] and d.get("excl") == 1
+    and "77.88.8.0/24 nomatch" in (ipset_set("awg2-ru") or []), [r, d])
+r1 = api("rudirect", "add", "tunnel", "bank.example", env=RTENV)
+r2 = api("rudirect", "add", "direct", "10.0.0.1", env=RTENV)
+r3 = api("rudirect", "add", "direct", "1.0.0.0/8", env=RTENV)
+r4 = api("rudirect", "add", "direct", "не адрес!", env=RTENV)
+r5 = api("rudirect", "add", "other", "1.1.1.1", env=RTENV)
+r6 = api("rudirect", "add", "direct", "bank.example", env=RTENV)
+chk("свои списки: уже в другом, частный, шире /12, мусор, неизвестный список — отказ; повтор — без дубля",
+    all(x.get("ok") is False for x in (r1, r2, r3, r4, r5)) and r6.get("ok")
+    and rud_status().get("direct") == ["bank.example"], [r1, r2, r3, r4, r5, r6])
+r = api("rudirect", "add", "direct", "5.255.255.5", env=RTENV)
+d = rud_status()
+chk("одиночный IPv4 — без /32 в списке, в наборе /32", r.get("ok") and d.get("direct") == ["bank.example", "5.255.255.5"]
+    and "5.255.255.5/32" in (ipset_set("awg2-ru") or []), d)
+r = api("rudirect", "del", "direct", "5.255.255.5/32", env=RTENV)
+d = rud_status()
+chk("убрать по записи (с /32 тоже находит)", r.get("ok") and d.get("direct") == ["bank.example"]
+    and "5.255.255.5/32" not in (ipset_set("awg2-ru") or []), [r, d])
+r = api("rudirect", "del", "direct", "9.9.9.9", env=RTENV)
+chk("убрать то, чего нет, — отказ", r.get("ok") is False, r)
+
+# Проверка списка: оборванный, раздутый — не принимаются; запасной источник
+with open(os.path.join(ASLISTS, "ipv4-aggregated.txt"), "w") as f:
+    f.write(ru_list(500))
+api("rudirect", "update", env=RTENV)
+d = rud_status()
+chk("оборванный список (500 сетей) не принят: ошибка видна, набор прежний",
+    "не похоже на список РФ" in d.get("error", "") and d.get("ru") == 2500 and len(ipset_set("awg2-ru") or []) >= 2500, d)
+with open(os.path.join(ASLISTS, "ipv4-aggregated.txt"), "w") as f:
+    f.write(ru_list(2500, 13))
+api("rudirect", "update", env=RTENV)
+d = rud_status()
+chk("слишком широкий охват — не принят", "не похоже на список РФ" in d.get("error", "") and d.get("ru") == 2500, d)
+os.remove(os.path.join(ASLISTS, "ipv4-aggregated.txt"))
+with open(os.path.join(ASLISTS, "ru-aggregated.zone"), "w") as f:
+    f.write(ru_list(2600))
+reset_calls()
+api("rudirect", "update", env=RTENV)
+d = rud_status()
+chk("основной источник недоступен — запасной (ipdeny): принят, ошибка ушла",
+    d.get("error") == "" and d.get("ru") == 2600 and "ipdeny" in d.get("src", "")
+    and calls().count("curl https://") == 2, [d, calls()])
+log = open(RULOG).read()
+chk("журнал РФ напрямую: скачивания, отказы и применения", "не похоже на список РФ" in log
+    and "не скачался" in log and "применено: сетей РФ 2600, своих напрямую 1, через туннель 1" in log, log[-600:])
+
+# Таймер: правило сбросили — вернуть без скачивания; всё на месте — домены перечитать
+open(f"{IPT_RULES}.iptables.mangle", "w").close()
+reset_calls()
+rc, out, _ = rbash('rudirect_rules_ok || echo GONE; bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("правило сбросили — таймер возвращает его без скачивания",
+    "GONE" in out and "rc=0" in out and len(rud_mangle()) == 2 and "curl" not in calls(), [out, rud_mangle()])
+reset_calls()
+rc, out, _ = rbash('bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("всё на месте, но в списках домены — таймер пересобирает набор (адреса доменов меняются), без скачивания",
+    "rc=0" in out and "restore" in calls() and "curl" not in calls() and len(rud_mangle()) == 2, calls())
+api("rudirect", "del", "direct", "all", env=RTENV)
+reset_calls()
+rc, out, _ = rbash('bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("всё на месте, доменов нет — таймер только проверяет",
+    "rc=0" in out and not any(c.startswith("curl") or " -I " in c or "restore" in c for c in calls().splitlines()), calls())
+rc, out, _ = rbash('sed -i "s/^UPDATED=.*/UPDATED=1/" "$RUDIRECT_CONF"; bash "$RUDIRECT_SCRIPT" heal; grep -c "^curl" "$CALLS"')
+chk("список старше суток — таймер обновляет", out.strip().endswith("1") or out.strip().endswith("2"), out)
+os.utime(os.path.join(RUD, "heal"), (time.time() - 4 * 3600,) * 2)
+reset_calls()
+rbash("rudirect_watchdog")
+chk("сторож: таймер молчал больше трёх часов — перезапуск",
+    "systemctl start --no-block awg2-rudirect-update.service" in calls(), calls())
+rbash(f'ip rule del fwmark {MARK} lookup main priority 90')
+d = rud_status()
+r = api("rudirect", "repair", env=RTENV)
+chk("правило маршрутизации пропало — статус «не на месте», «Починить» возвращает",
+    d.get("active") is False and r.get("ok") and rud_status().get("active") is True
+    and sum(1 for x in rt_rules() if x["fwmark"]) == 1, [d, r, rt_rules()])
+
+# Telegram напрямую: подсети Telegram — в тот же набор; свои списки и счёт сетей РФ не трогаются
+TG_NETS = ["149.154.160.0/20", "91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22",
+           "91.108.20.0/22", "91.108.56.0/22", "91.105.192.0/23", "185.76.151.0/24"]
+r = api("rudirect", "tg", "on", env=RTENV)
+d, ru = rud_status(), ipset_set("awg2-ru") or []
+chk("Telegram напрямую: все подсети Telegram в наборе, сетей РФ столько же, свои списки пусты",
+    r.get("ok") and d.get("tg") is True and all(n in ru for n in TG_NETS) and d.get("ru") == 2600
+    and d.get("mine") == 0 and d.get("direct") == [] and "Telegram напрямую" in open(RULOG).read().splitlines()[-1], [r, d])
+rc, out, _ = rbash('rudirect_summary; bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("Telegram напрямую: в сводке; таймер пересобирает набор — подсети Telegram на месте",
+    "Telegram напрямую" in out and "rc=0" in out and all(n in (ipset_set("awg2-ru") or []) for n in TG_NETS), out)
+r1, r2 = api("rudirect", "tg", "maybe", env=RTENV), api("rudirect", "tg", env=RTENV)
+chk("Telegram напрямую: не on/off — отказ", r1.get("ok") is False and r2.get("ok") is False, [r1, r2])
+
+# ── Если туннель упал ──
+with open(os.path.join(ROOT, "warp.peers"), "w") as f:
+    f.write(A + "\n")
+WSTATE = os.path.join(ROOT, "etc/wgcf/state")
+os.makedirs(os.path.dirname(WSTATE), exist_ok=True)
+open(WSTATE, "w").write("on\n")
+links("warp0")
+rt_out = lambda: rbash('rt_up warp0 200 "$WARP_PEERS"')
+rt_out()
+chk("WARP поднят (по умолчанию «напрямую»): правило клиента → 200, в таблице warp0, без «недоступно»",
+    {"prio": 200, "from": A, "fwmark": "", "lookup": "200"} in rt_rules()
+    and [x["kind"] for x in rt_table(200)] == ["dev"], [rt_rules(), rt_table(200)])
+chk("route get: клиент WARP — в warp0, не в туннеле — напрямую",
+    "dev warp0" in route_get(A, "1.1.1.1")[1] and "dev eth0" in route_get(B, "1.1.1.1")[1])
+chk("РФ напрямую: сеть России у клиента WARP — мимо туннеля (метка → main раньше правила 200)",
+    "dev eth0" in route_get(A, "77.88.0.1", "0x52550000")[1], route_get(A, "77.88.0.1", "0x52550000"))
+links()
+rbash("rt_down warp0 200")
+chk("«напрямую»: WARP упал — правила сняты, клиенты идут с адреса сервера",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and "dev eth0" in route_get(A, "1.1.1.1")[1],
+    rt_rules())
+
+links("warp0")
+rt_out()
+reset_calls()
+r = api("tunnels", "fail", "set", "warp", "block", env=RTENV)
+chk("tunnels fail set warp block: режим записан, работающему WARP — «недоступно» под маршрутом, сторож установлен",
+    r.get("ok") and open(TFCONF).read() == "warp=block\n"
+    and sorted(x["kind"] for x in rt_table(200)) == ["dev", "unreachable"]
+    and os.path.exists(os.path.join(ROOT, "units", "awg2-tunfail.service"))
+    and "systemctl enable --now awg2-tunfail.timer" in calls(), [r, rt_table(200), calls()])
+chk("работающий WARP: «недоступно» не мешает — трафик в warp0", "dev warp0" in route_get(A, "1.1.1.1")[1])
+rows = api("tunnels", "fail", env=RTENV).get("data") or []
+w = next((x for x in rows if x["name"] == "warp"), {})
+chk("tunnels fail: четыре туннеля, у WARP «блокировать», включён, работает, не удержан",
+    [x["name"] for x in rows] == ["warp", "xray", "t2s", "exits"] and w.get("mode") == "block" and w.get("enabled") is True
+    and w.get("up") is True and w.get("held") is False and next(x for x in rows if x["name"] == "xray")["mode"] == "direct", rows)
+links()
+rbash("rt_down warp0 200")
+chk("«блокировать»: WARP упал — правило клиента осталось, в таблице только «недоступно»",
+    {"prio": 200, "from": A, "fwmark": "", "lookup": "200"} in rt_rules()
+    and [x["kind"] for x in rt_table(200)] == ["unreachable"], [rt_rules(), rt_table(200)])
+rc, out = route_get(A, "1.1.1.1")
+chk("route get: клиент WARP — «нет маршрута» (адрес сервера не светится), остальные — напрямую",
+    rc != 0 and "No route" in out and "dev eth0" in route_get(B, "1.1.1.1")[1], out)
+chk("…а сеть России у удержанного — напрямую (РФ напрямую раньше удержания)",
+    "dev eth0" in route_get(A, "77.88.0.1", "0x52550000")[1])
+chk("журнал «если туннель упал»: падение записано", "warp0 упал — клиенты удержаны" in open(TFLOG).read())
+w = next((x for x in api("tunnels", "fail", env=RTENV).get("data") or [] if x["name"] == "warp"), {})
+st = api("tunnels", "status", env=RTENV).get("data") or {}
+chk("статус: WARP удержан — в tunnels fail и в tunnels status (held, fail_block, rudirect)",
+    w.get("held") is True and w.get("up") is False and st.get("held") == "WARP" and st.get("fail_block") is True
+    and st.get("rudirect") is True, [w, st])
+
+# ── Куда идёт адрес ──
+def droute(name, addr):
+    return api("diag", "route", name, addr, env=RTENV)
+
+
+r = droute("alice", "1.1.1.1")
+d = r.get("data") or {}
+chk("diag route: удержанный клиент — held, с пояснением",
+    r.get("ok") and d.get("client") == "alice" and d.get("ip") == A
+    and [(x["ip"], x["kind"]) for x in d.get("rows", [])] == [("1.1.1.1", "held")] and "блокировать" in d["rows"][0]["note"], r)
+with open(os.path.join(ROOT, "ip_forward"), "w") as f:
+    f.write("0\n")
+r = droute("alice", "1.1.1.1")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: пересылка пакетов выключена — none с подсказкой, а не «удержан»",
+    row.get("kind") == "none" and "ip_forward" in row.get("note", ""), r)
+os.remove(os.path.join(ROOT, "ip_forward"))
+r = droute("alice", "77.88.0.1")
+chk("diag route: сеть России — rudirect, мимо туннеля",
+    [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["rudirect"], r)
+r = droute("alice", "149.154.167.51")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: Telegram при «Telegram напрямую» — rudirect с пояснением про Telegram",
+    row.get("kind") == "rudirect" and "Telegram напрямую" in row.get("note", ""), r)
+api("rudirect", "tg", "off", env=RTENV)
+r = droute("alice", "149.154.167.51")
+chk("…выключили — подсетей Telegram в наборе нет, Telegram у удержанного клиента — held",
+    rud_status().get("tg") is False and not any(n in (ipset_set("awg2-ru") or []) for n in TG_NETS)
+    and [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["held"], r)
+r = droute("alice", "77.88.8.8")
+chk("diag route: исключение «через туннель» перекрывает сеть России — held, а не rudirect",
+    [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["held"], r)
+links("warp0")
+rt_out()
+chk("WARP вернулся: route get снова в warp0, «недоступно» осталось под маршрутом",
+    "dev warp0" in route_get(A, "1.1.1.1")[1] and sorted(x["kind"] for x in rt_table(200)) == ["dev", "unreachable"])
+r = droute("alice", "https://1.1.1.1:443/dns-query")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: ссылка с портом → адрес; клиент WARP — warp, устройство warp0",
+    row.get("ip") == "1.1.1.1" and row.get("kind") == "warp" and row.get("dev") == "warp0", r)
+r = droute("bob", "1.1.1.1")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: клиент не в туннеле — direct, пояснение называет активный туннель",
+    row.get("kind") == "direct" and "WARP" in row.get("note", ""), r)
+r = droute("alice", "two.example")
+chk("diag route: домен — каждый его IPv4 отдельной строкой",
+    [x["ip"] for x in (r.get("data") or {}).get("rows", [])] == ["93.184.1.1", "93.184.1.2"], r)
+r1, r2, r3 = droute("nobody", "1.1.1.1"), droute("alice", "не адрес!"), droute("alice", "nx.example")
+chk("diag route: нет клиента, мусор, домен не разрешается — отказ",
+    all(x.get("ok") is False for x in (r1, r2, r3)), [r1, r2, r3])
+rc, out, _ = rbash('mkdir -p "$VKBLOCK_DIR"; echo ON=1 > "$VKBLOCK_CONF"; echo 95.0.0.0/22 > "$IPSET_DIR/sets/awg2-vk"; '
+                   'diag_route alice 95.0.1.1; rm -f "$VKBLOCK_CONF" "$IPSET_DIR/sets/awg2-vk"')
+chk("diag route: сеть VK при включённом «VK и Max» — drop", out.split("\t")[1:2] == ["drop"], out)
+api("client", "add", "frank", "mimicry=none")
+bash('py meta-set "$SERVER_CONF" frank expires 1; py expire-check "$SERVER_CONF" "$EXPIRE_SUSPEND_IP" "$EXPIRE_STATE_DIR" >/dev/null')
+r = droute("frank", "1.1.1.1")
+chk("diag route: заблокированный клиент — blocked", [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["blocked"], r)
+api("client", "del", "frank")
+
+# ── Сторож и переключения ──
+links()
+rbash("rt_down warp0 200")
+rt_reset()
+links()
+reset_calls()
+rc, out, _ = rbash('bash "$TUNFAIL_SCRIPT"; echo "rc=$?"')
+chk("перезагрузка, WARP включён, но не поднялся: сторож удерживает его клиентов",
+    "rc=0" in out and {"prio": 200, "from": A, "fwmark": "", "lookup": "200"} in rt_rules()
+    and [x["kind"] for x in rt_table(200)] == ["unreachable"]
+    and "WARP включён, но не работает" in open(TFLOG).read(), [out, rt_rules(), rt_table(200)])
+n_log = open(TFLOG).read().count("включён, но не работает")
+rbash('bash "$TUNFAIL_SCRIPT"')
+chk("сторож повторно — без дублей правил и записей журнала",
+    sum(1 for x in rt_rules() if x["lookup"] == "200") == 1 and open(TFLOG).read().count("включён, но не работает") == n_log,
+    rt_rules())
+links("tun0")
+rbash("rt_up tun0 100 -")
+chk("поднялся другой туннель (tun2socks) — удержание WARP снято, его правила не перехватывают клиентов",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and "dev tun0" in route_get(A, "1.1.1.1")[1],
+    [rt_rules(), route_get(A, "1.1.1.1")])
+rbash('bash "$TUNFAIL_SCRIPT"')
+chk("сторож при живом другом туннеле лежащий WARP не держит", not any(x["lookup"] == "200" for x in rt_rules()), rt_rules())
+links()
+rbash("rt_down tun0 100")
+rt_reset()
+rbash('bash "$TUNFAIL_SCRIPT"')
+r = api("tunnels", "fail", "set", "warp", "direct", env=RTENV)
+chk("удержанному — «напрямую»: отпущен сразу, режим снят, файл режимов убран",
+    r.get("ok") and not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == []
+    and not os.path.exists(TFCONF) and "dev eth0" in route_get(A, "1.1.1.1")[1], [r, rt_rules()])
+
+# Выключение руками отпускает и в «блокировать»
+api("tunnels", "fail", "set", "warp", "block", env=RTENV)
+links("warp0")
+rt_out()
+links()
+rc, out, _ = rbash("warp_down")
+chk("«блокировать», но WARP выключен руками — клиенты отпущены напрямую",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and not os.path.exists(WSTATE)
+    and "dev eth0" in route_get(A, "1.1.1.1")[1], [out, rt_rules(), rt_table(200)])
+rbash('bash "$TUNFAIL_SCRIPT"')
+chk("…и сторож выключенный WARP не держит", not any(x["lookup"] == "200" for x in rt_rules()), rt_rules())
+
+r = api("tunnels", "fail", "set", "all", "block", env=RTENV)
+chk("всем — «блокировать»: четыре строки", r.get("ok")
+    and sorted(open(TFCONF).read().split()) == ["exits=block", "t2s=block", "warp=block", "xray=block"], r)
+r1 = api("tunnels", "fail", "set", "foo", "block", env=RTENV)
+r2 = api("tunnels", "fail", "set", "warp", "maybe", env=RTENV)
+chk("неизвестный туннель или режим — отказ, режимы прежние", r1.get("ok") is False and r2.get("ok") is False
+    and len(open(TFCONF).read().split()) == 4, [r1, r2])
+
+# Exit-ноды: остановка службы в «блокировать» удерживает, выключение — отпускает
+rt_reset()
+EXST = os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state")
+open(EXST, "w").write("active\nmode=all\nbalancer=single\nsingle_exit=\n")
+rbash('ip route replace default dev awg-exit-n1 table 202; ip rule add from "$(server_net)" lookup 202 priority 202; '
+      f'ip route replace default dev awg-exit-n1 table 210; ip rule add from {B} lookup 210 priority 202')
+rbash("exits_routing_stop")
+chk("exit-ноды остановлены (сбой, перезапуск) в «блокировать» — правила на месте, в таблицах только «недоступно»",
+    sum(1 for x in rt_rules() if x["lookup"] in ("202", "210")) == 2
+    and [x["kind"] for x in rt_table(202)] == ["unreachable"] and [x["kind"] for x in rt_table(210)] == ["unreachable"]
+    and "exit-ноды остановлены" in open(TFLOG).read(), [rt_rules(), rt_table(202), rt_table(210)])
+rbash("exits_down quiet")
+chk("exit-ноды выключены руками — отпущены, состояние inactive",
+    not any(x["lookup"] in ("202", "210") for x in rt_rules()) and rt_table(202) == [] and rt_table(210) == []
+    and open(EXST).read().startswith("inactive"), [rt_rules(), rt_table(202)])
+
+# Аварийный сброс — все напрямую, режимы ни при чём
+open(WSTATE, "w").write("on\n")
+links("warp0")
+rt_out()
+links()
+rbash("tunnels_panic_reset quiet")
+chk("аварийный сброс в «блокировать» — все клиенты напрямую, WARP выключен",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and not os.path.exists(WSTATE), rt_rules())
+
+reset_calls()
+rbash("tunfail_watchdog")
+chk("сторож «если упал»: таймер не работает — поставлен заново",
+    "systemctl enable --now awg2-tunfail.timer" in calls(), calls())
+r = api("tunnels", "fail", "set", "all", "direct", env=RTENV)
+chk("всем — «напрямую» (как было): файл режимов убран", r.get("ok") and not os.path.exists(TFCONF), r)
+reset_calls()
+rbash("tunfail_watchdog")
+chk("все «напрямую» — сторож ничего не ставит", "tunfail" not in calls(), calls())
+r = api("log", "tunfail", env=RTENV)
+chk("api log tunfail — журнал режимов и удержаний", r.get("ok") and "напрямую" in json.dumps(r, ensure_ascii=False), r)
+r = api("log", "rudirect", env=RTENV)
+chk("api log rudirect — журнал РФ напрямую", r.get("ok") and "применено" in json.dumps(r, ensure_ascii=False), r)
+
+# ── РФ напрямую: выключение и удаление ──
+r = api("rudirect", "off", env=RTENV)
+d = rud_status()
+chk("rudirect off: метки и правило 90 сняты, набор удалён",
+    r.get("ok") and rud_mangle() == [] and not any(x["fwmark"] for x in rt_rules()) and ipset_set("awg2-ru") is None
+    and d.get("enabled") is False and d.get("active") is False and d.get("packets") == 0, [r, d, rt_rules()])
+rc, out, _ = rbash('bash "$RUDIRECT_SCRIPT" apply; echo "rc=$?"')
+chk("выключено — служба при загрузке ничего не ставит", out.split() == ["rc=0"] and rud_mangle() == [], out)
+r = api("rudirect", "update", env=RTENV)
+chk("обновление при выключенном — отказ", r.get("ok") is False, r)
+r = api("rudirect", "add", "tunnel", "8.8.8.0/24", env=RTENV)
+chk("свой список при выключенном — сохранён, вступит при включении",
+    r.get("ok") and rud_status().get("tunnel") == ["77.88.8.0/24", "8.8.8.0/24"] and rud_mangle() == [], r)
+rc, out, _ = rbash('rudirect_remove; ls "$RUDIRECT_DIR" "$RUDIRECT_SCRIPT" 2>&1')
+chk("удаление: каталог и скрипт убраны", out.count("No such file") == 2, out)
+links()
+
+print("\n── Веб-панель: доступ по адресам и только через VPN ──")
+WFW = os.path.join(TMP, "awg2-web-fw")
+WNETS = os.path.join(TMP, "awg-web", "access.nets")
+WACC = ASPRE + WEBAPI + f'WEB_FW_SCRIPT="{WFW}"; WEB_NETS_FILE="{WNETS}"; need_cmds() {{ return 0; }}; '
+for fam in ("iptables", "ip6tables"):
+    open(f"{IPT_RULES}.{fam}", "w").close()
+wport = dict(ln.split("=", 1) for ln in open(WEBC).read().split("\n") if "=" in ln)["WEB_PORT"]
+rc, out, _ = bash(WACC + 'server_net; wgobf_get NET')
+VPN = out.split()
+WRULE = lambda port, st: (f"INPUT ! -i lo -p tcp --dport {port} -m conntrack --ctstate NEW -m set ! --match-set {st} src "
+                          "-m comment --comment awg2-webacl -j DROP")
+webacl = lambda fam=4: [x for x in ipt(fam) if "awg2-webacl" in x]
+wconf = lambda: dict(ln.split("=", 1) for ln in open(WEBC).read().split("\n") if "=" in ln)
+chk("для проверки есть подсети своего VPN (awg0 и обфускатор)", len(VPN) == 2, VPN)
+rc, out, err = bash(WACC + 'web_access_set ip 1.2.3.4 999.1.1.1 0.0.0.0/0')
+chk("не адрес и слишком широкая подсеть — отказ, режим не меняется",
+    rc != 0 and "999.1.1.1" in out + err and "0.0.0.0/0" in out + err and "WEB_ACCESS" not in wconf(), [out, err])
+# «*» в списке адресов — не маска файлов текущего каталога: в ответе то, что ввели, а не имена файлов
+os.makedirs(os.path.join(TMP, "globdir"), exist_ok=True)
+open(os.path.join(TMP, "globdir", "zz-file-1"), "w").close()
+rc, out, err = bash(WACC + f'cd "{TMP}/globdir"; web_access_set ip "*" "1.2.3.?"')
+chk("в списке адресов «*» и «?» не раскрываются в имена файлов; отказ называет введённое",
+    rc != 0 and "zz-file-1" not in out + err and "*, 1.2.3.?" in out + err and "WEB_ACCESS" not in wconf(), [out, err])
+rc, out, err = bash(WACC + 'web_access_set ip "1.2.3.4, 5.6.7.8/16" 2A02:6B8::/32 1.2.3.4')
+c = wconf()
+chk("по адресам: список нормализован (подсеть, регистр IPv6, без дублей), в конфиге режим ip",
+    rc == 0 and c.get("WEB_ACCESS") == "ip" and c.get("WEB_ALLOW") == "1.2.3.4/32,5.6.0.0/16,2a02:6b8::/32", [out, err, c])
+chk("список для самой панели: адреса и свой VPN; права 600",
+    open(WNETS).read().split() == ["1.2.3.4/32", "5.6.0.0/16", "2a02:6b8::/32"] + VPN
+    and os.stat(WNETS).st_mode & 0o777 == 0o600, open(WNETS).read())
+chk("набор IPv4 — адреса и VPN, IPv6 — свой; правило DROP первым в INPUT на порт панели (и для IPv6)",
+    sorted(ipset_set("awg2-web") or []) == sorted(["1.2.3.4/32", "5.6.0.0/16"] + VPN)
+    and ipset_set("awg2-web6") == ["2a02:6b8::/32"] and ipt(4)[:1] == [WRULE(wport, "awg2-web")]
+    and ipt(6)[:1] == [WRULE(wport, "awg2-web6")], [ipset_set("awg2-web"), ipset_set("awg2-web6"), ipt(4), ipt(6)])
+chk("скрипт правила для загрузки и самой панели сгенерирован", os.path.isfile(WFW)
+    and subprocess.run(["bash", "-n", WFW]).returncode == 0, WFW)
+fwu = open(os.path.join(ROOT, "units", "awg2-web-fw.service")).read()
+chk("служба правила при загрузке — раньше UFW и netfilter-persistent (сохранённые правила найдут набор)",
+    "DefaultDependencies=no" in fwu and "Before=network-pre.target ufw.service netfilter-persistent.service" in fwu
+    and f"ExecStart=-{WFW} apply" in fwu and "WantedBy=multi-user.target" in fwu, fwu)
+# Антисканер: оба правила DROP — друг друга не двигают, его проверка «первый» проходит
+rc, out, _ = bash(WACC + 'ipset create awg2-antiscan hash:net; _antiscan_rule_up iptables awg2-antiscan; '
+                  'antiscan_rules_ok && echo AS-OK; web_fw_run apply; antiscan_rules_ok && echo AS-OK2; '
+                  '_antiscan_rule_up iptables awg2-antiscan; antiscan_rules_ok && echo AS-OK3')
+chk("с антисканером: его правило «первое» и до, и после нашего (наш DROP он допускает выше себя); по одному правилу",
+    out.split() == ["AS-OK", "AS-OK2", "AS-OK3"] and len(webacl()) == 1
+    and sum("awg2-antiscan" in x for x in ipt(4)) == 1, [out, ipt(4)])
+rc, out, _ = bash(WACC + f'bash "{WFW}" check; echo "rc=$?"; iptables -D {WRULE(wport, "awg2-web")}; '
+                  f'bash "{WFW}" check; echo "rc=$?"; bash "{WFW}" apply; bash "{WFW}" check; echo "rc=$?"')
+chk("проверка: на месте — 0; правило сняли — 1, apply возвращает", out.split() == ["rc=0", "rc=1", "rc=0"]
+    and len(webacl()) == 1, [out, ipt(4)])
+rc, out, _ = bash(WACC + f'echo "NET=10.99.0.0/24" > "{TMP}/wgobf-state-x"; WGOBF_STATE="{TMP}/wgobf-state-x"; '
+                  f'_web_fw_emit; bash "{WFW}" check; echo "rc=$?"; _web_fw_emit')
+chk("сменилась подсеть VPN (обфускатор поставили заново) — проверка просит обновить список", out.split() == ["rc=1"], out)
+rc, out, _ = bash(WACC + 'web_conf_set WEB_PORT 40123; web_fw_run apply; web_conf_set WEB_PORT ' + wport + '; '
+                  'iptables -S INPUT | grep -c awg2-webacl')
+chk("смена порта — правило на новом порту, старое снято", out.split() == ["1"] and webacl()[0] == WRULE(40123, "awg2-web"),
+    [out, ipt(4)])
+bash(WACC + 'web_fw_run apply')
+rc, out, err = bash(WACC + 'AWG_CLIENT_IP=203.0.113.9 web_access_set ip 198.51.100.0/24')
+rc2, out2, err2 = bash(WACC + 'AWG_CLIENT_IP=198.51.100.7 web_access_set ip 198.51.100.0/24')
+chk("из панели: свой адрес не в списке — отказ (панель закрылась бы сама); в списке — можно",
+    rc != 0 and "203.0.113.9" in out + err and rc2 == 0 and wconf().get("WEB_ALLOW") == "198.51.100.0/24", [out, err, out2, err2])
+vhost = VPN[0].rsplit(".", 1)[0] + ".5"
+rc, out, err = bash(WACC + 'AWG_CLIENT_IP=203.0.113.9 web_access_set vpn')
+rc2, out2, err2 = bash(WACC + f'AWG_CLIENT_IP={vhost} web_access_set vpn')
+chk("только через VPN: зашли не через VPN — отказ с адресом панели изнутри VPN; через VPN — можно",
+    rc != 0 and "не через VPN" in out + err and rc2 == 0 and wconf().get("WEB_ACCESS") == "vpn"
+    and sorted(ipset_set("awg2-web") or []) == sorted(VPN) and ipset_set("awg2-web6") == []
+    and wconf().get("WEB_ALLOW") == "198.51.100.0/24", [out, err, out2, err2, ipset_set("awg2-web")])
+rc, out, err = bash(WACC + 'AWG_CLIENT_IP=127.0.0.1 web_access_set vpn && AWG_CLIENT_IP=::1 web_access_set vpn')
+chk("с самого сервера (127.0.0.1, ::1) — можно любой режим: так панель открывается всегда", rc == 0, [out, err])
+WGC = os.path.join(TMP, "wgobf0-only.conf")
+with open(WGC, "w") as f:
+    f.write("[Interface]\nAddress = 10.77.0.1/24\nPrivateKey = X\n")
+rc, out, _ = bash(WACC + f'SERVER_CONF="{TMP}/no-awg0.conf"; WGOBF_WG_CONF="{WGC}"; web_vpn_url')
+chk("адрес изнутри VPN без AWG — адрес wgobf0", out.strip() == f"https://10.77.0.1:{wport}/{wconf()['WEB_PATH']}/", out)
+rc, out, _ = bash(WACC + "api_main web status")
+st = json.loads(out)["data"]
+chk("api web status: доступ, список (хранится и в режиме VPN), подсети VPN, адрес из VPN",
+    st.get("access") == "vpn" and st.get("allow") == ["198.51.100.0/24"] and st.get("vpn_nets") == VPN
+    and st.get("vpn_url", "").startswith("https://" + VPN[0].rsplit(".", 1)[0] + ".1:" + wport + "/"), st)
+rc, out, _ = bash(WACC + "api_main web access all")
+chk("для всех: правила и наборы сняты, файл списка убран, список адресов сохранён",
+    json.loads(out).get("ok") and not webacl(4) and not webacl(6) and ipset_set("awg2-web") is None
+    and ipset_set("awg2-web6") is None and not os.path.exists(WNETS) and wconf().get("WEB_ALLOW") == "198.51.100.0/24",
+    [out, ipt(4), ipt(6)])
+# Скрипт сам по себе (загрузка, сама панель): без функций awg2
+with open(WEBC, "a") as f:
+    f.write("WEB_ACCESS=vpn\n")
+rc, out, err = bash(ASPRE + f'bash "{WFW}" apply; echo "rc=$?"')
+chk("скрипт без awg2 (ExecStartPre при загрузке): ставит правило по конфигу", out.split()[-1:] == ["rc=0"]
+    and webacl()[:1] == [WRULE(wport, "awg2-web")], [out, err, ipt(4)])
+rc, out, _ = bash(WACC + 'web_write_unit; cat "' + ROOT + '/units/awg-web.service"')
+chk("юнит панели: правило ставится до старта (с «-»: не встало — панель всё равно стартует), путь скрипта панели",
+    f"ExecStartPre=-{WFW} apply" in out and f"AWG_WEB_FW={WFW}" in out and f"AWG_WEB_NETS={WNETS}" in out, out)
+rc, out, _ = bash(WACC + 'unset SSH_CONNECTION; web_access_menu; web_conf_get WEB_ACCESS; web_conf_get WEB_ALLOW',
+                  stdin="2\n198.51.100.0/24, 192.0.2.7\n")
+rc2, out2, _ = bash(WACC + 'web_access_menu; web_conf_get WEB_ACCESS; do_web_menu', stdin="1\n0\n")
+chk("меню awg2: «Только с моих адресов» — список через запятую; «Для всех»; строка «Доступ» в меню панели",
+    out.split()[-2:] == ["ip", "198.51.100.0/24,192.0.2.7/32"] and "Только через VPN" in out
+    and "\nall\n" in out2 and any("a)" in ln and "Доступ" in ln and "для всех" in ln for ln in out2.splitlines()), [out[-600:], out2[-900:]])
+rc, out, _ = bash(WACC + 'web_access_set vpn >/dev/null; command() { [[ "$*" == "-v ipset" ]] && return 1; builtin command "$@"; }; '
+                  'web_fw_run check; echo "rc=$?"; echo 192.0.2.0/24 >> "$WEB_NETS_FILE"; web_fw_run check; echo "rc=$?"; '
+                  'unset -f command; web_access_set all >/dev/null')
+chk("без ipset проверка сверяет только список панели — не дёргает apply каждые 5 минут", out.split() == ["rc=0", "rc=1"], out)
+rc, out, _ = bash(WACC + 'web_fw_run down; iptables -S INPUT | grep -c awg2-webacl; ls "$WEB_NETS_FILE" 2>&1 | grep -c "No such"')
+chk("down — всё снято", out.split() == ["0", "1"], out)
+# Apply из awg2 и из сторожа панели разом — по очереди (иначе два DROP): второй ждёт замка первого
+bash(WACC + 'web_access_set vpn >/dev/null')
+order = os.path.join(TMP, "webfw-order")
+rc, out, _ = bash(WACC + f': > "{order}"; flock "$WEB_NETS_FILE.lock" -c \'sleep 1.5; echo released >> "{order}"\' & '
+                  f'sleep 0.3; bash "{WFW}" apply; echo applied >> "{order}"; wait')
+chk("правило панели: apply ждёт замка параллельного apply (скрипт панели и awg2 — один замок)",
+    open(order).read().split() == ["released", "applied"] and len(webacl()) == 1, [open(order).read(), ipt(4)])
+# Сменился VPN — список и правило панели сразу, не через 5 минут; последний VPN удалён при «только через VPN» —
+# режим «по адресам» по сохранённому списку (иначе панель закрылась бы всем), списка нет — «для всех»
+WOB = os.path.join(TMP, "wgobf-copy")
+shutil.rmtree(WOB, ignore_errors=True)
+os.makedirs(os.path.join(WOB, "etc"))
+shutil.copy(os.path.join(ROOT, "etc/awg-wgobf/state"), os.path.join(WOB, "etc/state"))
+open(os.path.join(WOB, "wgobf0.conf"), "w").write("[Interface]\nAddress = 10.77.0.1/24\n")
+WOBPRE = (f'WGOBF_DIR="{WOB}/etc"; WGOBF_STATE="{WOB}/etc/state"; WGOBF_WG_CONF="{WOB}/wgobf0.conf"; '
+          f'WGOBF_CLIENTS="{WOB}/clients"; WGOBF_LIB="{WOB}/lib"; WGOBF_BIN="{WOB}/lib/bin"; BACKUP_DIR="{WOB}/bak"; '
+          '_wgobf_routes_clear() { :; }; ')
+bash(WACC + 'web_access_set ip 198.51.100.0/24 >/dev/null')
+rc, out, err = bash(WACC + WOBPRE + 'wgobf_remove quiet; web_conf_get WEB_ACCESS')
+chk("обфускатор удалён (доступ по адресам) — его подсеть из списка панели и набора убрана сразу",
+    out.split()[-1:] == ["ip"] and open(WNETS).read().split() == ["198.51.100.0/24", VPN[0]]
+    and sorted(ipset_set("awg2-web") or []) == sorted(["198.51.100.0/24", VPN[0]]), [out, err, open(WNETS).read()])
+SRV = os.path.join(TMP, "srv-copy")
+shutil.rmtree(SRV, ignore_errors=True)
+os.makedirs(SRV)
+shutil.copy(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf"), os.path.join(SRV, "awg0.conf"))
+SRVPRE = (f'SERVER_CONF="{SRV}/awg0.conf"; CLIENT_DIR="{SRV}/cl"; TRAFFIC_DB="{SRV}/t.json"; WARP_PEERS="{SRV}/w"; '
+          f'XRAY_PEERS="{SRV}/x"; EXITS_PEERS="{SRV}/e"; EXPIRE_STATE_DIR="{SRV}/exp"; WGOBF_STATE="{WOB}/none"; '
+          'auto_backup() { :; }; tunnels_panic_reset() { :; }; ')
+bash(WACC + SRVPRE + 'web_access_set vpn >/dev/null')
+rc, out, err = bash(WACC + SRVPRE + 'server_reset; web_conf_get WEB_ACCESS; web_conf_get WEB_ALLOW')
+chk("сервер сброшен, других VPN нет, доступ «только через VPN» — режим тот же, снаружи закрыта, с предупреждением",
+    out.split()[-2:] == ["vpn", "198.51.100.0/24"] and "снаружи она закрыта" in out
+    and open(WNETS).read().split() == [] and ipset_set("awg2-web") == [] and len(webacl()) == 1,
+    [out, err, open(WNETS).read()])
+rc, out, err = bash(WACC + 'web_vpn_changed; web_conf_get WEB_ACCESS')
+chk("VPN снова есть (новый сервер) — «только через VPN» открывается через него сам, без предупреждения",
+    out.split()[-1:] == ["vpn"] and "закрыта" not in out and open(WNETS).read().split() == VPN
+    and sorted(ipset_set("awg2-web") or []) == sorted(VPN) and len(webacl()) == 1, [out, err, open(WNETS).read()])
+bash(WACC + 'web_conf_set WEB_ACCESS all; web_fw_run apply')
+
 print("\n── WG + обфускатор: клиенты с трафиком ──")
 os.makedirs(os.path.join(ROOT, "etc/awg-wgobf"), exist_ok=True)
 os.makedirs(os.path.join(ROOT, "etc/wireguard"), exist_ok=True)
@@ -2217,6 +3937,192 @@ rows = {x["name"]: x for x in r.get("data") or []}
 chk("клиенты обфускатора: рукопожатие и трафик с запуска; у второго (нет в dump) — пусто, не цифры соседа",
     r.get("ok") and rows.get("wa", {}).get("rx") == 5000 and rows["wa"].get("tx") == 7000 and 30 <= rows["wa"].get("ago", -1) <= 120
     and rows.get("wb", {}).get("rx") == 0 and rows["wb"].get("ago") is None, r)
+print("\n── WG + обфускатор: выход через WARP ──")
+r = api("wgobf", "route", "all", "warp")
+chk("выход через WARP без настроенного WARP — отказ с подсказкой", r.get("ok") is False and "WARP не настроен" in r.get("error", ""), r)
+with open(os.path.join(ROOT, "etc/wireguard/warp0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n[Peer]\nPublicKey = Q\nEndpoint = 162.159.192.1:2408\n")
+reset_calls()
+r = api("wgobf", "route", "all", "warp")
+wl = lambda: bash('cat "$WARP_PEERS.wgobf" 2>/dev/null')[1].split()
+st = (api("wgobf", "status").get("data") or {})
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("все клиенты обфускатора — в WARP: список .wgobf, выход в status и clients, WARP выключен — подсказка",
+    r.get("ok") and wl() == ["10.66.66.2", "10.66.66.3"] and st.get("route") == "warp" and st.get("warp") == "off"
+    and rows.get("wa", {}).get("route") == "warp" and rows.get("wb", {}).get("route") == "warp"
+    and "WARP сейчас выключен" in r.get("_err", "") + json.dumps(r, ensure_ascii=False), [r, wl(), st, rows])
+r = api("wgobf", "route", "wb", "direct")
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("один клиент — напрямую: из списка WARP и его правила сняты", r.get("ok") and wl() == ["10.66.66.2"]
+    and rows["wb"]["route"] == "direct" and "ip rule del from 10.66.66.3" in calls(), [r, wl()])
+r = api("wgobf", "route", "nobody", "warp")
+r2 = api("wgobf", "route", "wa", "tor")
+r3 = api("wgobf", "route", "wa", "warp:x")
+r4 = api("wgobf", "route", "wa", "xray:A\n10.66.66.9|B")
+r5 = api("wgobf", "route", "wa", "exits:../x")
+chk("нет клиента и неизвестный выход — отказ; перевод строки и чужие символы в выходе — тоже",
+    all(x.get("ok") is False for x in (r, r2, r3, r4, r5)) and wl() == ["10.66.66.2"], [r, r2, r3, r4, r5, wl()])
+rc, out, _ = bash('peers_all "$WARP_PEERS"; peers_sync "$WARP_PEERS"; : > "$WARP_PEERS"; cat "$WARP_PEERS.wgobf"')
+chk("«все клиенты AWG» и синхронизация списка WARP клиентов обфускатора не трогают", out.split() == ["10.66.66.2"], out)
+rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client wc >/dev/null 2>&1; cat "$WARP_PEERS.wgobf"; '
+                  'wgobf_delete_client wa >/dev/null 2>&1; echo "--"; cat "$WARP_PEERS.wgobf"')
+chk("новый клиент — туда же, куда все (WARP); удалённый — из списка", out.split() == ["10.66.66.2", "10.66.66.4", "--", "10.66.66.4"], out)
+rc, out, _ = bash('_wgobf_routes_clear; [[ -e "$WARP_PEERS.wgobf" ]] && echo LEFT || echo GONE')
+chk("удаление или новая установка обфускатора — список выходов прежних клиентов убран", out.strip() == "GONE", out)
+os.remove(os.path.join(ROOT, "etc/wireguard/warp0.conf"))
+with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
+            "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
+
+print("\n── WG + обфускатор: AppArmor wg-quick (Ubuntu 25.10+) ──")
+with open(os.path.join(BIN, "apparmor_parser"), "w") as f:
+    f.write('#!/usr/bin/env bash\necho "apparmor_parser $*" >> "$CALLS"\nexit 0\n')
+os.chmod(os.path.join(BIN, "apparmor_parser"), 0o755)
+AA = os.path.join(ROOT, "etc/apparmor.d")
+AAL = os.path.join(AA, "local/wg-quick")
+reset_calls()
+rc, out, _ = bash('WGOBF_FW=/usr/local/lib/awg2/wgobf-fw.sh; _wgobf_apparmor; [[ -e "$WGOBF_AA_DIR/local/wg-quick" ]] && echo MADE || echo NONE')
+chk("профиля wg-quick нет — AppArmor не трогаем", out.strip().endswith("NONE") and "apparmor_parser" not in calls(), [out, calls()])
+os.makedirs(os.path.join(AA, "local"), exist_ok=True)
+with open(os.path.join(AA, "wg-quick"), "w") as f:
+    f.write("profile wg-quick /usr/bin/wg-quick {\n  include if exists <local/wg-quick>\n}\n")
+with open(AAL, "w") as f:
+    f.write("# своё\nfile r /etc/my-hook.conf,\n")
+reset_calls()
+rc, out, _ = bash('WGOBF_FW=/usr/local/lib/awg2/wgobf-fw.sh; _wgobf_apparmor; _wgobf_apparmor')
+loc = open(AAL).read()
+chk("профиль wg-quick есть — скрипт правил wgobf0 разрешён в local/wg-quick, своё на месте, профиль перечитан один раз",
+    "file PUx /usr/local/lib/awg2/wgobf-fw.sh," in loc and loc.startswith("# своё\nfile r /etc/my-hook.conf,\n")
+    and loc.count("awg2-wgobf: begin") == 1 and calls().count("apparmor_parser -r") == 1
+    and os.path.join(AA, "wg-quick") in calls(), [loc, calls()])
+reset_calls()
+rc, out, _ = bash('_wgobf_apparmor drop')
+loc = open(AAL).read()
+chk("удаление обфускатора — свой блок убран, чужие строки остались, профиль перечитан",
+    loc == "# своё\nfile r /etc/my-hook.conf,\n" and calls().count("apparmor_parser -r") == 1, [loc, calls()])
+with open(os.path.join(AA, "wg-quick"), "w") as f:
+    f.write("profile wg-quick /usr/bin/wg-quick {\n}\n")
+os.remove(AAL)
+rc, out, err = bash('_wgobf_apparmor')
+chk("профиль без local/wg-quick — предупреждение, файл не создаём", not os.path.exists(AAL) and "local/wg-quick" in out + err, [out, err])
+os.remove(os.path.join(AA, "wg-quick"))
+
+print("\n── WG + обфускатор: свой маршрут клиента — Xray и exit-ноды ──")
+XCONF = os.path.join(ROOT, "etc/xray/config.json")
+xconf_was = open(XCONF).read() if os.path.exists(XCONF) else None
+fake_xray(tun=True)
+os.makedirs(os.path.dirname(XCONF), exist_ok=True)
+with open(XCONF, "w") as f:
+    json.dump({"inbounds": [{"protocol": "tun", "tag": "tun-in", "settings": {"name": "xray0"}}],
+               "outbounds": [{"protocol": "vless", "tag": "A"}, {"protocol": "vless", "tag": "B"},
+                             {"protocol": "freedom", "tag": "direct"}],
+               "routing": {"rules": [{"type": "field", "inboundTag": ["tun-in"], "outboundTag": "A"}]}}, f)
+for n in ("p1", "p2"):
+    open(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf"), "w").close()
+st = api("wgobf", "status").get("data") or {}
+chk("api wgobf status: туннели на выбор — Xray с выходами (умеет tun), exit-ноды",
+    st.get("xray") in ("off", "up") and st.get("xray_tags") == ["A", "B"] and st.get("exits") in ("off", "up")
+    and {"p1", "p2"} <= set(st.get("exit_nodes") or []), st)
+# Xray поднят в режиме tun: свой выход клиента — правило в конфиге Xray и перезапуск
+WSTUB = 'xray_restart() { echo XRAY-RESTART; }; exits_reapply() { echo EXITS-REAPPLY; }; '
+with open(LINKS, "w") as f:
+    f.write("xray0\n")
+with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
+    f.write("active\ntun_mode=native\n")
+reset_calls()
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:A; echo "--"; cat "$XRAY_PEERS.wgobf"')
+xr = [r for r in json.load(open(XCONF))["routing"]["rules"] if r.get("source")]
+chk("клиент обфускатора → свой выход Xray: список, правило по адресу в конфиге, перезапуск, без NAT в xray0",
+    rc == 0 and "XRAY-RESTART" in out and out.split("--")[1].split() == ["10.66.66.2|A"]
+    and any(r.get("source") == ["10.66.66.2"] and r.get("outboundTag") == "A" for r in xr)
+    and "ip rule add from 10.66.66.2 lookup 201 priority 201" in calls()
+    and "-t nat -I POSTROUTING 1 -s 10.66.66.0/24 -o xray0 -j RETURN" in calls() and "EXITS-REAPPLY" not in out,
+    [out, xr, calls()])
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:A; echo "--"; wgobf_route_set wa xray; echo "--"; wgobf_route_set wa xray')
+parts = out.split("--")
+chk("тот же выход — без перезапуска; на выход по умолчанию — перезапуск один раз, дальше без него",
+    rc == 0 and len(parts) == 3 and "XRAY-RESTART" not in parts[0] and "XRAY-RESTART" in parts[1]
+    and "XRAY-RESTART" not in parts[2], out)
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wb exits:p2; echo "--"; cat "$EXITS_PEERS.wgobf"; echo "--"; wgobf_route_set wb exits:p2')
+parts = out.split("--")
+chk("клиент обфускатора → своя exit-нода: список, маршрутизация нод перезапускается, повтор — без перезапуска",
+    rc == 0 and "EXITS-REAPPLY" in parts[0] and parts[1].split() == ["10.66.66.3|p2"] and "EXITS-REAPPLY" not in parts[2], out)
+# Exit-ноды работают: тот же выход повторно не снимает правило клиента (список тот же — перезапуска нод
+# нет, и вернуть его было бы некому), потерянное правило возвращается без перезапуска, стоящее — не дублируется
+links_was, active_was = open(LINKS).read(), open(ACTIVE).read()
+with open(LINKS, "a") as f:
+    f.write("awg-exit-p2\n")
+with open(ACTIVE, "a") as f:
+    f.write("awg-exits-routing.service\n")
+reset_calls()
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wb exits:p2 2>&1')
+chk("exit-нода выбрана повторно — правило клиента не снимается и на месте, без перезапуска нод",
+    rc == 0 and "EXITS-REAPPLY" not in out and "ip rule del from 10.66.66.3" not in calls()
+    and re.search(r"ip rule add from 10\.66\.66\.3 lookup 21\d priority 202", calls()), [out, calls()])
+reset_calls()
+rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("правило клиента exit-ноды потеряно — возвращается в таблицу его ноды, без перезапуска нод",
+    "EXITS-REAPPLY" not in out and re.search(r"ip rule add from 10\.66\.66\.3 lookup 21\d priority 202", calls()), [out, calls()])
+reset_calls()
+rc, out, _ = bash(WSTUB + 'ip() { if [[ "$1 $2" == "rule show" ]]; then printf "202:\\tfrom 10.66.66.3 lookup 211\\n"; '
+                  'else command ip "$@"; fi; }; _wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("правило клиента exit-ноды на месте — второе не ставится", "from 10.66.66.3" not in calls(), calls())
+open(LINKS, "w").write(links_was)
+reset_calls()
+rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("нода клиента лежит — правило в таблицу её ноды (там общий выход или «недоступно»): вернётся — сторож вернёт маршрут",
+    re.search(r"ip rule add from 10\.66\.66\.3 lookup 21\d priority 202", calls()), calls())
+open(ACTIVE, "w").write(active_was)
+reset_calls()
+rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("exit-ноды выключены — правил клиенту exit-нод не ставим", "ip rule add from 10.66.66.3" not in calls(), calls())
+rc, out, _ = bash(WSTUB + 'SERVER_CONF="$SERVER_CONF.none"; wgobf_route_set wb exits 2>&1; echo "rc=$?"; '
+                  'wgobf_route_of 10.66.66.3; wgobf_route_set wb direct >/dev/null 2>&1; echo "rc=$?"; '
+                  'echo 0 | _wgobf_route_pick 2>&1')
+chk("сервера AWG нет (только обфускатор) — выход в туннель не принимается с понятной причиной, напрямую — можно",
+    "сервером AWG" in out.split("rc=1")[0] and "rc=1\nexits:p2\nrc=0" in out
+    and "exit-нод" not in out.split("rc=0")[1], out)
+bash(WSTUB + 'wgobf_route_set wb exits:p2 >/dev/null 2>&1')
+r1 = api("wgobf", "route", "wb", "exits:zz")
+r2 = api("wgobf", "route", "wb", "xray:Q")
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("нет ноды или выхода Xray — отказ; в clients — маршрут каждого",
+    r1.get("ok") is False and "Ноды zz нет" in r1.get("error", "") and r2.get("ok") is False
+    and "Выхода Xray Q нет" in r2.get("error", "") and rows.get("wa", {}).get("route") == "xray"
+    and rows.get("wb", {}).get("route") == "exits:p2", [r1, r2, rows])
+rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client all >/dev/null 2>&1; echo "rc=$?"; wgobf_clients | grep -cx all || true')
+chk("клиент обфускатора с именем all не создаётся: в «wgobf route» так зовутся все клиенты", out.split() == ["rc=1", "0"], out)
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:B >/dev/null; _xray_peers_untag B; cat "$XRAY_PEERS.wgobf"')
+chk("выход Xray удалён — клиент обфускатора на выходе по умолчанию",
+    len(out.split()) == 2 and int(out.split()[0]) >= 1 and out.split()[1] == "10.66.66.2", out)
+rc, out, _ = bash(WSTUB + 'exits_node_del p2 >/dev/null; : > "$EXITS_DIR/awg-exit-p3.conf"; cat "$EXITS_PEERS.wgobf"')
+chk("нода удалена — клиент обфускатора на общем выходе", out.split() == ["10.66.66.3"], out)
+rc, out, _ = bash(WSTUB + '_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; '
+                  'wgobf_route_set all exits:p1 >/dev/null; wgobf_get ROUTE; wgobf_add_client wc >/dev/null 2>&1; '
+                  'rm -f "$EXITS_DIR/awg-exit-p1.conf"; wgobf_add_client wd >/dev/null 2>&1; cat "$EXITS_PEERS.wgobf"; '
+                  'echo "--"; cat "$XRAY_PEERS.wgobf"; echo "--"; wgobf_route_of 10.66.66.5')
+chk("новые клиенты — за всеми (exits:p1); ноды уже нет — общий выход exit-нод; в одном списке за раз",
+    out.split() == ["exits:p1", "10.66.66.2|p1", "10.66.66.3|p1", "10.66.66.4|p1", "10.66.66.5", "--", "--", "exits"], out)
+rc, out, _ = bash('_backup_tunnel_paths; printf "%s\n" "${_BACKUP_TUNNEL_PATHS[@]}"')
+chk("бэкап туннелей — со списком exit-нод клиентов обфускатора", "exits_peers.list.wgobf" in out, out)
+rc, out, _ = bash(WSTUB + '_wgobf_routes_clear; ls "$EXITS_PEERS.wgobf" "$XRAY_PEERS.wgobf" 2>&1 | grep -c "No such"')
+chk("обфускатор удалён — списки Xray и exit-нод его клиентов убраны, маршрутизация нод перезапущена",
+    out.split() == ["EXITS-REAPPLY", "2"], out)
+os.remove(os.path.join(ROOT, "etc/xray/state"))
+open(LINKS, "w").close()
+for n in ("p1", "p2", "p3"):
+    if os.path.exists(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf")):
+        os.remove(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf"))
+if xconf_was is None:
+    os.remove(XCONF)
+else:
+    with open(XCONF, "w") as f:
+        f.write(xconf_was)
+with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
+            "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
+bash('wgobf_set ROUTE direct')
+
 r = api("traffic", "now")
 d = r.get("data") or {}
 chk("api traffic now — клиенты обфускатора отдельно (wpeers): живая скорость считает и их",
@@ -2230,5 +4136,232 @@ for chan, age, want in (("beta", 1300, True), ("beta", 600, False), ("stable", 1
                       'unset AWG_NO_UPDATE_CHECK; update_check_async; sleep 0.3; [[ -e "$STATE_DIR/peeked" ]] && echo PEEK || echo SKIP')
     chk(f"{chan}: прошлой проверке {age // 60} мин — {'проверяет' if want else 'ещё рано'}",
         out.strip().endswith("PEEK" if want else "SKIP"), out)
+
+print("\n── Резолверы шифрованного DNS: только DoH по IPv4, откат, если не поднялся ──")
+
+
+def _stamp(proto, addr):
+    b = bytes([proto]) + (7).to_bytes(8, "little") + bytes([len(addr)]) + addr.encode() + b"\x00"
+    return "sdns://" + base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+RES_MD = os.path.join(ROOT, "var/cache/dnscrypt-proxy/public-resolvers.md")
+os.makedirs(os.path.dirname(RES_MD), exist_ok=True)
+with open(RES_MD, "w") as f:
+    f.write("# public-resolvers\n\n")
+    for name, proto, addr in (("cloudflare", 2, "1.0.0.1"), ("google", 2, "8.8.8.8"), ("adguard-dns", 1, "94.140.14.14:5443"),
+                              ("adguard-dns-doh", 2, "94.140.14.14"), ("dns.sb", 2, "185.222.222.222"),
+                              ("mullvad-doh-ipv6", 2, "[2a07:e340::2]"), ("mullvad-doh", 2, "194.242.2.2")):
+        f.write(f"## {name}\n\nописание\n\n{_stamp(proto, addr)}\n\n")
+DNSC = os.path.join(ROOT, "etc/dnscrypt-proxy/dnscrypt-proxy.toml")
+os.makedirs(os.path.dirname(DNSC), exist_ok=True)
+FAKE_RESTART = ('dns_restart() { echo restart >> "$STATE_DIR/dns_restarts"; '
+                '! grep -q "google" "$DNS_PROXY_CONF"; }; rm -f "$STATE_DIR/dns_restarts"; ')
+
+
+def dns_conf(names="'cloudflare'"):
+    with open(DNSC, "w") as f:
+        f.write(f"listen_addresses = []\nserver_names = [{names}]\nrequire_nofilter = true\ndoh_servers = true\n")
+
+
+def dns_names():
+    with open(DNSC) as f:
+        return re.search(r"^server_names = (.*)$", f.read(), re.M).group(1)
+
+
+dns_conf()
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream adguard-dns")
+chk("DNSCrypt-имя не записано, подсказка — DoH-вариант", rc != 0 and dns_names() == "['cloudflare']"
+    and "adguard-dns-doh" in out + err and "DoH" in out + err, out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream mullvad-doh-ipv6")
+chk("только IPv6 — не записано, подсказка — IPv4-вариант", rc != 0 and "mullvad-doh" in out + err
+    and dns_names() == "['cloudflare']", out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream adgaurd-dns-doh")
+chk("опечатка — «нет в списке» и похожее имя", rc != 0 and "нет в списке" in out + err and "adguard-dns-doh" in out + err, out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream 'dns.sb,adguard-dns-doh'")
+chk("имя с точкой и DoH-вариант — записаны", rc == 0 and dns_names() == "['dns.sb', 'adguard-dns-doh']", out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream 'cloudflare google'")
+chk("служба не поднялась — прежние резолверы вернулись", rc != 0 and dns_names() == "['dns.sb', 'adguard-dns-doh']"
+    and "вернул прежние" in out + err, out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream 'cloud*'")
+chk("звёздочка и прочее — отказ до записи", rc != 0 and dns_names() == "['dns.sb', 'adguard-dns-doh']", out + err)
+os.remove(RES_MD)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream mullvad-doh-ipv6")
+chk("списка ещё нет — имя проверит перезапуск", rc == 0 and dns_names() == "['mullvad-doh-ipv6']", out + err)
+rc, out, _ = bash('popular() { for i in "${DNS_POPULAR[@]}"; do echo "${i%%|*}"; done; }; popular')
+chk("подсказка «Популярные» — 10 имён", len(out.split()) == 10 and "adguard-dns-doh" in out.split(), out)
+
+print("\n── UFW: русская локаль, порты awg0 и обфускатора, политика FORWARD, починка ──")
+UFWR = os.path.join(TMP, "ufw-active-rules")
+UFWD = os.path.join(ROOT, "etc/default/ufw")
+os.makedirs(os.path.dirname(UFWD), exist_ok=True)
+open(UFWR, "w").close()
+# ufw как на русской локали: статус переведён; правила — в файле, allow/delete его правят
+UFWS = r"""ufw() { echo "ufw $*" >> "$CALLS"
+  case "$1" in
+    status)
+      if [[ "${LC_ALL:-}" == C ]]; then echo "Status: active"; else echo "Состояние: активен"; fi
+      if [[ "${2:-}" == numbered ]]; then awk '{printf "[%2d] %s\n", NR, $0}' "@R@"; else cat "@R@"; fi ;;
+    allow) grep -qF -- "$2 " "@R@" || printf '%-26s ALLOW IN    Anywhere                   # %s\n' "$2" "$4" >> "@R@" ;;
+    --force) sed -i "${3}d" "@R@" ;;
+  esac
+  return 0
+}
+""".replace("@R@", UFWR)
+WOV = (f'WGOBF_DIR="{TMP}/wgobf-ufw"; WGOBF_STATE="$WGOBF_DIR/state"; WGOBF_OBF_CONF="$WGOBF_DIR/obfuscator.conf"; '
+       f'WGOBF_WG_CONF="$WGOBF_DIR/wgobf0.conf"; WGOBF_CLIENTS="$WGOBF_DIR/clients"; WGOBF_LIB="$WGOBF_DIR/lib"; '
+       'WGOBF_BIN="$WGOBF_LIB/wg-obfuscator"; WGOBF_FW="$WGOBF_LIB/wgobf-fw.sh"; '
+       '_wgobf_prepare() { :; }; wgobf_restart() { :; }; web_vpn_changed() { :; }; ')
+
+
+def ufw_defaults(policy):
+    with open(UFWD, "w") as f:
+        f.write(f'IPV6=yes\nDEFAULT_INPUT_POLICY="DROP"\nDEFAULT_FORWARD_POLICY="{policy}"\nMANAGE_BUILTINS=no\n')
+
+
+def ufw_rules():
+    with open(UFWR) as f:
+        return f.read()
+
+
+rc, out, _ = bash(UFWS + 'LC_ALL= ufw status | head -1; ufw_active && echo ACTIVE')
+chk("ufw на русской локали («Состояние: активен») — Тулза видит, что он включён",
+    out.startswith("Состояние: активен") and "ACTIVE" in out, out)
+ufw_defaults("DROP")
+reset_calls()
+rc, out, err = bash(UFWS + WOV + "wgobf_install_opts endpoint=203.0.113.10 port=40555 masking=STUN client= 2>&1")
+chk("установка обфускатора при включённом UFW — порт открыт с меткой, FORWARD=ACCEPT, об этом сказано",
+    rc == 0 and "40555/udp" in ufw_rules() and "# awg-wgobf" in ufw_rules() and "UFW: открыт 40555/udp" in out
+    and 'DEFAULT_FORWARD_POLICY="ACCEPT"' in open(UFWD).read() and "ufw reload" in calls(), [out[-500:], err[-300:], ufw_rules()])
+reset_calls()
+rc, out, _ = bash(UFWS + WOV + f'API_DATA="{TMP}/api-wgobf.json"; _api_wgobf status >/dev/null 2>&1; cat "$API_DATA"')
+try:
+    chk("api wgobf status: ufw=open", json.loads(out).get("ufw") == "open", out[-300:])
+except ValueError:
+    chk("api wgobf status: ufw=open", False, out[-300:])
+n = calls().count("ufw status")
+chk("api wgobf status — ufw запускается один раз (он медленный, на Python)", n == 1, n)
+# UFW включили после установки (правил на порты нет, FORWARD снова DROP), правила wgobf0 снесены
+open(UFWR, "w").close()
+ufw_defaults("DROP")
+links_saved = open(LINKS).read()
+with open(LINKS, "a") as f:
+    f.write("wgobf0\n")
+reset_calls()
+rc, out, _ = bash(UFWS + WOV + "AUTO_MODE=1; do_repair 2>&1")
+aport = bash("server_port")[1].strip()
+chk("«Проверить и починить»: открывает порты AWG и обфускатора, FORWARD=ACCEPT, возвращает правила wgobf0",
+    f"UFW: открыт {aport}/udp" in out and "UFW: открыт 40555/udp" in out and "DEFAULT_FORWARD_POLICY=ACCEPT" in out
+    and "Правила wgobf0 восстановлены" in out and "-I FORWARD 1 -i wgobf0 -j ACCEPT" in calls()
+    and f"{aport}/udp" in ufw_rules() and "40555/udp" in ufw_rules(), out[-900:])
+rc, out, _ = bash(UFWS + WOV + 'iptables() { for a in "$@"; do [[ "$a" == -C ]] && return 0; done; command iptables "$@"; }; '
+                  "AUTO_MODE=1; do_repair 2>&1")
+chk("всё открыто и правила на месте — замечаний по файрволу нет",
+    "порт обфускатора 40555/udp открыт" in out and f"порт AWG {aport}/udp открыт" in out
+    and "закрыт" not in out and "Нет правил файрвола" not in out and "FORWARD — DROP" not in out, out[-900:])
+rc, out, _ = bash(UFWS + WOV + "wgobf_status 2>&1")
+chk("статус обфускатора — строка UFW: порт открыт", "UFW" in out and "порт открыт" in out, out)
+rc, out, _ = bash(UFWS + WOV + "_wgobf_teardown drop 2>&1; echo rc=$?")
+chk("удаление обфускатора снимает его правило UFW, чужие остаются",
+    "rc=0" in out and "40555/udp" not in ufw_rules() and f"{aport}/udp" in ufw_rules(), [out[-300:], ufw_rules()])
+open(LINKS, "w").write(links_saved)
+shutil.rmtree(os.path.join(TMP, "wgobf-ufw"), ignore_errors=True)
+
+print("\n── Порт AWG и обфускатора: 443 (QUIC) или 1024-65535 ──")
+rc, out, _ = bash('for p in 443 1024 51820 65535 80 53 123 1023 0 65536 0443 44x; do '
+                  'awg_port_ok "$p" && printf "+%s " "$p" || printf -- "-%s " "$p"; done')
+chk("443 и 1024-65535 — можно; 80, 53, 123, 1023, 0, 65536, 0443 и мусор — нет",
+    out.split() == ["+443", "+1024", "+51820", "+65535", "-80", "-53", "-123", "-1023", "-0", "-65536", "-0443", "-44x"], out)
+rc, out, _ = bash("server_create_ready() { return 0; }; server_create_opts port=80 2>&1; echo rc=$?")
+chk("api server create port=80 — отказ с подсказкой про 443", "port: 443 или 1024-65535" in out and "rc=1" in out, out[-300:])
+rc, out, _ = bash("server_create_ready() { return 0; }; udp_listening() { [[ $1 == 443 ]]; }; "
+                  "server_create_opts port=443 2>&1; echo rc=$?")
+chk("api server create port=443 — проходит проверку, занятый 443 (HTTP/3 у веб-сервера) — отказ",
+    "UDP 443 занят" in out and "rc=1" in out and "1024-65535" not in out, out[-300:])
+rc, out, _ = bash("wgobf_installed() { return 1; }; wgobf_install_opts port=1023 2>&1; echo rc=$?")
+chk("api wgobf install port=1023 — отказ с подсказкой про 443", "port: 443 или 1024-65535" in out and "rc=1" in out, out[-300:])
+
+print("\n── Установка бота: awg2 из беты, канал стабильный — предложить бету ──")
+CH = 'update_channel_apply stable; update_peek() { echo v1.0.0; }; ask_yes() { echo "ASK: $1"; return 0; }; '
+rc, out, _ = bash(CH + 'AUTO_MODE=0; update_offer_beta; echo "CH=$UPDATE_CHANNEL $(cat "$UPDATE_CHANNEL_FILE")"')
+chk("сборка новее стабильной, канал стабильный — вопрос, канал → бета (и сохранён)",
+    "ASK:" in out and "бот оттуда не совпадёт" in out and "CH=beta beta" in out, out)
+rc, out, _ = bash(CH + 'rm -f "$UPDATE_CHANNEL_FILE"; AUTO_MODE=1; update_offer_beta; echo "CH=$UPDATE_CHANNEL"')
+chk("через API (AUTO_MODE) канал не меняется и вопроса нет", "ASK:" not in out and "CH=stable" in out, out)
+rc, out, _ = bash(CH + 'rm -f "$UPDATE_CHANNEL_FILE"; AUTO_MODE=0; update_peek() { echo "$VERSION"; }; update_offer_beta; '
+                  'echo "CH=$UPDATE_CHANNEL"')
+chk("версия как в стабильном — вопроса нет", "ASK:" not in out and "CH=stable" in out, out)
+rc, out, _ = bash(CH + 'AUTO_MODE=0; update_channel_apply beta; update_offer_beta; echo "CH=$UPDATE_CHANNEL"')
+chk("канал уже бета — вопроса нет", "ASK:" not in out and "CH=beta" in out, out)
+rc, out, _ = bash('rm -f "$UPDATE_CHANNEL_FILE"')
+
+print("\n── Ctrl+C: выход от сигнала — в «awg2.sh; awg-bot-install.sh» вторая команда не запускается ──")
+rc, out, _ = bash("trap '_on_interrupt INT' INT; kill -INT $$; sleep 1; echo AFTER")
+chk("Ctrl+C в меню — «Прервано» и смерть от SIGINT, а не exit 130", rc == -2 and "Прервано" in out and "AFTER" not in out, (rc, out))
+chk("TERM — смерть от SIGTERM", bash("trap '_on_interrupt TERM' TERM; kill -TERM $$; echo AFTER")[0] == -15)
+
+# ── warpscout: поиск endpoint WARP и обновление сканера ──────
+print("warpscout")
+WS = os.path.join(TMP, "ws")
+os.makedirs(os.path.join(WS, "bin"), exist_ok=True)
+with open(os.path.join(WS, "bin", "warpscout"), "w") as f:
+    f.write(r"""#!/bin/bash
+# Заглушка warpscout: WS_MODE — что печатает скан; версия — из файла
+case "$1" in
+  version) cat "$WS/ver" 2>/dev/null || echo 0.13.2; exit 0 ;;
+  register) echo '{}' > "${3:-warpscout-account.json}"; exit 0 ;;
+esac
+echo "$PWD" > "$WS/cwd"; : > warpscout-report-1.txt
+n=$(( $(cat "$WS/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WS/n"
+case "$WS_MODE" in
+  old) printf '\033[32mENDPOINT  PING\033[0m\n162.159.193.10:2408  0.36ms\n162.159.193.10:2408\n' ;;
+  new) echo "Phase 1: probing reachable WARP ports: reachable ports [2408 500]"; echo "Phase 2: verifying tunnels (proto=awg): done"
+       echo 188.114.96.20:2408; echo "Report: warpscout-report-1.txt" ;;
+  flaky) (( n == 1 )) && { echo "Phase 2: verifying tunnels (proto=awg): done"; exit 0; }; echo 162.159.195.7:2408 ;;
+  fail) echo "Using cached WARP account" ; echo "error: account rejected by Cloudflare (401)" >&2; exit 1 ;;
+esac
+""")
+os.chmod(os.path.join(WS, "bin", "warpscout"), 0o755)
+WSPRE = (f'WS="{WS}"; export WS; WARPSCOUT_BIN="{WS}/bin/warpscout"; WARPSCOUT_DIR="{WS}/acc"; '
+         'WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"; warp_backend() { echo wg; }; '
+         'mkdir -p "${WARP_CONF%/*}" "${WARP_PROFILE%/*}"; printf "[Peer]\nEndpoint = 1.2.3.4:2408\n" > "$WARP_CONF"; '
+         'cp "$WARP_CONF" "$WARP_PROFILE"; ')
+
+
+def ws(mode, code="warp_endpoint_best"):
+    for f in ("n", "cwd"):
+        if os.path.exists(os.path.join(WS, f)):
+            os.remove(os.path.join(WS, f))
+    return bash(WSPRE + f"export WS_MODE={mode}; {code}; echo \"rc=$?\"; grep Endpoint \"$WARP_CONF\"")
+
+
+rc, out, _ = ws("old")
+chk("warpscout 0.13: таблица и лучший адрес последней строкой — endpoint в профиле, аккаунт зарегистрирован",
+    "rc=0" in out and "Endpoint = 162.159.193.10:2408" in out and os.path.exists(os.path.join(WS, "acc", "warpscout-account.json")), out)
+rc, out, _ = ws("new")
+chk("warpscout поновее: ход скана и строка отчёта после адреса — адрес всё равно найден",
+    "rc=0" in out and "Endpoint = 188.114.96.20:2408" in out, out)
+chk("скан идёт в каталоге warpscout (не в /), его отчёты не копятся",
+    open(os.path.join(WS, "cwd")).read().strip() == os.path.join(WS, "acc")
+    and not [f for f in os.listdir(os.path.join(WS, "acc")) if f.startswith("warpscout-report")], os.listdir(os.path.join(WS, "acc")))
+rc, out, _ = ws("flaky")
+chk("первый скан пустой (сбой сети на миг) — второй, адрес применён",
+    "сканирую ещё раз" in out and "rc=0" in out and "Endpoint = 162.159.195.7:2408" in out, out)
+rc, out, _ = ws("fail")
+chk("warpscout упал — его же слова о причине, а не «UDP режут»; endpoint прежний",
+    "rc=1" in out and "account rejected by Cloudflare (401)" in out and "режут" not in out
+    and "Endpoint = 1.2.3.4:2408" in out and "Обновить скаут" in out, out)
+inst = ('curl() { local o; while (( $# )); do [[ "$1" == -o ]] && o="$2"; shift; done; '
+        'printf \'#!/bin/sh\necho 0.16.1 > "$WS/ver"\n\' > "$o"; }; ')
+rc, out, _ = ws("old", 'echo 0.13.2 > "$WS/ver"; ' + inst + "warpscout_update")
+chk("«Обновить скаут»: официальный установщик, версия было → стало", "rc=0" in out and "warpscout 0.13.2 → 0.16.1" in out, out)
+rc, out, _ = ws("old", inst + "warpscout_update")
+chk("«Обновить скаут» на последней — «уже последняя версия»", "rc=0" in out and "0.16.1 — уже последняя версия" in out, out)
+rc, out, _ = ws("old", 'curl() { return 22; }; warpscout_update')
+chk("установщик не скачался — понятная ошибка", "rc=1" in out and "Не скачался установщик warpscout" in out, out)
+rc, out, _ = bash(WSPRE + "api_main warp status")
+chk("api warp status: версия сканера (scout)", '"scout": "0.16.1"' in out, out[-300:])
+rc, out, _ = bash(WSPRE + "api_main warp")
+chk("api warp: scout-update в списке команд", "scout-update" in out, out[-300:])
 
 summary()

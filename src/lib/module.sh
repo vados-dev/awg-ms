@@ -65,16 +65,16 @@ mod_built_for() { modinfo -k "$1" "$MOD_NAME" &>/dev/null; }
 # случай «исходники обновили, а пересобрать забыли».
 mod_stale() {
   mod_loaded || return 1
-  local ko live disk newest=0 t kt
+  local ko live disk newest kt
   ko=$(modinfo -n "$MOD_NAME" 2>/dev/null) || return 1
   [[ -f "$ko" ]] || return 1
   live=$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null || true)
   disk=$(modinfo -F srcversion "$ko" 2>/dev/null || true)
   [[ -n "$live" && -n "$disk" && "$live" != "$disk" ]] && return 0
-  for t in "$MOD_SRC_DIR"/*.[ch]; do
-    [[ -f "$t" ]] || continue
-    t=$(stat -c %Y "$t"); (( t > newest )) && newest=$t
-  done
+  # Самый новый файл исходников — одним stat, а не процессом на каждый из десятков
+  # файлов: reboot_reason зовут сводка и server info на каждом экране панели
+  newest=$(stat -c %Y "$MOD_SRC_DIR"/*.[ch] 2>/dev/null | sort -n | tail -1)
+  [[ "$newest" =~ ^[0-9]+$ ]] || newest=0
   kt=$(stat -c %Y "$ko" 2>/dev/null || echo 0)
   (( newest > 0 && kt > 0 && newest > kt ))
 }
@@ -114,12 +114,14 @@ reboot_reason() {
     return 0
   fi
   newest=$(installed_kernels | tail -1)
+  # Коротко и с номером ядра без «-generic»: панель прячет замечание до
+  # следующего нового ядра — по этому тексту
   if [[ -n "$newest" && "$newest" != "$running" ]]; then
-    echo "работает ядро $running, установлено более новое $newest"
+    echo "новое ядро ${newest%%-[a-z]*} — нужна перезагрузка"
   elif mod_stale; then
     echo "в памяти прежняя сборка модуля — нужна перезагрузка модуля"
   elif [[ -f /run/reboot-required ]]; then
-    echo "система просит перезагрузку после обновления пакетов"
+    echo "обновлены пакеты — нужна перезагрузка"
   fi
 }
 

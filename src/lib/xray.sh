@@ -16,6 +16,16 @@
 #                               трафик через Xray действительно идёт.
 
 xray_installed() { [[ -x "$XRAY_BIN" && -f "$XRAY_CONF" ]]; }
+# Сбой включённого Xray: down — Xray не запущен (xray0 нет); notraffic — запущен,
+# но служба маршрутов не дождалась трафика через выход (ссылка устарела, сервер
+# выхода лежит) — клиенты Xray не в туннеле. Пока маршруты ждут (при загрузке до
+# минуты) — не сбой. Пусто и 1 — сбоя нет или Xray выключен.
+xray_fail() {
+  [[ -f "$XRAY_STATE" ]] || return 1
+  if ! ip link show "$XRAY_IF" &>/dev/null && ! unit_active "$XRAY_UNIT"; then echo down; return 0; fi
+  systemctl is-failed --quiet "$XRAY_ROUTING_UNIT" 2>/dev/null && { echo notraffic; return 0; }
+  return 1
+}
 xray_state_get() { sed -n "s/^$1=//p" "$XRAY_STATE" 2>/dev/null | head -1; }
 xray_tags()      { [[ -f "$XRAY_CONF" ]] && py xray-tags "$XRAY_CONF" 2>/dev/null; }
 xray_ru_on()     { [[ -f "$XRAY_CONF" ]] && grep -q '"ruleTag": "ru-direct"' "$XRAY_CONF"; }
@@ -75,7 +85,7 @@ xray_port_owners() {
 
 # ── Установка ─────────────────────────────────────────────
 xray_install() {  # [update] — без вопроса обновить уже установленный
-  local asset base tmp want rc
+  local asset base tmp want rc why prev=""
   if xray_installed; then
     info "Установлен: $("$XRAY_BIN" version 2>/dev/null | head -1)"
     [[ "${1:-}" == update ]] || ask_yes "  Обновить до последней версии? [y/N]: " n || return 0
@@ -99,12 +109,26 @@ xray_install() {  # [update] — без вопроса обновить уже �
   unzip -qo "$tmp/x.zip" xray -d "$tmp" || { err "Архив не распаковался"; return 1; }
   unzip -qo "$tmp/x.zip" geoip.dat geosite.dat -d "$XRAY_ASSET_DIR" 2>/dev/null || true
   "$tmp/xray" version &>/dev/null || { err "Скачанный xray не запускается"; return 1; }
+  [[ -x "$XRAY_BIN" ]] && cp -p "$XRAY_BIN" "$tmp/xray.prev" && prev="$tmp/xray.prev"
   install -m 755 "$tmp/xray" "$XRAY_BIN"
   ok "Xray: $("$XRAY_BIN" version 2>/dev/null | head -1)"
   _XRAY_TUN=""
   mkdir -p "$XRAY_DIR" && chmod 700 "$XRAY_DIR"
   [[ -f "$XRAY_CONF" ]] || py xray-default "$XRAY_CONF"
+  # Новые версии Xray строже к конфигу — то, что писали прежние версии Тулзы,
+  # приводится к ним заранее
+  py xray-compat "$XRAY_CONF"
   if xray_is_up; then
+    # Конфиг, который новый Xray не примет, уронил бы работающий туннель:
+    # проверяем до перезапуска и в этом случае возвращаем прежний бинарь
+    if [[ -n "$prev" ]] && ! why=$(xray_test); then
+      err "Новый Xray не принимает конфиг:"
+      sed 's/^/      /' <<< "$why"
+      install -m 755 "$prev" "$XRAY_BIN"
+      _XRAY_TUN=""
+      warn "Вернул прежний Xray: $("$XRAY_BIN" version 2>/dev/null | head -1) — туннель работает на нём"
+      return 1
+    fi
     info "Перезапускаю туннель на новой версии"
     xray_restart
   fi
@@ -161,14 +185,18 @@ xray_del_outbound() {
   xray_del_tag "$CHOSEN"
 }
 
-# Клиенты удалённых выходов — на выход по умолчанию; печатает, сколько их.
+# Клиенты удалённых выходов (и клиенты обфускатора) — на выход по умолчанию;
+# печатает, сколько их.
 _xray_peers_untag() {  # тег...
-  local f="$XRAY_PEERS"
-  [[ -f "$f" ]] || { echo 0; return 0; }
-  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {c++} END {print c + 0}' \
-    <(printf '%s\n' "$@") "$f"
-  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {print $1; next} {print}' \
-    <(printf '%s\n' "$@") "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+  local f n=0 c
+  for f in "$XRAY_PEERS" "$XRAY_PEERS.wgobf"; do
+    [[ -f "$f" ]] || continue
+    c=$(awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {c++} END {print c + 0}' <(printf '%s\n' "$@") "$f")
+    n=$((n + c))
+    awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {print $1; next} {print}' \
+      <(printf '%s\n' "$@") "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+  done
+  echo "$n"
 }
 
 xray_del_tag() {  # тег
@@ -390,13 +418,14 @@ xray_routing_run() {
     socks_probe "$XRAY_SOCKS" >/dev/null && { rt_up "$XRAY_IF" "$XRAY_TABLE" "$XRAY_PEERS" "" "$nat"; return; }
     sleep 5
   done
-  echo "через Xray трафик не идёт — клиенты остаются на прямом маршруте" >&2
+  echo "через Xray трафик не идёт — клиенты Xray не переведены в туннель" >&2
+  echo "$XRAY_CHECK_HINT (Туннели → Xray → Диагностика)" >&2
   return 1
 }
 
 _xray_emit_routing() {
   emit_script "$XRAY_ROUTING_SCRIPT" 'xray_routing_run "$@"' XRAY_IF XRAY_TABLE XRAY_PEERS XRAY_STATE \
-    XRAY_TUN_ADDR XRAY_SOCKS socks_probe "${RT_FUNCS[@]}" xray_routing_run
+    XRAY_TUN_ADDR XRAY_SOCKS XRAY_CHECK_HINT socks_probe "${RT_FUNCS[@]}" xray_routing_run
 }
 
 _xray_write_units() {  # режим
@@ -506,7 +535,8 @@ xray_up() {
   info "Проверяю, идёт ли трафик через Xray..."
   if ! why=$(socks_probe "$XRAY_SOCKS"); then
     err "Через Xray трафик не идёт (ответ: $why) — туннель не включаю"
-    info "Клиенты остались на прямом маршруте. Логи: journalctl -u $XRAY_UNIT -n 30"
+    info "${XRAY_CHECK_HINT^}"
+    info "Клиенты остались на прямом маршруте"
     xray_down quiet
     return 1
   fi
@@ -516,13 +546,15 @@ xray_up() {
 }
 
 xray_down() {
+  # Состояние — раньше остановки: ExecStop маршрутов в режиме «блокировать»
+  # иначе удержал бы клиентов, а ConditionPathExists не даст Xray стартовать
+  rm -f "$XRAY_STATE"
   systemctl stop "$XRAY_ROUTING_UNIT" &>/dev/null || true
   systemctl disable "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl stop "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl reset-failed "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   rt_down "$XRAY_IF" "$XRAY_TABLE"
   ip link del "$XRAY_IF" &>/dev/null || true
-  rm -f "$XRAY_STATE"
   [[ "${1:-}" == quiet ]] || ok "Xray выключен — клиенты идут напрямую"
 }
 
@@ -543,15 +575,19 @@ xray_uninstall() {
 
 # ── Статус и диагностика ──────────────────────────────────
 xray_status() {
-  local tags=() n total name tag
+  local tags=() n total name tag fail
   if ! xray_installed; then echo -e "  Xray      : ${D}○ не установлен${N}"; return 0; fi
   echo -e "  Версия    : $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
-  if ip link show "$XRAY_IF" &>/dev/null; then
+  fail=$(xray_fail)
+  if [[ "$fail" == notraffic ]]; then
+    echo -e "  Туннель   : ${R}▲ включён, но через выход трафик не идёт${N} — клиенты Xray не в туннеле"
+    echo -e "  ${D}  ${XRAY_CHECK_HINT^}${N}"
+  elif ip link show "$XRAY_IF" &>/dev/null; then
     echo -e "  Туннель   : ${G}● включён${N} ${D}($(xray_state_get tun_mode))${N}"
     n=$(grep -c . "$XRAY_PEERS" 2>/dev/null || true); total=$(clients_name_ip | wc -l)
     echo -e "  Клиентов  : ${W}${n:-0}${N} из $total через Xray"
   elif [[ -f "$XRAY_STATE" ]]; then
-    echo -e "  Туннель   : ${R}▲ включён, но $XRAY_IF нет${N} ${D}— journalctl -u $XRAY_UNIT${N}"
+    echo -e "  Туннель   : ${R}▲ включён, но не запущен${N} — «Перезапустить»; не поднимется — «Диагностика»"
   else
     echo -e "  Туннель   : ${D}○ выключен${N}"
   fi

@@ -32,12 +32,7 @@ os_supported() {
       [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )) && return 0
       echo "$OS_LABEL — нужен Debian 12 или новее"
       ;;
-    centos)
-      [[ -z "$OS_VER" ]] && return 0
-      [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 9 )) && return 0
-      echo "$OS_LABEL — нужен Centos 9 или новее"
-      ;;
-    *) echo "$OS_LABEL — поддерживаются только Centos 9+, Ubuntu 24.04+ и Debian 12+" ;;
+    *) echo "$OS_LABEL — поддерживаются только Ubuntu 24.04+ и Debian 12+" ;;
   esac
   return 1
 }
@@ -81,9 +76,9 @@ need_cmds() {
 # у которых точный пакет уже убран из зеркала.
 headers_candidates() {
   local k="$1" arch flavor
-  os_detect
   echo "linux-headers-$k"
   arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+  os_detect
   if [[ "$OS_ID" == debian ]]; then
     [[ "$k" == *-cloud-* ]] && echo "linux-headers-cloud-$arch"
     echo "linux-headers-$arch"
@@ -212,11 +207,39 @@ ipt_del_grep() {
 }
 
 # ── UFW ───────────────────────────────────────────────────
-ufw_active() { command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]*active'; }
+# LC_ALL=C: ufw переводит вывод («Состояние: активен») — на русской локали
+# Тулза считала бы его выключенным и не открывала бы ни один порт.
+ufw_active() { command -v ufw &>/dev/null && LC_ALL=C ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]*active'; }
 
 ufw_allow() {  # порт/протокол комментарий
   ufw_active || return 0
-  ufw allow "$1" comment "$2" >/dev/null 2>&1
+  LC_ALL=C ufw allow "$1" comment "$2" >/dev/null 2>&1
+}
+
+# Порт в UFW одним вызовом ufw (он на Python — каждый вызов ~0,1-0,3 с):
+# off — UFW нет или выключен, open — разрешающее правило на порт есть, closed — нет
+ufw_port_state() {  # порт/протокол, как пишет ufw status: 51820/udp
+  local out
+  command -v ufw &>/dev/null && out=$(LC_ALL=C ufw status 2>/dev/null) \
+    && grep -qiE '^Status:[[:space:]]*active' <<< "$out" || { echo off; return 0; }
+  if grep -qE "^$1[[:space:]]+ALLOW" <<< "$out"; then echo open; else echo closed; fi
+}
+
+# Открыть порт службы с сообщением; UFW выключен — молча ничего.
+ufw_open() {  # порт/протокол комментарий
+  ufw_active || return 0
+  ufw_allow "$1" "$2" && ok "UFW: открыт $1"
+}
+
+# Политика FORWARD в UFW: DROP оставит клиентов VPN без интернета, если
+# правил ACCEPT туннеля в цепочке не окажется (ufw с MANAGE_BUILTINS=yes,
+# iptables -F) — для серверов с VPN ставим ACCEPT, как делает сам wg-quick.
+ufw_forward_accept() {
+  ufw_active || return 0
+  grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null || return 0
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$UFW_DEFAULTS" || return 1
+  LC_ALL=C ufw reload &>/dev/null || true
+  info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
 }
 
 # Снять правила UFW с комментарием ровно $1. ufw_delete_matching ищет подстроку —
@@ -225,12 +248,12 @@ ufw_delete_comment() {
   command -v ufw &>/dev/null || return 0
   local n guard=0
   while (( guard++ < 64 )); do
-    n=$(ufw status numbered 2>/dev/null | awk -v c="$1" '{
+    n=$(LC_ALL=C ufw status numbered 2>/dev/null | awk -v c="$1" '{
           s = $0; sub(/[ \t]+$/, "", s); i = index(s, "# ")
           if (i && substr(s, i + 2) == c && match(s, /^\[ *[0-9]+ *\]/)) {
             n = substr(s, 2, RLENGTH - 2); gsub(/ /, "", n); print n; exit } }')
     [[ -n "$n" ]] || break
-    ufw --force delete "$n" >/dev/null 2>&1 || break
+    LC_ALL=C ufw --force delete "$n" >/dev/null 2>&1 || break
   done
 }
 
@@ -239,8 +262,8 @@ ufw_delete_matching() {
   command -v ufw &>/dev/null || return 0
   local n guard=0
   while (( guard++ < 64 )); do
-    n=$(ufw status numbered 2>/dev/null | grep -F -- "$1" | head -1 | grep -oE '^\[ *[0-9]+ *\]' | tr -d '[] ')
+    n=$(LC_ALL=C ufw status numbered 2>/dev/null | grep -F -- "$1" | head -1 | grep -oE '^\[ *[0-9]+ *\]' | tr -d '[] ')
     [[ -n "$n" ]] || break
-    ufw --force delete "$n" >/dev/null 2>&1 || break
+    LC_ALL=C ufw --force delete "$n" >/dev/null 2>&1 || break
   done
 }

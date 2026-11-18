@@ -42,12 +42,19 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
     n = d.get("cascade", 0)
     lines = [f"{ui.state_icon(d.get(k, 'none'))} {label} — {ui.state_word(d.get(k, 'none'))}" for k, label, _ in names]
     lines.insert(4, f"{'🟢' if n else '▫️'} Каскад портов — {'правил: ' + str(n) if n else 'правил нет'}")
+    lines.append(f"{'🟢' if d.get('rudirect') else '▫️'} РФ напрямую — "
+                 + ("сайты России мимо туннеля" if d.get("rudirect") else "выключено"))
+    held = d.get("held") or ""
+    lines.append(("🔴" if held else "🛑" if d.get("fail_block") else "▫️") + " Если туннель упал — "
+                 + (f"удерживает клиентов: {esc(held)}" if held
+                    else "где-то «блокировать»" if d.get("fail_block") else "напрямую (как было)"))
     text = ("<b>🌐 Туннели и DNS</b>\n\nОдновременно работает только один туннель для клиентов."
             + (f"\nСейчас: <b>{esc(d['active'])}</b>" if d.get("active") else "")
             + "\n\n" + "\n".join(lines)
             + "\n\n<i>🚨 Всё напрямую — аварийно выключить туннели, настройки сохранятся</i>")
     buttons = [(f"{ui.state_icon(d.get(k, 'none'))} {label}", to) for k, label, to in names]
     buttons.insert(4, (f"{'🟢' if n else '▫️'} Каскад", "cas"))
+    buttons += [("🇷🇺 РФ напрямую", "rud"), (f"{'🔴' if held else '🪂'} Если упал", "tf")]
     await ui.render(cb, text, ui.kb(buttons, ("🚨 Всё напрямую", tun.data("panic")), ui.back()))
 
 
@@ -119,9 +126,12 @@ async def warp_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
     conf = d.get("configured")
     hints = [f"📦 — {'переустановить' if conf else 'установить'} и зарегистрировать (бэкенд {esc(d.get('backend') or '?')})"]
     if conf:
-        hints.append("✅ Health-check — сам перезапускает WARP, если тот перестал отвечать")
+        hints.append("✅ Health-check — WARP не отвечает: клиенты напрямую, а WARP он вернёт сам")
     if wg:
         hints.append("📥 Импорт — свой wgcf-profile.conf, если регистрация отсюда не проходит")
+    if wg and conf:
+        hints.append("🔄 Обновить скаут — последняя версия warpscout для поиска endpoint"
+                     + (f" (сейчас {esc(d['scout'])})" if d.get("scout") else ""))
     await ui.render(cb, "<b>☁️ WARP (Cloudflare)</b>\n" + ui.pre(r.log, 1500, tail=False)
                     + "\n<i>" + "\n".join(hints) + "</i>", ui.kb(
         ("📦 Переустановить" if conf else "📦 Установить", warp.data("install")),
@@ -133,9 +143,15 @@ async def warp_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
         ("🔑 Ключ Warp+", warp.data("key")) if wg and conf else None,
         ("📥 Импорт профиля", warp.data("import")) if wg else None,
         ("🔎 Поиск endpoint", warp.data("ep")) if wg and conf else None,
+        ("🔄 Обновить скаут", warp.data("scout")) if wg and conf else None,
         ("🔀 Сменить бэкенд", warp.data("backend")),
         ("🗑 Удалить", warp.data("rm")) if conf else None,
         ui.back("tun")))
+
+
+@warp("scout")
+async def _warp_scout(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await jobs.start(cb, "Обновление warpscout", "warp", "scout-update", back_to="warp")
 
 
 @warp("install")
@@ -146,6 +162,11 @@ async def _warp_install(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 @warp("up")
 async def _warp_up(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await jobs.start(cb, "Включение WARP", "warp", "up", back_to="warp")
+
+
+@warp("restart")
+async def _warp_restart(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await jobs.start(cb, "Перезапуск WARP", "warp", "restart", back_to="warp")
 
 
 @warp("down")
@@ -181,14 +202,17 @@ async def _warp_import(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await ask.ask(cb, state, "warp_import",
                   "Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):\n"
                   "<code>./wgcf register --accept-tos &amp;&amp; ./wgcf generate</code>\n\n"
-                  "Пришли <code>wgcf-profile.conf</code> файлом или текстом.", "warp")
+                  "Пришли <code>wgcf-profile.conf</code> файлом или текстом.\n"
+                  "<i>Подойдёт и профиль с параметрами AmneziaWG (Jc, Jmin, Jmax): с российских серверов "
+                  "чистый WireGuard к Cloudflare часто режут, а с ними WARP поднимается через AmneziaWG.</i>", "warp")
 
 
 @ask.on("warp_import")
 async def _warp_import_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     data = await ask.file_of(msg)
     text = data.decode(errors="replace") if data else ask.text_of(msg)
-    if "[Interface]" not in text or "[Peer]" not in text:
+    # Заголовки проверяет и чинит awg2 («Interface]» без скобки — частая потеря при копировании)
+    if "PrivateKey" not in text or "PublicKey" not in text:
         await ask.retry(msg, state, ctx, "Это не похоже на wgcf-profile.conf")
         return
     await ui.render(msg, "⏳ Импортирую профиль…")
@@ -256,6 +280,9 @@ async def xray_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
     d = r.data
     inst, up, tags = d.get("installed"), d.get("up"), d.get("tags") or []
     text = "<b>🛰 Xray</b>\n" + ui.pre(r.log, 1500, tail=False)
+    if d.get("fail") == "notraffic":
+        text += ("\n⚠️ <b>Через выход трафик не идёт</b> — проверь ссылку: 🩺 Диагностика покажет, какой выход "
+                 "не отвечает. Ссылка устарела — ➕ добавь новую, старую ➖ удали, затем 🔄 перезапусти Xray.\n")
     if inst:
         text += ("\n<i>➕ Добавить выход — ссылкой vless://, vmess://, trojan://, ss://, hysteria2://\n"
                  "✅ РФ напрямую — российские сайты мимо Xray"
@@ -429,7 +456,7 @@ async def _t2s_rm_ok(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 # ── AWG exit-ноды ─────────────────────────────────────────
 @ex()
 async def exits_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
-    r = await api.call("exits", "status")
+    r = await api.call("exits", "status", "check")     # с проверкой выхода в интернет через ноды
     if not r.ok or not isinstance(r.data, dict):
         await ui.render(cb, ui.fail(r, "Exit-ноды"), ui.kb(ui.back("tun")))
         return
@@ -445,8 +472,52 @@ async def exits_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> N
         ("🎯 Выбранные", ex.data("up", "peers")) if nodes and (not up or d.get("mode") != "peers") else None,
         ("⏹ Выключить", ex.data("down")) if up else None,
         ("⚖️ Балансировка", ex.data("bal")) if nodes else None,
+        ("🪂 Порядок нод", ex.data("ord")) if len(nodes) > 1 else None,
         ("👥 Клиенты и ноды", ex.data("cl")) if nodes else None,
         ui.back("tun")))
+
+
+def _ex_node_state(n: dict) -> str:
+    if n.get("health") == "down":
+        return f"🔴 не отвечает с {ui.fmt_time(n.get('since') or 0)}"
+    return "🟢 работает" if n.get("up") else "⚪️ не поднята"
+
+
+@ex("ord")
+async def exits_order_screen(cb: CallbackQuery, state: FSMContext, arg: str = "", note: str = "") -> None:
+    d = await api.data("exits", "status", default={}) or {}
+    nodes = {n["name"]: n for n in d.get("nodes") or [] if isinstance(n, dict) and n.get("name")}
+    order = [n for n in d.get("order") or [] if n in nodes]
+    lines = ["<b>🪂 Порядок нод</b>",
+             "Общий выход — через первую живую ноду по порядку. Упала — следующая; основная снова отвечает — "
+             "выход вернётся на неё. Сторож проверяет выход в интернет через каждую ноду раз в 30 с.", ""]
+    if note:
+        lines += [note, ""]
+    for i, name in enumerate(order):
+        role = "основная" if i == 0 else f"запасная {i}"
+        lines.append(f"{i + 1}. <b>{esc(name)}</b> — {role} · {_ex_node_state(nodes[name])}")
+    if d.get("active"):
+        lines.append(f"\n➡️ Общий выход сейчас: <b>{esc(str(d['active']).replace('+', ' + '))}</b>")
+    if d.get("balancer") == "ecmp":
+        lines.append("<i>Сейчас ECMP: трафик делится между всеми живыми нодами, порядок вступит в силу "
+                     "в режиме «одна нода».</i>")
+    if d.get("up") and not d.get("watch"):
+        lines.append("▲ Сторож не запущен — автопереключения нет. Выключи и включи маршруты exit-нод.")
+    await ui.render(cb, "\n".join(lines), ui.kb(
+        [(f"⬆️ {n}", ex.data("ordup", n)) for n in order[1:]], ui.back("ex")))
+
+
+@ex("ordup")
+async def _ex_order_up(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    d = await api.data("exits", "status", default={}) or {}
+    order = [str(n) for n in d.get("order") or []]
+    if name in order and order.index(name) > 0:
+        i = order.index(name)
+        order[i - 1], order[i] = order[i], order[i - 1]
+    r = await api.call("exits", "order", *order)
+    await exits_order_screen(cb, state, note=(f"✅ {esc(name)} — " + ("основная" if order[:1] == [name] else
+                                                                     f"запасная {order.index(name)}"))
+                             if r.ok else ui.fail(r, "Порядок нод"))
 
 
 @ex("add")
@@ -510,8 +581,8 @@ async def _ex_bal(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     d = await api.data("exits", "status", default={}) or {}
     nodes = d.get("nodes") or []
     cur = "ecmp" if d.get("balancer") == "ecmp" else d.get("single") or ""
-    await ui.render(cb, "<b>⚖️ Балансировка</b>\nОдна нода — весь общий трафик через неё; "
-                        "ECMP — поровну между поднятыми нодами.",
+    await ui.render(cb, "<b>⚖️ Балансировка</b>\nОдна нода — весь общий трафик через неё (упала — через "
+                        "следующую по порядку); ECMP — поровну между живыми нодами.",
                     ui.kb([(f"{'🔘' if cur == n['name'] else '⚪️'} {n['name']}",
                             ex.data("balset", f"single|{n['name']}")) for n in nodes],
                           (f"{'🔘' if cur == 'ecmp' else '⚪️'} ECMP", ex.data("balset", "ecmp|")),
@@ -600,7 +671,7 @@ async def _cas_proto(cb: CallbackQuery, state: FSMContext, proto: str) -> None:
 @ask.on("cas_in")
 async def _cas_in(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1 <= int(v) <= 65535:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 65535:
         await ask.retry(msg, state, ctx, "Порт — число 1-65535")
         return
     await ask.ask(msg, state, "cas_dst", "Публичный IPv4 сервера назначения:", "cas", **ctx.data, port=v)
@@ -620,7 +691,7 @@ async def _cas_dst(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 @ask.on("cas_out")
 async def _cas_out(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1 <= int(v) <= 65535:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 65535:
         await ask.retry(msg, state, ctx, "Порт — число 1-65535")
         return
     await _cas_comment(msg, state, dict(ctx.data, out=v))
@@ -782,16 +853,21 @@ async def _dns_set(cb: CallbackQuery, state: FSMContext, idx: str) -> None:
 
 @dns("manual")
 async def _dns_manual(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    d = await api.data("dns", "status", default={}) or {}
+    pop = [p for p in d.get("popular") or [] if isinstance(p, dict)]
+    tip = ("\n\n<b>Популярные (DoH)</b> — нажми на имя, чтобы скопировать:\n<blockquote expandable>"
+           + "\n".join(f"<code>{esc(p.get('name', ''))}</code> — {esc(p.get('label', ''))}" for p in pop)
+           + "</blockquote>") if pop else ""
     await ask.ask(cb, state, "dns_names", "Имена резолверов через запятую — из списка "
                                           "<a href=\"https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/"
-                                          "public-resolvers.md\">public-resolvers</a>.", "dns")
+                                          "public-resolvers.md\">public-resolvers</a>. Подходят только DoH." + tip, "dns")
 
 
 @ask.on("dns_names")
 async def _dns_names(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not re.fullmatch(r"[A-Za-z0-9_, -]+", v):
-        await ask.retry(msg, state, ctx, "Допустимы латиница, цифры, дефис и запятая")
+    if not re.fullmatch(r"[A-Za-z0-9._, -]+", v):
+        await ask.retry(msg, state, ctx, "Допустимы латиница, цифры, точка, дефис и запятая")
         return
     await quick(msg, "Резолверы", "dns", "dns", "upstream", v)
 
