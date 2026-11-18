@@ -47,7 +47,7 @@ jobs:
           verify() { ssh-keygen -Y verify -f "$RUNNER_TEMP/allowed" -I "$id" -n "$ns" -s awg2.sh.sig < awg2.sh >/dev/null 2>&1; }
           # awg2.sh — ровно сборка src/ (с той же буквой тестовой сборки)
           built() {
-            AWGM_BUILD="$(sed -n 's/^BUILD="\(.*\)"$/\1/p' awg2.sh | head -1)" ./build.sh "$RUNNER_TEMP/built.sh" >/dev/null \
+            AWG_BUILD="$(sed -n 's/^BUILD="\(.*\)"$/\1/p' awg2.sh | head -1)" ./build.sh "$RUNNER_TEMP/built.sh" >/dev/null \
               && cmp -s "$RUNNER_TEMP/built.sh" awg2.sh
           }
           for attempt in 1 2 3; do
