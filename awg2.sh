@@ -1366,7 +1366,7 @@ client_name_of() { local b="${1##*/}"; echo "${b%_awg[23].conf}"; }
 
 client_files() {
   local f
-  for f in "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
+  for f in "$CLIENT_DIR/${1}/${1}.conf" "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
   return 0
 }
 
@@ -20819,5 +20819,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=92a37d5ebe775e18
+_BUILD_SUM=31c60fb4c47e9e92
 main "$@"
