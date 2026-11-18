@@ -1223,9 +1223,9 @@ taken_networks() {
 }
 
 # ═════ conf ═════
-# Конфиг сервера awg0.conf и файлы клиентов.
+# Конфиг сервера $SERVER_CONF и файлы клиентов.
 #
-# Шапка awg0.conf — служебные метки «# КЛЮЧ=значение» до секции [Interface].
+# Шапка $SERVER_CONF — служебные метки «# КЛЮЧ=значение» до секции [Interface].
 # Их читает и Telegram-бот, поэтому имена меток не меняются:
 #   AWG_PROFILE     lite | pro | standard (устаревший)
 #   AWG_PROTO       2.0 | 3.0 | 3.1 (нет метки — 2.0)
@@ -1356,7 +1356,7 @@ client_suffix() { [[ "$(server_proto)" == 3* ]] && echo _awg3 || echo _awg2; }
 # Путь к конфигу клиента: существующий файл любой версии, иначе новый.
 client_file() {
   local f
-  for f in "$CLIENT_DIR/${1}_awg3.conf" "$CLIENT_DIR/${1}_awg2.conf"; do
+  for f in "$CLIENT_DIR/${1}/${1}.conf" "$CLIENT_DIR/${1}_awg3.conf" "$CLIENT_DIR/${1}_awg2.conf"; do
     [[ -f "$f" ]] && { echo "$f"; return 0; }
   done
   echo "$CLIENT_DIR/${1}$(client_suffix).conf"
@@ -20819,5 +20819,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=43bbd379e23dff88
+_BUILD_SUM=92a37d5ebe775e18
 main "$@"
