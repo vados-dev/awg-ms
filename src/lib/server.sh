@@ -69,16 +69,26 @@ do_install() {
   fi
   : > "$INSTALL_LOG"; chmod 600 "$INSTALL_LOG"
   info "Подробный вывод шагов: $INSTALL_LOG"
-  _purge_legacy_ppa && ok "Удалены остатки старых PPA"
+  if [[ "$os_type" = "deb" ]]; then
+    _purge_legacy_ppa && ok "Удалены остатки старых PPA"
+  fi
   _ensure_dns || return 1
 
-  export DEBIAN_FRONTEND=noninteractive
-  run_step "Обновление списка пакетов" apt-get update -q || return 1
-  if ask_yes "  Обновить пакеты системы (apt upgrade)? [Y/n]: " y; then
-    run_step "Обновление системы" apt-get upgrade -y -q -o Dpkg::Options::=--force-confdef \
-      -o Dpkg::Options::=--force-confold || warn "apt upgrade с ошибкой — продолжаю"
+  if [[ "$os_type" = "deb" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    run_step "Обновление списка пакетов" apt-get update -q || return 1
+    if ask_yes "  Обновить пакеты системы (apt upgrade)? [Y/n]: " y; then
+      run_step "Обновление системы" apt-get upgrade -y -q -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold || warn "apt upgrade с ошибкой — продолжаю"
+    fi
+    run_step "Пакеты (${#BASE_PKGS[@]})" apt_install "${BASE_PKGS[@]}" || { apt_errors; return 1; }
+  else
+    run_step "Обновление списка пакетов" dnf check-update -y -q || return 1
+    if ask_yes "  Обновить пакеты системы (dnf upgrade)? [Y/n]: " y; then
+      run_step "Обновление системы" dnf upgrade -y -q || warn "dnf upgrade с ошибкой — продолжаю"
+    fi
+    run_step "Пакеты (${#BASE_PKGS[@]})" apt_install "${BASE_PKGS[@]}" || { apt_errors; return 1; }
   fi
-  run_step "Пакеты (${#BASE_PKGS[@]})" apt_install "${BASE_PKGS[@]}" || { apt_errors; return 1; }
 
   running=$(uname -r)
   if ! run_step "Заголовки ядра $running" ensure_headers "$running"; then

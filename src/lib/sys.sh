@@ -23,16 +23,20 @@ os_supported() {
   local major="${OS_VER%%.*}"
   case "$OS_ID" in
     ubuntu)
+      os_type="deb"
+      [[ -z "$OS_VER" ]] && return 0
       [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 24 )) && return 0
       echo "$OS_LABEL — нужна Ubuntu 24.04 или новее"
       ;;
     debian)
+      os_type="deb"
       # testing/sid живут без VERSION_ID — это заведомо новее 12
       [[ -z "$OS_VER" ]] && return 0
       [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )) && return 0
       echo "$OS_LABEL — нужен Debian 12 или новее"
       ;;
     centos)
+      os_type="rhel"
       [[ -z "$OS_VER" ]] && return 0
       [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 9 )) && return 0
       echo "$OS_LABEL — нужен Centos 9 или новее"
