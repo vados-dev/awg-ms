@@ -668,7 +668,12 @@ os_supported() {
       [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 12 )) && return 0
       echo "$OS_LABEL — нужен Debian 12 или новее"
       ;;
-    *) echo "$OS_LABEL — поддерживаются только Ubuntu 24.04+ и Debian 12+" ;;
+    centos)
+      [[ -z "$OS_VER" ]] && return 0
+      [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 9 )) && return 0
+      echo "$OS_LABEL — нужен Centos 9 или новее"
+      ;;
+    *) echo "$OS_LABEL — поддерживаются только Centos 9+, Ubuntu 24.04+ и Debian 12+" ;;
   esac
   return 1
 }
@@ -20814,5 +20819,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=0049450f6c45b12b
+_BUILD_SUM=43bbd379e23dff88
 main "$@"
