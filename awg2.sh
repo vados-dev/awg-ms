@@ -379,18 +379,19 @@ INSTALL_LOG="/var/log/awg2-install.log"
 
 # ── AmneziaWG ─────────────────────────────────────────────
 AWG_DIR="/etc/amnezia/amneziawg"
-SERVER_CONF="$AWG_DIR/awg0.conf"
-AWG_IF="awg0"
-CLIENT_DIR="/root"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
-AUTOSTART_DROPIN="/etc/systemd/system/awg-quick@awg0.service.d"
+AWG_IF="${AWG_IFACE:-awg3vds}"
+SERVER_CONF="$AWG_DIR/${AWG_IF}.conf"
+AWG_CONF_DIR="/etc/VPN/${AWG_IF}"
+CLIENT_DIR="${AWG_CONF_DIR}/clients"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
+AUTOSTART_DROPIN="/etc/systemd/system/awg31-quick@${AWG_IF}.service.d"
 MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
 SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
 
 # Компоненты собираются из исходников апстрима через git + DKMS.
-MOD_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
+MOD_REPO="https://github.com/vados-dev/amneziawg-linux-kernel-module-vds.git"
 TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
 MOD_NAME="amneziawg"
-MOD_DKMS_VER="1.0.0"               # апстрим держит 1.0.0 во всех тегах
+MOD_DKMS_VER="v3.1.20260906-vds"               # апстрим держит 1.0.0 во всех тегах
 MOD_SRC_DIR="/usr/src/${MOD_NAME}-${MOD_DKMS_VER}"
 MOD_TAG_FILE="$STATE_DIR/module_tag"
 TOOLS_TAG_FILE="$STATE_DIR/tools_tag"
@@ -404,8 +405,8 @@ COUNTRY_MANUAL="$STATE_DIR/country_manual"   # страна, выбранная 
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
-UPDATE_REPO_STABLE="pumbaX/awg-multi-script"
-UPDATE_REPO_BETA="genaRijoff/awg-multi-script"
+UPDATE_REPO_STABLE="vados-dev/awg-ms"
+UPDATE_REPO_BETA="vados-dev/awg-ms"
 UPDATE_CHANNEL_FILE="$STATE_DIR/channel"
 # Проверка версии в канале (4 КБ файла): бета выходит по нескольку раз в день —
 # раз в 6 часов уведомление бота о новой версии запаздывало на полдня
@@ -441,9 +442,9 @@ EXITS_TABLE=202
 EXITS_TABLE_BASE=210
 EXITS_TABLE_MAX=249
 
-WARP_IF="warp0"
+WARP_IF="${WARP_IFACE:-warp0}"
 WARP_DIR="/etc/wgcf"
-WARP_CONF="/etc/wireguard/warp0.conf"
+WARP_CONF="/etc/wireguard/${WARP_IF}.conf"
 WARP_ACCOUNT="$WARP_DIR/wgcf-account.toml"
 WARP_PROFILE="$WARP_DIR/wgcf-profile.conf"
 WARP_STATE="$WARP_DIR/state"
@@ -452,8 +453,6 @@ WARP_BACKEND_FILE="/etc/awg-warp-backend"
 WARP_AUTOSTART_SCRIPT="$WARP_DIR/warp-autostart.sh"
 WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_LOG="/var/log/awg-warp-health.log"
-WARP_HEALTH_FAILS="/tmp/awg-warp-fails"     # провалов подряд
-WARP_HEALTH_RETRY="/tmp/awg-warp-retry"     # попыток вернуть WARP после отказа
 WARPSCOUT_BIN="/usr/local/bin/warpscout"
 WARPSCOUT_DIR="/etc/warpscout"
 WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"
@@ -551,7 +550,7 @@ WGOBF_TAG="awg-wgobf"
 WGOBF_MTU=1380
 
 # ── Telegram-бот ──────────────────────────────────────────
-BOT_CONF="/etc/awg-bot.conf"
+BOT_CONF="/etc/VPN/configs/${AWG_IF}/awg-bot.conf"
 BOT_ADMINS="/var/lib/awg-bot/admins.json"   # приглашённые админы (ведёт бот)
 BOT_DIR="/opt/awg-bot"
 BOT_UNIT="awg-bot.service"
@@ -630,7 +629,7 @@ TUNFAIL_UNIT="awg2-tunfail.service" TUNFAIL_TIMER="awg2-tunfail.timer"
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
-OWN_IFACES=" awg0 warp0 xray0 tun0 wgcf wgobf0 "
+OWN_IFACES=" ${AWG_IF} awg3vds ${WARP_IF} xray0 tun0 wgcf wgobf0 "
 # GitHub в части сетей режут — релизы качаются и через зеркала.
 GH_MIRRORS=("" "https://ghproxy.net/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/")
 
@@ -20815,5 +20814,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=39f202d7d94ad076
+_BUILD_SUM=0049450f6c45b12b
 main "$@"
