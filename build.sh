@@ -14,7 +14,7 @@ OUT="${1:-dist/awg2.sh}"
 #OUT="${1:-/usr/local/bin/awg2}"
 
 LIBS=(
-  core const sys net conf module params mimicry server clients entry expire speed
+  core const compat sys net conf module params mimicry server clients entry expire speed
   tunnels warp dns cascade xray tun2socks exits wgobf cert
   backup amnezia update bot web antiscan vkblock rudirect tunfail uninstall diag menu api cli
 )
