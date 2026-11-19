@@ -20,14 +20,14 @@ SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
 MOD_REPO="https://github.com/vados-dev/amneziawg-linux-kernel-module-vds.git"
 TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
 MOD_NAME="amneziawg"
-MOD_DKMS_VER="v3.1.20260906-vds"               # апстрим держит 1.0.0 во всех тегах
+MOD_DKMS_VER="v3.1.20261113-02-vds"               # апстрим держит 1.0.0 во всех тегах
 MOD_SRC_DIR="/usr/src/${MOD_NAME}-${MOD_DKMS_VER}"
 MOD_TAG_FILE="$STATE_DIR/module_tag"
 TOOLS_TAG_FILE="$STATE_DIR/tools_tag"
 MOD_BACKUP_DIR="/var/backups/awg-mod"
 MOD_LOG="/var/log/awg-mod-update.log"
-MOD_FALLBACK_TAG="v3.1.20260906"
-TOOLS_FALLBACK_TAG="v3.1.20260812"
+MOD_FALLBACK_TAG="v3.1.20260906-vds"   # сборка с 6.1.0-7-amd64 (2026-09-06) — последняя, которая работала на всех ядрах Debian 12/13 и Ubuntu 24.04/24.10
+TOOLS_FALLBACK_TAG="v3.1.20260812-vds" # сборка с 6.1.0-7-amd64 (2026-08-12) — последняя, которая работала на всех ядрах Debian 12/13 и Ubuntu 24.04/24.10
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
 COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000 2 NL=4,DE=1»: страна сервера по геосервисам (флаг в шапке панели)
 COUNTRY_MANUAL="$STATE_DIR/country_manual"   # страна, выбранная вручную, — главнее геосервисов
