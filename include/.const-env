@@ -8,7 +8,7 @@ INSTALL_LOG="/var/log/awg2-install.log"
 
 # ── AmneziaWG ─────────────────────────────────────────────
 AWG_DIR="/etc/amnezia/amneziawg"
-AWG_IF="${AWG_IFACE:-awg3vds}"
+AWG_IF="${AWG_IFACE:-awg31}"
 SERVER_CONF="$AWG_DIR/${AWG_IF}.conf"
 AWG_CONF_DIR="/etc/VPN/${AWG_IF}"
 CLIENT_DIR="${AWG_CONF_DIR}/clients"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
@@ -20,13 +20,13 @@ SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
 MOD_REPO="https://github.com/vados-dev/amneziawg-linux-kernel-module-vds.git"
 TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
 MOD_NAME="amneziawg"
-MOD_DKMS_VER="v3.1.20260906-vds"               # апстрим держит 1.0.0 во всех тегах
+MOD_DKMS_VER="v3.1.20261113-02-vds"               # апстрим держит 1.0.0 во всех тегах
 MOD_SRC_DIR="/usr/src/${MOD_NAME}-${MOD_DKMS_VER}"
 MOD_TAG_FILE="$STATE_DIR/module_tag"
 TOOLS_TAG_FILE="$STATE_DIR/tools_tag"
 MOD_BACKUP_DIR="/var/backups/awg-mod"
 MOD_LOG="/var/log/awg-mod-update.log"
-MOD_FALLBACK_TAG="v3.1.20260906"
+MOD_FALLBACK_TAG="v3.1.20260906-vds"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
 COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
