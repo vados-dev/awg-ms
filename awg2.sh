@@ -696,6 +696,8 @@ check_os() {
         BASE_PKGS="dkms make curl ca-certificates iproute2 iptables python3 python3-venv python3-pip golang-go"
     fi
 }
+check_root
+check_os
 
 check_dnf_updates() { ! dnf check-update -y > /dev/null 2>&1 && err "dnf обновления не проверены!" || log "dnf обновления проверены."; }
 
@@ -1940,9 +1942,13 @@ components_report() {
 mod_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$MOD_LOG" 2>/dev/null || true; }
 
 components_deps() {
-  need_cmds git:git make:build-essential gcc:build-essential dkms:dkms pkg-config:pkg-config \
-    || return 1
-  dpkg -s libmnl-dev &>/dev/null || apt_install libmnl-dev >/dev/null 2>&1 || { err "Не ставится libmnl-dev"; return 1; }
+    if [[ "$os_type" == "deb" ]]; then
+      need_cmds git:git make:build-essential gcc:build-essential dkms:dkms pkg-config:pkg-config \
+        || return 1
+      dpkg -s libmnl-dev &>/dev/null || apt_install libmnl-dev >/dev/null 2>&1 || { err "Не ставится libmnl-dev"; return 1; }
+    else
+      dnf_install libmnl-devel
+    fi
 }
 
 # Клон тега в каталог $2 (с проверкой, что тег существует).
@@ -2777,18 +2783,24 @@ mimicry_tag() { (( ${#I_LINES[@]} )) && echo "$MIMICRY" || echo none; }
 # перегенерация параметров и смена версии протокола.
 
 # ── Установка компонентов ─────────────────────────────────
-BASE_PKGS=(ca-certificates curl gnupg iproute2 iptables python3 python3-cryptography
-           qrencode git build-essential dkms libmnl-dev pkg-config iputils-ping)
-
+if [[ "$os_type" == "deb" ]]; then
+    BASE_PKGS=(ca-certificates curl gnupg iproute2 iptables python3 python3-cryptography
+               qrencode git build-essential dkms libmnl-dev pkg-config iputils-ping)
+else
+    BASE_PKGS=(ca-certificates curl gnupg python3 python3-cryptography
+               qrencode git build-essential amneziawg-dkms libmnl-devel pkg-config iputils-ping)
+fi
 # Остатки APT-репозиториев эпохи установки через PPA ломают apt-get update.
 _purge_legacy_ppa() {
   local f found=1
-  for f in /etc/apt/sources.list.d/amnezia*.{list,sources} \
-           /etc/apt/sources.list.d/canonical-kernel-team*.{list,sources} \
-           /etc/apt/trusted.gpg.d/amnezia*.gpg /etc/apt/keyrings/amnezia*.gpg; do
-    [[ -e "$f" ]] && { rm -f "$f"; found=0; }
-  done
-  return "$found"
+  if [[ "$os_type" == "deb" ]]; then
+    for f in /etc/apt/sources.list.d/amnezia*.{list,sources} \
+             /etc/apt/sources.list.d/canonical-kernel-team*.{list,sources} \
+             /etc/apt/trusted.gpg.d/amnezia*.gpg /etc/apt/keyrings/amnezia*.gpg; do
+      [[ -e "$f" ]] && { rm -f "$f"; found=0; }
+    done
+    return "$found"
+  fi
 }
 
 # github.com не резолвится — чиним DNS сервера бережно: при systemd-resolved
@@ -2818,15 +2830,19 @@ _ensure_dns() {
 _install_current_kernel() {
   local arch pkgs
   os_detect
-  arch=$(dpkg --print-architecture)
-  if [[ "$OS_ID" == debian ]]; then
-    if [[ "$(uname -r)" == *-cloud-* ]]; then pkgs=("linux-image-cloud-$arch" "linux-headers-cloud-$arch")
-    else pkgs=("linux-image-$arch" "linux-headers-$arch"); fi
+  if [[ "$os_type" == "deb" ]]; then
+      arch=$(dpkg --print-architecture)
+      if [[ "$OS_ID" == debian ]]; then
+        if [[ "$(uname -r)" == *-cloud-* ]]; then pkgs=("linux-image-cloud-$arch" "linux-headers-cloud-$arch")
+        else pkgs=("linux-image-$arch" "linux-headers-$arch"); fi
+      else
+        pkgs=(linux-generic)
+        dpkg -s linux-virtual &>/dev/null && pkgs=(linux-virtual linux-headers-virtual)
+      fi
+      run_step "Установка ядра: ${pkgs[*]}" apt_install "${pkgs[@]}"
   else
-    pkgs=(linux-generic)
-    dpkg -s linux-virtual &>/dev/null && pkgs=(linux-virtual linux-headers-virtual)
+      run_step "Обновление системы: " dnf_install "${BASE_PKGS[@]}"; dnf -y update
   fi
-  run_step "Установка ядра: ${pkgs[*]}" apt_install "${pkgs[@]}"
 }
 
 do_install() {
@@ -2849,7 +2865,7 @@ do_install() {
   fi
   _ensure_dns || return 1
 
-  if [[ "$os_type" = "deb" ]]; then
+  if [[ "$os_type" == "deb" ]]; then
     export DEBIAN_FRONTEND=noninteractive
     run_step "Обновление списка пакетов" apt-get update -q || return 1
     if ask_yes "  Обновить пакеты системы (apt upgrade)? [Y/n]: " y; then
@@ -21009,5 +21025,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=b6ec764a05af70a2
+_BUILD_SUM=8a6537d840531c0d
 main "$@"

@@ -316,9 +316,13 @@ components_report() {
 mod_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$MOD_LOG" 2>/dev/null || true; }
 
 components_deps() {
-  need_cmds git:git make:build-essential gcc:build-essential dkms:dkms pkg-config:pkg-config \
-    || return 1
-  dpkg -s libmnl-dev &>/dev/null || apt_install libmnl-dev >/dev/null 2>&1 || { err "Не ставится libmnl-dev"; return 1; }
+    if [[ "$os_type" == "deb" ]]; then
+      need_cmds git:git make:build-essential gcc:build-essential dkms:dkms pkg-config:pkg-config \
+        || return 1
+      dpkg -s libmnl-dev &>/dev/null || apt_install libmnl-dev >/dev/null 2>&1 || { err "Не ставится libmnl-dev"; return 1; }
+    else
+      dnf_install libmnl-devel
+    fi
 }
 
 # Клон тега в каталог $2 (с проверкой, что тег существует).
