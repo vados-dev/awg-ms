@@ -639,10 +639,20 @@ GH_MIRRORS=("" "https://ghproxy.net/" "https://gh-proxy.com/" "https://mirror.gh
 #shopt -s extglob
 #export LC_ALL=C
 
+#-> Dynamic vars:
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "${SELF}")"
+#PARENT_DIR="$(dirname "${SELF_DIR}")"
 
-PROGRAM="${0##*/}"
+ME_SELF="${SELF##*/}"
+ME_CLEAN="${ME_SELF%.*}"
+
+me_name="${0##*/}"
 ARGS=( "$@" )
+
+#-> Static vars:
+PROGRAM="compat.sh"
+
 DTSTAMP="$(date +'%Y%m%d%H%M')"
 mod_tmp_ver="3.1-${DTSTAMP}"
 mod_branch="master"
@@ -663,9 +673,20 @@ err()  { printf ' \033[0;31m ⚫ ERROR:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM"
 die()  { printf ' \033[1;31m ❌ CRITICAL:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM" "$*" >&2; exit 1; }
 
 check_root() { [ "$(id -u)" -eq 0 ] || die "Запускайте от root."; }
-check_os() {
+
+os_detect() {
+  [[ -n "$OS_ID" ]] && return 0
+  IFS='|' read -r OS_ID OS_VER OS_CODENAME < <(. /etc/os-release \
+    && printf '%s|%s|%s\n' "${ID:-}" "${VERSION_ID:-}" "${VERSION_CODENAME:-}")
+  OS_LABEL="${OS_ID^} ${OS_VER:-${OS_CODENAME:-?}}"  
+  [[ -n "$OS_CODENAME" && -n "$OS_VER" ]] && OS_LABEL+=" ($OS_CODENAME)"
+  return 0
+}
+
+os_supported() {
+    os_detect
     # shellcheck disable=SC1091
-    [[ -r /etc/os-release ]] && source "/etc/os-release"; os_id="$ID"; os_ver="$VERSION_ID" || die "Нет /etc/os-release!"
+    #[[ -r /etc/os-release ]] && source "/etc/os-release"; OS_ID="$ID"; OS_VER="$VERSION_ID" || { echo "Нет /etc/os-release!"; true; }
     version_ge() {
         local a="$1" b="$2"
         [[ "$a" == "$b" ]] && return 0
@@ -678,29 +699,40 @@ check_os() {
         done
         return 0
     }
-    case "$os_id" in
-        "ubuntu") version_ge "$os_ver" "22.04" && os_type="deb"  || die "Ubuntu ${os_ver}: проверялось на 24.04+!" ;;
-        "debian") version_ge "$os_ver" "12"    && os_type="deb"  || die "Debian ${os_ver}: проверялось на 12+!" ;;
-        "almalinux") version_ge "$os_ver" "9"  && os_type="rhel" || die "Almalinux ${os_ver}: проверялось на 9+!" ;;
-        "rocky") version_ge "$os_ver" "9"      && os_type="rhel" || die "Rocky ${os_ver}: проверялось на 9+!" ;;
-        "centos") version_ge "$os_ver" "9"     && os_type="rhel" || die "CentOS ${os_ver}: проверялось на 9+!" ;;
-        *) die "ОС '${os_ver}' не проверялась; ожидается Ubuntu 24.04+ / Debian 12+ / Almalinux 9+ / Rocky 9+ / Centos 9+." ;;
+    case "$OS_ID" in
+        "ubuntu") version_ge "$OS_VER" "22.04" && os_type="deb"  || die "Ubuntu ${OS_VER}: проверялось на 24.04+!" ;;
+        "debian") version_ge "$OS_VER" "12"    && os_type="deb"  || die "Debian ${OS_VER}: проверялось на 12+!" ;;
+        "almalinux") version_ge "$OS_VER" "9"  && os_type="rhel" || die "Almalinux ${OS_VER}: проверялось на 9+!" ;;
+        "rocky") version_ge "$OS_VER" "9"      && os_type="rhel" || die "Rocky ${OS_VER}: проверялось на 9+!" ;;
+        "centos") version_ge "$OS_VER" "9"     && os_type="rhel" || die "CentOS ${OS_VER}: проверялось на 9+!" ;;
+        *) die "ОС '${OS_VER}' не проверялась; ожидается Ubuntu 24.04+ / Debian 12+ / Almalinux 9+ / Rocky 9+ / Centos 9+." ;;
     esac
-    log "ОС: ${os_id} ${os_ver}, Тип ОС: ${os_type}"
+    log "ОС: ${OS_ID} ${OS_VER}, Тип ОС: ${os_type}"
     if [[ "$os_type" == "rhel" ]]; then
         SRC_DIR="/usr/src"
-        BASE_PKGS="amneziawg-dkms gcc make git tar gzip which curl libmnl-dev pkg-config"
+        BASE_PKGS="amneziawg-dkms gcc make git tar gzip which curl pkg-config python3 python3-venv python3-pip golang-go"
         #setup_tmp="${SELF_DIR}/${mod_repo}-${mod_tmp_ver}"
     else
         SRC_DIR="${SRC_DIR:-/usr/local/src}"
         BASE_PKGS="dkms make curl ca-certificates iproute2 iptables python3 python3-venv python3-pip golang-go"
     fi
 }
-check_root
-check_os
+readonly -f os_supported
+export -f os_supported
 
-# /etc/pm-compat.sh — оверлей apt → pm для dnf-систем.
-# Подключается через BASH_ENV=/etc/pm-compat.sh (см. /etc/environment).
+check_root
+os_detect
+
+_postup_lines() {
+    local net="$1" dev="$2"
+    echo "PostUp =" 2>/dev/null || true
+    echo "PostDown =" 2>/dev/null || true
+}
+readonly -f _postup_lines
+export -f _postup_lines
+
+# /etc/profile.d/custom-compat.sh[scriptname-compat.sh] — оверлей apt → pm для dnf-систем.
+# Подключается через BASH_ENV=/etc/profile.d/custom-compat.sh (см. /etc/environment).
 
 PM_REAL=${PM_REAL:-/usr/local/bin/pm}
 
@@ -794,7 +826,7 @@ install_dnf_repos() {
     is_copr() { dnf -q repolist --enabled | grep -qi "copr.*$1"; }
     is_enabled crb > /dev/null 2>&1 || do_enable crb
     is_enabled epel > /dev/null 2>&1 || { dnf install -y epel-release; do_enable epel; }
-    is_copr "tigro/amneziawg" > /dev/null 2>&1 || { dnf copr enable -y tigro/amneziawg centos-stream-${os_ver}-$(arch); } 
+    is_copr "tigro/amneziawg" > /dev/null 2>&1 || { dnf copr enable -y tigro/amneziawg centos-stream-${OS_VER}-$(arch); } 
     ret=$(dnf clean all && dnf makecache) > /dev/null 2>&1 || err "Ошибка 'dnf clean all && dnf makecache': ${ret}"
     log "Настройка dnf репозиториев закончена."
 }
@@ -21101,5 +21133,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=85a727714f027c5b
+_BUILD_SUM=4959cd4da3f887aa
 main "$@"
