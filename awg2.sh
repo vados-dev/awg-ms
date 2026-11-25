@@ -674,6 +674,8 @@ die()  { printf ' \033[1;31m ❌ CRITICAL:\033[0;1m [%s] - %s!\033[0m\n' "$PROGR
 
 check_root() { [ "$(id -u)" -eq 0 ] || die "Запускайте от root."; }
 
+OS_ID="" OS_VER="" OS_CODENAME="" OS_LABEL=""
+
 os_detect() {
   [[ -n "$OS_ID" ]] && return 0
   IFS='|' read -r OS_ID OS_VER OS_CODENAME < <(. /etc/os-release \
@@ -21133,5 +21135,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=4959cd4da3f887aa
+_BUILD_SUM=68ec2c0f033d2539
 main "$@"
