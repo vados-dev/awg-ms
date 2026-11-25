@@ -381,7 +381,7 @@ INSTALL_LOG="/var/log/awg2-install.log"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_IF="${AWG_IFACE:-awg31}"
 SERVER_CONF="$AWG_DIR/${AWG_IF}.conf"
-AWG_CONF_DIR="/root/awg-ms/configs"                  #"/etc/VPN/configs/${AWG_IF}"
+AWG_CONF_DIR="/etc/VPN/configs/${AWG_IF}"
 CLIENT_DIR="${AWG_CONF_DIR}/clients"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
 AUTOSTART_DROPIN="/etc/systemd/system/awg31-quick@${AWG_IF}.service.d"
 MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
@@ -21122,5 +21122,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=ecc9b53c4652cd0b
+_BUILD_SUM=a4959d8fc8285762
 main "$@"
