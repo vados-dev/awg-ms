@@ -108,6 +108,7 @@ async function post(path, body = {}, bg = false, ms = 0) {
   if (!r.ok || d.ok === false) {
     const e = new Error(d.error || `HTTP ${r.status}`);
     e.log = d.log || "";
+    e.rc = d.rc;
     throw e;
   }
   return d;
@@ -3278,6 +3279,8 @@ route(/^\/server$/, async (ctx) => {
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
       menuItem("🚫 VK и Max мимо VPN", "клиенты VPN не ходят через сервер в сети VK", () => go("/server/vkblock")),
+      menuItem("🇷🇺 РФ мимо VPN", "клиенты VPN не ходят через сервер в сети России", () => go("/server/rublock")),
+      menuItem("✉️ Почта: порт 25", "клиенты VPN не шлют почту через сервер — спам не уйдёт", () => go("/server/smtp")),
       d.exists ? menuItem("📍 Точки входа", "клиенты через другой сервер (каскад) — свой Endpoint", () => go("/server/entries")) : null,
       amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
         : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
@@ -3373,6 +3376,56 @@ route(/^\/server\/vkblock$/, async (ctx) => {
       btn("📜 Журнал", () => go("/log/vkblock"))),
     hint("Сервисы VK у клиентов через VPN не откроются — в приложении VPN их пускают мимо туннеля. Список сетей VK — "
       + "C24Be/AS_Network_List, обновляется раз в сутки. Трафик самого сервера не трогается."));
+});
+
+// РФ мимо VPN: трафик клиентов VPN в сети России сервер не пускает — сразу отказ.
+// Российские сайты не видят адрес зарубежного сервера. Противоположно «РФ напрямую»
+route(/^\/server\/rublock$/, async (ctx) => {
+  const d = (await call("rublock", "status")) || {};
+  const on = !!d.enabled;
+  ctx.put(title("🇷🇺 РФ мимо VPN"),
+    hint("Клиенты VPN не ходят через сервер в сети России. Российские сайты и приложения не видят адрес сервера и не "
+      + "могут сдать его как VPN — для зарубежного сервера."),
+    h("div", { class: "card", "data-name": "rublock-status" },
+      kv("Статус", !on ? h("span", { class: "muted" }, "○ выключено") : d.active ? h("span", { class: "ok" }, "● включено")
+        : h("span", { class: "warn" }, "▲ правило не на месте")),
+      on ? kv("Сетей России", num(d.nets)) : null,
+      on ? kv("Отказано", num(d.blocked) + " пакетов") : null,
+      d.updated ? kv("Список", fmtTime(d.updated) + (d.src ? " · " + d.src : "")) : null,
+      d.error ? h("div", { class: "small warn" }, "▲ " + d.error) : null,
+      on && d.home ? h("div", { class: "small warn" }, "▲ Сервер в России: российские сайты и так видят российский адрес. "
+        + "«РФ мимо VPN» нужен зарубежному серверу; серверу в России — «РФ напрямую» (Туннели).") : null,
+      !on && d.rudirect ? h("div", { class: "small muted" }, "Сейчас включено «РФ напрямую» (Туннели) — противоположный "
+        + "режим. Сначала выключи его.") : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("⏹ Выключить", (b) => quickAsk(b, "Выключить? Правило и набор снимаются — клиенты VPN снова пойдут "
+        + "в сети России через сервер.", "РФ мимо VPN выключено", ["rublock", "off"]))
+        : btn("✅ Включить", (b) => quickAsk(b, "Включить? Российские сайты и приложения у клиентов через VPN перестанут "
+          + "открываться — в приложении VPN их надо пустить мимо туннеля. Выключить можно здесь или в боте.",
+        "РФ мимо VPN включено", ["rublock", "on"]), "btn-primary"),
+      on ? btn("🔄 Обновить список", (b) => quick(b, "Список обновлён", ["rublock", "update"])) : null,
+      btn("📜 Журнал", () => go("/log/rublock"))),
+    hint("Российские сервисы у клиентов через VPN сразу получат отказ — в приложении VPN их пускают мимо туннеля. "
+      + "Список сетей России — ipverse (данные RIPE), обновляется раз в сутки. Трафик самого сервера не трогается."));
+});
+
+// Почта: порт 25 — клиенты VPN не отправляют почту через сервер напрямую почтовым
+// серверам: спам с сервера не уйдёт, хостер не заблокирует сервер
+route(/^\/server\/smtp$/, async (ctx) => {
+  const d = (await call("smtpblock", "status")) || {};
+  const on = !!d.enabled;
+  ctx.put(title("✉️ Почта: порт 25"),
+    hint("Клиенты VPN не отправляют почту через сервер на порт 25 — спам с сервера не уйдёт, хостер не заблокирует "
+      + "сервер. Почтовые приложения шлют письма через 465 и 587 — они работают."),
+    h("div", { class: "card", "data-name": "smtpblock-status" },
+      kv("Порт 25", !on ? h("span", { class: "muted" }, "○ открыт") : d.active ? h("span", { class: "ok" }, "● закрыт для клиентов")
+        : h("span", { class: "warn" }, "▲ правила не на месте")),
+      on ? kv("Отбито", num(d.dropped) + " попыток") : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("🔓 Открыть порт 25", (b) => quickAsk(b, "Открыть порт 25? Клиенты VPN снова смогут слать почту через "
+        + "сервер напрямую почтовым серверам — и спам тоже.", "Порт 25 открыт", ["smtpblock", "off"]))
+        : btn("🔒 Закрыть порт 25", (b) => quick(b, "Порт 25 закрыт", ["smtpblock", "on"]), "btn-primary")),
+    hint("Соединения к самому серверу и его собственная почта не трогаются. Счётчик сбрасывается при перезагрузке."));
 });
 
 // Перенос из Amnezia (Docker): сервер AWG из контейнера приложения AmneziaVPN — в awg0
@@ -4201,10 +4254,16 @@ route(/^\/tunnels\/warp\/endpoint$/, async (ctx) => {
 // Xray
 const BALANCERS = [["random", "случайный выход"], ["roundRobin", "по очереди"], ["leastPing", "наименьший пинг"],
   ["leastLoad", "наименьшая нагрузка"], ["off", "выключить"]];
+const OBS_URLS = [["Google", "https://www.google.com/generate_204"],
+  ["Gstatic", "https://www.gstatic.com/generate_204"],
+  ["Cloudflare", "http://cp.cloudflare.com/generate_204"]];
+const OBS_INTERVALS = ["10s", "15s", "30s", "1m", "2m"];
 
 route(/^\/tunnels\/xray$/, async (ctx) => {
   const r = await callR(["xray", "status"]);
   const d = r.data || {}, inst = d.installed, tags = d.tags || [];
+  const obs = d.obs && typeof d.obs === "object" ? d.obs : {};
+  const obsOn = obs.on && (d.balancer === "leastPing" || d.balancer === "leastLoad");
   async function outbound(t) {
     const v = await sheet("Выход " + t, [
       ...(d.main !== t ? [{ label: "⭐ Сделать выходом по умолчанию", value: "main" }] : []),
@@ -4227,16 +4286,22 @@ route(/^\/tunnels\/xray$/, async (ctx) => {
     inst ? [h("h2", {}, "Выходы"),
       h("div", { class: "card list" }, tags.length ? tags.map((t) => {
         const own = (d.clients || []).filter((c) => c.out === t).map((c) => c.name);
+        // Сервер подписки — с именем из неё, тег — строкой ниже
+        const name = ((d.outs || []).find((o) => o.tag === t) || {}).name || "";
         return h("div", { class: "item", "data-name": "xo-" + t, onclick: () => outbound(t) },
-          h("div", { class: "main" }, h("div", { class: "title" }, t, d.main === t ? " " : null, d.main === t ? pill("по умолчанию", "ok") : null),
+          h("div", { class: "main" }, h("div", { class: "title" }, name || t, d.main === t ? " " : null, d.main === t ? pill("по умолчанию", "ok") : null),
+            name ? h("div", { class: "sub" }, "📡 из подписки · " + t) : null,
             own.length ? h("div", { class: "sub" }, "свой выход: " + own.join(", ")) : null),
           h("div", { class: "side" }, icon("chevron-right")));
-      }) : h("div", { class: "empty" }, "Выходов нет — добавь ссылкой")),
+      }) : h("div", { class: "empty" }, "Выходов нет — добавь ссылкой или подпиской")),
       tags.length > 1 ? hint(d.per_client ? "Клиенту можно закрепить свой выход: Клиенты → клиент → Маршрут. "
         + "Остальные идут через выход по умолчанию или балансировщик."
         : "Свой выход клиенту — только с inbound tun в самом Xray: обнови Xray.") : null,
       btn("➕ Добавить выход", () => go("/tunnels/xray/add"), "btn-block" + (tags.length ? "" : " btn-primary")),
+      btn(d.sub ? "📡 Подписка ✅" : "📡 Подписка", () => go("/tunnels/xray/sub"), "btn-block"),
       tags.length > 1 ? btn(`⚖️ Балансировщик: ${d.balancer || "off"}`, balancer, "btn-block") : null,
+      obsOn ? btn(`🔭 Проверка: ${obs.probeInterval || "1m"}`
+        + (obs.enableConcurrency ? " · параллельно" : ""), () => go("/tunnels/xray/observatory"), "btn-block") : null,
       h("h2", {}, "Управление")] : null,
     inst ? null : [hint("Клиенты выходят в интернет через твой сервер VLESS, VMess, Trojan, Shadowsocks или Hysteria2 — "
       + "выходы добавляются ссылками. Можно несколько, с балансировкой."),
@@ -4265,6 +4330,99 @@ route(/^\/tunnels\/xray\/add$/, async (ctx) => {
       if (!/^(vless|vmess|trojan|ss|hysteria2|hy2):\/\//.test(v)) return fail(new Error("Это не ссылка Xray"));
       return quick(b, "Выход добавлен", ["xray", "add", v], () => back());
     }, "btn-primary btn-block"));
+});
+
+// Проверка выходов (observatory): URL / интервал / параллельно при leastPing или leastLoad
+route(/^\/tunnels\/xray\/observatory$/, async (ctx) => {
+  const r = await callR(["xray", "status"]);
+  const d = r.data || {}, obs = d.obs && typeof d.obs === "object" ? d.obs : {};
+  if (d.balancer !== "leastPing" && d.balancer !== "leastLoad") {
+    ctx.put(title("🔭 Проверка выходов"),
+      hint("Только при балансировщике leastPing или leastLoad."),
+      btn("⚖️ К балансировщику", () => go("/tunnels/xray"), "btn-block"));
+    return;
+  }
+  async function pickUrl(b) {
+    const v = await sheet("🔗 URL проверки выходов", [
+      ...OBS_URLS.map(([n, u]) => ({ label: `${obs.probeUrl === u ? "🔘" : "⚪️"} ${n} — ${u}`, value: u })),
+      { label: "✏️ Свой URL…", value: "custom" }]);
+    if (!v) return;
+    if (v === "custom") return go("/tunnels/xray/observatory/url");
+    await quick(b, "URL проверки: " + v, ["xray", "observatory", "url", v]);
+  }
+  async function pickInterval(b) {
+    const v = await sheet("⏱ Интервал проверки", OBS_INTERVALS.map((i) =>
+      ({ label: `${obs.probeInterval === i ? "🔘" : "⚪️"} ${i}`, value: i })));
+    if (v) await quick(b, "Интервал: " + v, ["xray", "observatory", "interval", v]);
+  }
+  ctx.put(title("🔭 Проверка выходов"),
+    hint("Для leastPing / leastLoad. Слишком частый интервал — лишний трафик."),
+    h("div", { class: "card list" },
+      h("div", { class: "item", onclick: (e) => pickUrl(e.currentTarget) },
+        h("div", { class: "main" }, h("div", { class: "title" }, "URL проверки"),
+          h("div", { class: "sub" }, obs.probeUrl || "—")),
+        h("div", { class: "side" }, icon("chevron-right"))),
+      h("div", { class: "item", onclick: (e) => pickInterval(e.currentTarget) },
+        h("div", { class: "main" }, h("div", { class: "title" }, "Интервал"),
+          h("div", { class: "sub" }, obs.probeInterval || "1m")),
+        h("div", { class: "side" }, icon("chevron-right")))),
+    // Ошибка awg2 — исключением: переключатель остаётся как был (quick её проглотил бы)
+    switchRow("Параллельная проверка", "все выходы сразу", !!obs.enableConcurrency,
+      async (on) => { await call("xray", "observatory", "concurrency", on ? "on" : "off"); toast("Параллельно: " + (on ? "вкл" : "выкл")); }));
+});
+
+route(/^\/tunnels\/xray\/observatory\/url$/, async (ctx) => {
+  const url = h("input", { placeholder: "https://www.google.com/generate_204", autocapitalize: "off",
+    autocomplete: "off", inputmode: "url" });
+  ctx.put(title("✏️ Свой URL проверки"),
+    hint("http:// или https://, без пробелов."),
+    h("label", {}, "URL"), url,
+    btn("Сохранить", (b) => {
+      const v = url.value.trim();
+      if (!/^https?:\/\/\S{3,500}$/.test(v)) return fail(new Error("Нужен http(s)://… без пробелов"));
+      return quick(b, "URL проверки: " + v, ["xray", "observatory", "url", v], () => go("/tunnels/xray/observatory"));
+    }, "btn-primary btn-block"));
+});
+
+// Подписка Xray: серверы по адресу подписки провайдера — выходы, обновляются сами.
+// Адрес — секрет (в нём ключ доступа): уходит в awg2 через stdin, на экране — только сайт
+route(/^\/tunnels\/xray\/sub$/, async (ctx) => {
+  const s = (await call("xray", "sub", "status")) || {};
+  const url = h("input", { type: "url", autocomplete: "off", autocapitalize: "off", spellcheck: "false",
+    placeholder: "https://…", "aria-label": "Адрес подписки" });
+  const here = { onBack: () => replace("/tunnels/xray/sub") };
+  const save = btn(s.set ? "✏️ Сменить адрес" : "📡 Задать подписку", async () => {
+    const v = url.value.replace(/\s+/g, "");
+    if (!/^https?:\/\//i.test(v) || v.length > 2048 || /["\\]/.test(v)) return fail(new Error("Нужен адрес подписки: https://…"));
+    let extra = [];
+    if (/^http:\/\//i.test(v)) {
+      if (!await confirmTg("Адрес по http: подписку могут подменить по дороге и подсунуть свои серверы. Лучше адрес "
+        + "https. Всё равно использовать?")) return;
+      extra = ["insecure"];
+    }
+    url.value = "";
+    await runJob(ctx, "Подписка Xray", ["xray", "sub", "set", ...extra], null, Object.assign({ stdin: v + "\n" }, here));
+  }, "btn-primary btn-block");
+  const used = (+s.up || 0) + (+s.down || 0), left = (+s.expire || 0) - Date.now() / 1000;
+  ctx.put(title("📡 Подписка Xray"),
+    hint("Серверы из подписки провайдера (3x-ui, Marzban, Remnawave…) становятся выходами Xray и обновляются сами. "
+      + "Свои выходы (ссылкой) не трогаются; клиенту можно закрепить сервер подписки, как обычный выход."),
+    h("div", { class: "card", "data-name": "xray-sub" },
+      kv("Подписка", s.set ? h("span", { class: "ok" }, "● " + s.site + (s.title ? " · " + s.title : "")) : h("span", { class: "muted" }, "○ не задана")),
+      s.set ? kv("Серверов", String(s.count || 0) + (s.skipped ? ` (пропущено ${s.skipped})` : "")) : null,
+      s.set && s.updated ? kv("Обновлена", fmtTime(s.updated) + ` · сама — раз в ${s.every || 6} ч`) : null,
+      s.set && s.total ? kv("Трафик", h("span", { class: used >= 0.9 * s.total ? "warn" : "" }, fmtBytes(used) + " из " + fmtBytes(s.total))) : null,
+      s.set && s.expire ? kv("Действует до", h("span", { class: left < 3 * 86400 ? "warn" : "" },
+        new Date(s.expire * 1000).toLocaleDateString("ru-RU") + (left <= 0 ? " — истекла" : ""))) : null,
+      s.set && s.insecure ? h("div", { class: "small warn" }, "▲ По http — подписку могут подменить по дороге") : null,
+      s.error ? h("div", { class: "small warn" }, "▲ " + s.error) : null),
+    s.set ? h("div", { class: "actions", style: "margin-top:8px" },
+      btn("🔄 Обновить сейчас", () => runJob(ctx, "Обновление подписки", ["xray", "sub", "update"], null, here)),
+      btn("🗑 Убрать", () => jobAsk(ctx, "Убрать подписку? Её серверы уйдут из выходов Xray, клиенты, закреплённые за ними, — "
+        + "на выход по умолчанию. Свои выходы останутся.", "Подписка убирается", ["xray", "sub", "off"]), "btn-danger")) : null,
+    h("h2", {}, s.set ? "Сменить адрес" : "Адрес подписки"), url, h("div", { style: "margin-top:8px" }, enterTo(save, url)),
+    hint("Ссылка «для приложения» из панели провайдера. Адрес — секрет (в нём ключ доступа): Тулза хранит его только "
+      + "на сервере, на экранах показывает только сайт."));
 });
 
 // tun2socks
@@ -4480,7 +4638,7 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
       [{ label: "⏹ Выключить", value: "off" }, { label: "🗑 Удалить совсем, с dnscrypt-proxy", value: "purge", cls: "bad" }]);
     if (v) await quick(b, "DNS выключен", ["dns", "remove", ...(v === "purge" ? ["purge"] : [])]);
   }
-  ctx.put(title("🔐 Шифрованный DNS"), hint("Запросы клиентов идут через dnscrypt-proxy по DoH, DoT (853) закрыт."),
+  ctx.put(title("🔐 Шифрованный DNS"), hint("Запросы клиентов AWG и WG + обфускатора идут через dnscrypt-proxy по DoH, DoT (853) закрыт."),
     logCard(r.log),
     inst ? [h("h2", {}, "Резолверы"),
       h("div", { class: "card list" }, (d.presets || []).map((p) => h("div", { class: "item", onclick: () =>
@@ -4542,7 +4700,7 @@ const RUD_LISTS = { direct: ["Всегда напрямую", "мимо тунн
   tunnel: ["Всегда через туннель", "в туннель, даже если адрес в сетях России"] };
 // Сервер не в России: «РФ напрямую» светит адрес входа российским приложениям
 const rudAbroad = (cc) => `Сервер не в России (${cc}): российские сайты и приложения увидят адрес сервера, к которому `
-  + "подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России.";
+  + "подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России; зарубежному — «РФ мимо VPN» (Сервер).";
 route(/^\/tunnels\/rudirect$/, async (ctx) => {
   const d = (await call("rudirect", "status")) || {};
   const on = !!d.enabled;
@@ -4745,13 +4903,41 @@ route(/^\/diag\/dpi$/, async (ctx) => {
 const BACKUP_MAX = 20 * 1024 * 1024;
 // «20260930_035321» из метаданных бэкапа → «30.09.2026 03:53»
 const fmtStamp = (s) => { const m = /^(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)/.exec(s || ""); return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]}` : s; };
-// Отправка бэкапа в чат с отметкой на экране
-function sendBackup(path, note) {
+// Отправка бэкапа в чат с отметкой на экране; enc — задан пароль бэкапов (файл зашифрован)
+function sendBackup(path, note, enc) {
   note.textContent = WEB ? "⬇️ Скачиваю…" : "📥 Отправляю в чат…";
-  return (WEB ? download({ what: "backup", path }) : post("/api/send", { what: "backup", path })).then(() => {
-    note.textContent = (WEB ? "✅ Файл скачан." : "✅ Файл — в чате с ботом.") + " В нём приватные ключи — храни как пароль.";
+  return (WEB ? download({ what: "backup", path }) : post("/api/send", { what: "backup", path })).then((r) => {
+    const locked = WEB ? enc : !!(r && r.encrypted);
+    note.textContent = (WEB ? "✅ Файл скачан." : "✅ Файл — в чате с ботом.")
+      + (locked ? " 🔐 Зашифрован паролем бэкапов." : " В нём приватные ключи — храни как пароль.");
     haptic();
   }, (e) => { note.textContent = "❌ " + e.message; });
+}
+
+// Пароль бэкапов: им awg2 шифрует файлы, которые уходят с сервера (в чат, скачиванием)
+function backupKeyCard(k, owner) {
+  const pass = h("input", { type: "password", autocomplete: "new-password", placeholder: "8–128 символов: латиница, цифры, знаки",
+    maxlength: "128", "aria-label": "Пароль бэкапов" });
+  const pass2 = h("input", { type: "password", autocomplete: "new-password", placeholder: "Ещё раз", maxlength: "128",
+    "aria-label": "Пароль бэкапов ещё раз" });
+  const save = btn(k.set ? "✏️ Сменить" : "🔐 Задать", (b) => busy(b, async () => {
+    if (!pass.value) throw new Error("Введи пароль");
+    // Ввод не виден — повтор ловит опечатку: её потом не исправить
+    if (pass.value !== pass2.value) throw new Error("Пароли не совпадают");
+    await callR(["backup", "key", "set"], { stdin: pass.value + "\n" });
+    pass.value = pass2.value = "";
+    haptic(); toast("✅ Пароль задан. Запиши его — без него зашифрованные бэкапы не открыть", 5000); render();
+  }), "btn-primary");
+  return h("div", { class: "card", "data-name": "backup-key", style: "margin-top:12px" },
+    h("div", { class: "kv" }, h("b", {}, "🔐 Пароль бэкапов"), k.set ? pill("задан", "ok") : h("span", { class: "muted small" }, "не задан")),
+    owner ? [h("div", { style: "margin-top:8px" }, pass, pass2, h("div", { style: "margin-top:8px" }, enterTo(save, pass, pass2))),
+      k.set ? btn("🗑 Убрать пароль", (b) => quickAsk(b, "Убрать пароль? Новые файлы бэкапов будут уходить с сервера без "
+        + "шифрования. Уже зашифрованные открываются только прежним паролем.", "Пароль убран", ["backup", "key", "clear"]), "btn-block") : null]
+      : null,
+    hint("Файлы бэкапов, которые уходят с сервера (в чат, автобэкап, скачивание), шифруются паролем (AES-256); бэкапы в "
+      + "~/awg_backup остаются как есть. На этом сервере зашифрованный восстанавливается без пароля, на другом — его спросят. "
+      + `На компьютере: openssl enc -d -aes-256-cbc -pbkdf2 -iter ${k.iter || 200000} -md sha256 -in ФАЙЛ.enc -out бэкап.tar.gz. `
+      + "Забудешь пароль — зашифрованные файлы не открыть." + (owner ? "" : " Задаёт пароль владелец.")));
 }
 async function uploadBackup(file) {
   if (file.size > BACKUP_MAX) throw new Error("Файл больше 20 МБ — это не бэкап awg2");
@@ -4799,7 +4985,9 @@ function autoBackupCard(a, redraw) {
 }
 
 route(/^\/backup$/, async (ctx) => {
-  const [rowsAll, alertsInfo] = await Promise.all([call("backup", "list"), post("/api/alerts").catch(() => null)]);
+  // S.me — после главной; открыли «Бэкапы» сразу — спросить, владелец ли
+  const [rowsAll, alertsInfo, key, me] = await Promise.all([call("backup", "list"), post("/api/alerts").catch(() => null),
+    call("backup", "key", "status").catch(() => null), S.me || post("/api/me").catch(() => null)]);
   const rows = (rowsAll || []).slice(0, 30);
   const autoBox = h("div");
   const drawAuto = (a) => a && autoBox.replaceChildren(autoBackupCard(a, drawAuto));
@@ -4831,29 +5019,47 @@ route(/^\/backup$/, async (ctx) => {
     h("div", { class: "actions" },
       btn("💾 Создать", () => runJob(ctx, "Бэкап", ["backup", "create"], (d) => {
         const note = h("div", { class: "small", style: "margin-top:6px" });
-        if (d && d.path) sendBackup(d.path, note);
+        if (d && d.path) sendBackup(d.path, note, !!(key && key.set));
         return h("div", { class: "card" }, kv("Файл", (d && d.path || "").split("/").pop()), kv("Размер", fmtBytes(d && d.size)), note);
       }), "btn-primary"),
-      btn("📤 Из файла", () => file.click())), file, autoBox,
+      btn("📤 Из файла", () => file.click())), file, autoBox, key ? backupKeyCard(key, !!(me && me.owner)) : null,
     h("h2", {}, "На сервере"),
     h("div", { class: "card list" }, rows.length ? rows.map((b) => h("div", { class: "item", onclick: () => pick(b) },
       h("div", { class: "ibox" }, icon(b.full ? "folder" : "file-archive")),
       h("div", { class: "main" }, h("div", { class: "title" }, fmtTime(b.time)),
         h("div", { class: "sub" }, `${b.full ? "полный, каталог" : "архив"} · ${fmtBytes(b.size)}`)),
       h("div", { class: "side" }, icon("chevron-right")))) : h("div", { class: "empty" }, "Бэкапов на сервере нет")),
-    hint("Полный бэкап лежит каталогом, рядом — его архив. Восстановить можно и из архива прежнего бота."));
+    hint("Полный бэкап лежит каталогом, рядом — его архив. Восстановить можно и из архива прежнего бота и из зашифрованного .enc."));
 });
 
 route(/^\/backup\/restore$/, async (ctx) => {
   const rs = S.restore;
   if (!rs) return replace("/backup");
-  const d = (await call("backup", "inspect", rs.path)) || {};
+  let d;
+  try {
+    // Пароль к зашифрованному — только в памяти страницы, до запуска восстановления
+    d = (await callR(["backup", "inspect", rs.path, ...(rs.pw ? ["pass"] : [])], rs.pw ? { stdin: rs.pw + "\n" } : {})).data || {};
+  } catch (e) {
+    if (e.rc !== 4) throw e;
+    const pass = h("input", { type: "password", autocomplete: "off", placeholder: "Пароль бэкапа", "aria-label": "Пароль бэкапа" });
+    const open = btn("🔓 Открыть", () => {
+      if (!pass.value) return;
+      S.restore = Object.assign({}, rs, { pw: pass.value });
+      render();
+    }, "btn-primary btn-block");
+    return ctx.put(title("♻️ Восстановление"),
+      h("div", { class: "card", "data-name": "backup-pass" }, kv("Файл", rs.name),
+        h("div", { class: "small " + (rs.pw ? "warn" : "muted"), style: "margin:6px 0" }, rs.pw ? "▲ " + e.message
+          : "🔐 Бэкап зашифрован, а пароль бэкапов этого сервера к нему не подходит. Введи пароль, которым он зашифрован."),
+        pass, h("div", { style: "margin-top:8px" }, enterTo(open, pass))),
+      btn("✖️ Отмена", () => { S.restore = null; back(); }, "btn-block"));
+  }
   const meta = Object.fromEntries((d.meta || "").split("\n").filter((l) => l.includes("="))
     .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
   const opt = { wgobf: !!d.wgobf, tunnels: !!d.tunnels };
   ctx.put(title("♻️ Восстановление"),
-    h("div", { class: "card" },
-      kv("Файл", rs.name),
+    h("div", { class: "card", "data-name": "backup-inspect" },
+      kv("Файл", rs.name + (rs.pw ? " 🔐" : "")),
       meta.timestamp ? kv("Создан", fmtStamp(meta.timestamp)) : null,
       meta.hostname ? kv("Сервер", meta.hostname) : null,
       meta.toolza ? kv("Версия", meta.toolza) : null,
@@ -4868,8 +5074,8 @@ route(/^\/backup\/restore$/, async (ctx) => {
     btn("♻️ Восстановить", async () => {
       if (!await confirmTg("Заменить текущий сервер и клиентов данными из бэкапа?")) return;
       S.restore = null;
-      await runJob(ctx, "Восстановление из бэкапа", ["backup", "restore", rs.path, ...["wgobf", "tunnels"].filter((k) => opt[k])],
-        null, { onBack: () => replace("/backup") });
+      await runJob(ctx, "Восстановление из бэкапа", ["backup", "restore", rs.path, ...["wgobf", "tunnels"].filter((k) => opt[k]),
+        ...(rs.pw ? ["pass"] : [])], null, { onBack: () => replace("/backup"), stdin: rs.pw ? rs.pw + "\n" : undefined });
     }, "btn-danger btn-block"),
     btn("✖️ Отмена", () => { S.restore = null; back(); }, "btn-block"));
 });
@@ -5004,6 +5210,8 @@ route(/^\/update$/, async (ctx) => {
 // ── WG + обфускатор ───────────────────────────────────────
 const WGOBF_DNS = [["Cloudflare", "1.1.1.1, 1.0.0.1"], ["Google", "8.8.8.8, 8.8.4.4"], ["Quad9", "9.9.9.9, 149.112.112.112"]];
 const wgobfOnline = (c) => c.ago != null && c.ago < 180;
+const wgobfPresetLabel = (p) => (p === "main" ? "основной" : p);
+const WGOBF_MASKS = [["MEDIA", "MEDIA · видеопоток"], ["STUN", "STUN · звонок"], ["NONE", "NONE · XOR"]];
 const wgobfSeen = (c) => (c.ago == null ? pill("не подключался") : wgobfOnline(c) ? pill("онлайн · " + fmtDur(c.ago), "ok")
   : pill(fmtDur(c.ago) + " назад"));
 const sendWgobf = (b, name, what) => busy(b, () => deliver({ what, name },
@@ -5058,7 +5266,7 @@ route(/^\/wgobf$/, async (ctx) => {
         d.endpoint || "", " ", icon("copy"))],
       acts: [act("refresh-cw", "Рестарт", (b) => quickAsk(b, "Перезапустить обфускатор? Его клиенты на несколько секунд потеряют "
         + "связь и переподключатся сами.", "Перезапущено", ["wgobf", "restart"])),
-        act("key", "Ключ", (b) => quickAsk(b, "Сменить ключ обфускатора? Все клиенты отключатся, пока не получат новый комплект.",
+        act("key", "Ключ", (b) => quickAsk(b, "Сменить ключ основного профиля? Его клиенты отключатся, пока не получат новый комплект.",
           "Ключ сменён", ["wgobf", "rotate-key"])),
         act("file-text", "Журнал", () => go("/log/wgobf"))] }),
     statGrid([
@@ -5069,6 +5277,26 @@ route(/^\/wgobf$/, async (ctx) => {
     segText([["STUN", "STUN · видеозвонок"], ["NONE", "NONE · только XOR"]], d.masking, (v) => (v !== d.masking ? mask(v) : null)),
     h("div", { style: "margin-top:10px" }, switchRow("Чистый WG", "пускать и обычный WireGuard без обфускатора (iOS) — его DPI видит",
       d.clean, (on) => call("wgobf", "clean", on ? "1" : "0"))),
+    // IPv6 в туннеле: WireGuard перезапускается — кнопкой с вопросом, а не переключателем
+    h("div", { class: "card", "data-name": "wgobf-ipv6" }, kv("IPv6 в туннеле", d.ipv6 ? pill("включён", "ok") : pill("выключен")),
+      h("div", { class: "muted small" }, d.ipv6 ? `Клиентам — адрес из ${d.net6} и сайты по IPv6 через сервер; клиентам в туннелях — только IPv4.`
+        : d.ipv6_why || "Клиентам — адрес IPv6 и сайты по IPv6 через сервер."),
+      d.ipv6 || !d.ipv6_why ? btn(d.ipv6 ? "Выключить IPv6" : "Включить IPv6", (b) => quickAsk(b, d.ipv6
+        ? "Выключить IPv6 в туннеле? WireGuard перезапустится, комплекты клиентов перевыпустятся."
+        : "Включить IPv6 в туннеле? Клиенты получат адрес IPv6; прежние комплекты (только IPv4) продолжат работать. "
+          + "WireGuard перезапустится — клиенты на несколько секунд потеряют связь.",
+      d.ipv6 ? "IPv6 выключен" : "IPv6 включён", ["wgobf", "ipv6", d.ipv6 ? "off" : "on"]), "btn-block") : null),
+    // Профили обфускации: свой порт, ключ и маскировка (MEDIA — форк Phobos)
+    h("h2", { "data-name": "wgobf-presets" }, "Профили обфускации"),
+    hint("Профиль — свой порт, ключ и маскировка; все ведут в тот же WireGuard. MEDIA — под видеопоток (обфускатор Phobos). "
+      + "Клиенту профиль — в его карточке; ⭐ — профиль новых клиентов."),
+    (d.presets || []).map((p) => ecard({ state: p.running ? "on" : "bad", name: wgobfPresetLabel(p.name) + (p.name === d.default ? " ⭐" : ""),
+      attrs: { "data-name": "preset-" + p.name }, onopen: () => go("/wgobf/preset/" + encodeURIComponent(p.name)),
+      right: pill(p.running ? "работает" : "остановлен", p.running ? "ok" : "bad"),
+      meta: [tag(p.masking, "accent", "drama"), p.obfb ? tag("obfuscate-bytes " + p.obfb) : null,
+        tag(p.engine === "phobos" ? "Phobos" : "ClusterM")].filter(Boolean),
+      lines: [`${p.port}/udp · клиентов: ${p.clients}` + (p.ufw === "closed" ? " · порт закрыт в UFW" : "")] })),
+    btn("➕ Новый профиль", () => go("/wgobf/preset-add"), "btn-block"),
     // Выход всех клиентов (и новых): напрямую или через туннель — тот же, что у клиентов AWG;
     // своему клиенту — в его карточке
     h("label", { "data-name": "wgobf-route" }, "Выход клиентов"),
@@ -5088,6 +5316,7 @@ route(/^\/wgobf$/, async (ctx) => {
       return ecard({ state: wgobfOnline(c) ? "on" : "", name: c.name, attrs: { "data-name": c.name },
         onopen: () => go(`/wgobf/client/${enc}`), right: wgobfSeen(c),
         lines: [c.ip + (c.rx || c.tx ? ` · ↓ ${fmtBytes(c.rx)} ↑ ${fmtBytes(c.tx)}` : "")
+          + (c.preset && c.preset !== "main" ? " · профиль " + c.preset : "")
           + ((c.route || "direct") !== "direct" ? " · " + wgobfRouteLabel(c.route) : "")],
         acts: [act("file-text", "Комплект", () => go(`/wgobf/client/${enc}`)), act(WEB ? "download" : "send", TO("В чат", "Файл"), (b) => sendWgobf(b, c.name, "wgobf")),
           act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить клиента ${c.name}?`, "Клиент удалён", ["wgobf", "del", c.name]), "bad")] });
@@ -5116,16 +5345,112 @@ route(/^\/wgobf\/add$/, async (ctx) => {
     }, "btn-primary btn-block"));
 });
 
+route(/^\/wgobf\/preset\/([^/]+)$/, async (ctx, name) => {
+  const d = (await callR(["wgobf", "status"])).data || {};
+  const p = (d.presets || []).find((x) => x.name === name);
+  if (!p) throw new Error(`Профиля ${name} нет`);
+  const main = name === "main", back = () => backWith((q) => (/^\/wgobf\/preset\//.test(q) ? "/wgobf" : null));
+  const num = (v, min, max, nm) => h("input", { type: "number", min, max, value: String(v), "data-name": nm });
+  const dummy = num(p.dummy, 0, 1024, "preset-dummy"), idle = num(p.idle, 10, 86400, "preset-idle");
+  const obfb = main ? null : num(p.obfb, 0, 1500, "preset-obfb");
+  const toPreset = () => btn("🎛 Профиль " + wgobfPresetLabel(name), () => replace("/wgobf/preset/" + encodeURIComponent(name)),
+    "btn-primary btn-block");
+  ctx.put(title("Профиль " + wgobfPresetLabel(name), p.name === d.default ? pill("⭐ для новых", "accent") : null),
+    h("div", { class: "card", "data-name": "preset-info" },
+      kv("Служба", pill(p.running ? "работает" : "остановлен", p.running ? "ok" : "bad")),
+      kv("Вход", `${(d.endpoint || "").replace(/:\d+$/, "")}:${p.port}/udp`),
+      kv("Обфускатор", p.engine === "phobos" ? "Phobos " + (d.ph_version || "") : "ClusterM"),
+      kv("Клиентов", String(p.clients || 0)),
+      p.ufw === "closed" ? h("div", { class: "small warn" }, "Порт закрыт в UFW — Сервер → Проверить и починить") : null),
+    h("label", {}, "Маскировка"),
+    segText(main ? WGOBF_MASKS.slice(1) : WGOBF_MASKS, p.masking, (v) => {
+      if (v === p.masking) return null;
+      if (main) return quick(null, "Маскировка " + v, ["wgobf", "preset", "set", "main", "masking=" + v]);
+      return jobAsk(ctx, `Маскировка ${v}? Прежние комплекты клиентов профиля перестанут работать — им нужны новые.`
+        + (v === "MEDIA" ? " Первый раз сервер соберёт обфускатор Phobos — минута-две." : ""),
+      `Профиль ${name}: ${v}`, ["wgobf", "preset", "set", name, "masking=" + v], toPreset);
+    }),
+    hint(main ? "Сервер понимает и STUN, и NONE: прежние комплекты продолжат работать."
+      : "MEDIA — под видеопоток RTP (обфускатор Phobos); на Keenetic — вкладка «Phobos» в AWG Manager."),
+    h("label", {}, "max-dummy — до скольки байт мусора в пакет (0-1024)"), dummy,
+    h("label", {}, "idle-timeout — через сколько секунд тишины забыть клиента (10-86400)"), idle,
+    main ? null : [h("label", {}, "obfuscate-bytes — шифровать только начало пакета: 0 — весь (у MEDIA — 16), или 4-1500"), obfb],
+    btn("Сохранить", (b) => {
+      const vals = [["dummy", dummy, p.dummy], ["idle", idle, p.idle]].concat(main ? [] : [["obfb", obfb, p.obfb]]);
+      const changed = vals.filter(([, el, was]) => el.value.trim() !== String(was));
+      if (!changed.length) return toast("Ничего не изменилось");
+      if (changed.some(([, el]) => !/^(0|[1-9]\d{0,4})$/.test(el.value.trim()))) return fail(new Error("Нужны целые числа без ведущих нулей"));
+      const args = ["wgobf", "preset", "set", name].concat(changed.map(([k, el]) => `${k}=${el.value.trim()}`));
+      // obfuscate-bytes может перевести профиль на обфускатор Phobos (сборка) — задачей
+      if (changed.some(([k]) => k === "obfb")) return runJob(ctx, `Профиль ${name}`, args, toPreset);
+      return quick(b, "Сохранено", args);
+    }, "btn-primary btn-block"),
+    p.name === d.default ? null : btn("⭐ Для новых клиентов", (b) => quick(b, "Новые клиенты: " + wgobfPresetLabel(name),
+      ["wgobf", "preset", "default", name]), "btn-block"),
+    btn("🔑 Сменить ключ", (b) => quickAsk(b, "Сменить ключ профиля? Его клиенты отключатся, пока не получат новый комплект.",
+      "Ключ сменён", ["wgobf", "preset", "key", name]), "btn-block"),
+    main ? null : btn("🗑 Удалить профиль", (b) => quickAsk(b, `Удалить профиль ${name}? Его клиенты перейдут на основной, `
+      + "их прежние комплекты перестанут работать.", "Профиль удалён", ["wgobf", "preset", "del", name], back), "btn-danger btn-block"));
+});
+
+route(/^\/wgobf\/preset-add$/, async (ctx) => {
+  const f = { masking: "MEDIA" };
+  const name = h("input", { placeholder: "media", maxlength: 16, autocapitalize: "off", autocomplete: "off", "data-name": "preset-name" });
+  const port = h("input", { type: "number", min: 443, max: 65535, placeholder: "случайный" });
+  const box = h("div");
+  const draw = () => box.replaceChildren(h("label", {}, "Маскировка"),
+    segText(WGOBF_MASKS, f.masking, (v) => { f.masking = v; draw(); }),
+    hint(f.masking === "MEDIA" ? "Под видеопоток RTP — обфускатор Phobos: первый раз сервер соберёт его (минута-две). "
+      + "Клиентам — приложение Phobos или AWG Manager (вкладка «Phobos»)." : f.masking === "STUN" ? "Под видеозвонок." : "Только XOR, без маскировки."));
+  draw();
+  ctx.put(title("Новый профиль"), hint("Свой порт и ключ, все профили ведут в тот же WireGuard. Клиенту профиль — в его карточке."),
+    h("label", {}, "Имя — латиница, цифры и _, до 16"), name, box,
+    h("label", {}, "UDP-порт — 443 или 1024-65535"), port,
+    btn("Создать", () => {
+      const n = name.value.trim(), pv = port.value.trim();
+      if (!/^[A-Za-z0-9_]{1,16}$/.test(n) || n === "main" || n === "all") return fail(new Error("Имя: латиница, цифры и _, до 16; main и all заняты"));
+      if (pv && !awgPortOk(pv)) return fail(new Error("Порт — 443 или число 1024-65535"));
+      return runJob(ctx, "Профиль " + n, ["wgobf", "preset", "add", n, "masking=" + f.masking].concat(pv ? ["port=" + (+pv)] : []),
+        () => btn("🎛 Профиль " + n, () => replace("/wgobf/preset/" + encodeURIComponent(n)), "btn-primary btn-block"));
+    }, "btn-primary btn-block"));
+});
+
 route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
   // Комплект не собрался — статус и мониторинг всё равно на экране, ошибка — плашкой
   const [d, rows, ws] = await Promise.all([post("/api/wgobf/bundle", { name }).catch((e) => ({ error: e.message })),
     call("wgobf", "clients").catch(() => []), call("wgobf", "status").catch(() => null)]);
   const c = (rows || []).find((x) => x.name === name);
   if (d.error && !c) throw new Error(d.error);
+  const presets = (ws && ws.presets) || [], cur = (c && c.preset) || "main";
+  // Ссылка установки — по кнопке: одноразовая, на сутки
+  const linkBox = h("div", { "data-name": "wgobf-install-link" });
+  const showLink = (r) => {
+    const cmd = `curl -fsSL${r.insecure ? "k" : ""} ${r.url} | sudo bash`;
+    const until = new Date(r.exp * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+    linkBox.replaceChildren(h("div", { class: "card" },
+      h("div", { class: "muted small" }, `Срабатывает один раз, действует до ${until}. Ссылка — это доступ к VPN.`),
+      h("label", {}, "Linux (Debian, Ubuntu) — в терминале"), h("pre", { "data-name": "install-cmd" }, cmd),
+      r.insecure ? hint("-k — у веб-панели самоподписанный сертификат; надёжнее — ссылка из Mini App.") : null,
+      copyBtn("Скопировать команду", cmd),
+      h("label", {}, "Keenetic — AWG Manager → «Phobos» → верхнее поле «Ссылка установки Phobos»"),
+      h("div", { class: "mono small", style: "overflow-wrap:anywhere" }, r.url),
+      copyBtn("Скопировать ссылку", r.url),
+      btn("🚫 Отозвать", (b) => busy(b, async () => {
+        await post("/api/wgobf/install-link/revoke", { id: r.id }); haptic(); toast("Ссылка отозвана"); linkBox.replaceChildren();
+      }), "btn-block")));
+  };
   ctx.put(title(name, pill("обфускатор", "accent")),
-    c ? h("div", { class: "card", "data-name": "wgobf-status" }, kv("Статус", wgobfSeen(c)), kv("Адрес", c.ip),
+    c ? h("div", { class: "card", "data-name": "wgobf-status" }, kv("Статус", wgobfSeen(c)),
+      kv("Адрес", c.ip + (c.ip6 ? ", " + c.ip6 : "")),
       kv("Трафик с запуска", `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`),
+      kv("Профиль", wgobfPresetLabel(cur)),
       kv("Выход", wgobfRouteText(c.route, ws))) : null,
+    // Профиль клиента: только комплект — прежний работает, пока жив его профиль
+    c && presets.length > 1 ? h("div", { class: "card rcard", "data-name": "wgobf-client-preset" }, h("div", { class: "eyebrow" }, "профиль"),
+      segText(presets.map((p) => [p.name, wgobfPresetLabel(p.name)]), cur, (v) => (v === cur ? null : busy(null, async () => {
+        await call("wgobf", "assign", name, v); haptic(); toast(`Профиль ${wgobfPresetLabel(v)} — новый комплект готов`); render();
+      }))),
+      hint("Клиент получит новый комплект; прежний работает, пока есть его профиль.")) : null,
     // Свой выход клиенту — прямо здесь: настроенные туннели, их выходы и ноды
     c && ws ? h("div", { class: "card rcard", "data-name": "wgobf-client-route" }, h("div", { class: "eyebrow" }, "маршрут"),
       wgobfPick(ws, c.route || "direct", (b, v) => busy(b, async () => {
@@ -5139,6 +5464,9 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
     h("div", { class: "pair" },
       btn(TO("✉️ Всё в чат", "⬇️ Файл .conf"), (b) => sendWgobf(b, name, "wgobf"), "btn-primary"),
       btn("📦 Архив Linux", (b) => sendWgobf(b, name, "wgobf_zip"))),
+    c ? btn("🔗 Ссылка установки", (b) => busy(b, async () => showLink(await post("/api/wgobf/install-link", { name }))),
+      "btn-block") : null,
+    linkBox,
     // Ссылка phobos:// — длинный base64: на экране начало, целиком — копированием
     d.link ? [h("h2", {}, "Ссылка для Keenetic"),
       h("div", { class: "card" }, h("div", { class: "mono small", style: "overflow-wrap:anywhere" },
@@ -5492,7 +5820,7 @@ const LOGS = { manager: "awg2 — действия", install: "Компонен�
   expire: "Сроки клиентов", warp: "WARP", "warp-health": "WARP health-check", usque: "usque (WARP MASQUE)", xray: "Xray",
   "xray-routing": "Маршруты Xray", tun2socks: "tun2socks", exits: "Exit-ноды", cascade: "Каскад", dns: "dnscrypt-proxy",
   "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер",
-  vkblock: "VK и Max мимо VPN", rudirect: "РФ напрямую", tunfail: "Если туннель упал" };
+  vkblock: "VK и Max мимо VPN", rublock: "РФ мимо VPN", rudirect: "РФ напрямую", tunfail: "Если туннель упал" };
 
 route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
   const r = await callR(["log", name, "150"]);
