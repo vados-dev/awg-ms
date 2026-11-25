@@ -8,7 +8,7 @@ INSTALL_LOG="/var/log/awg2-install.log"
 
 # ── AmneziaWG ─────────────────────────────────────────────
 AWG_DIR="/etc/amnezia/amneziawg"
-AWG_IF="${AWG_IFACE:-awg3vds}"
+AWG_IF="${AWG_IFACE:-awg31}"
 SERVER_CONF="$AWG_DIR/${AWG_IF}.conf"
 AWG_CONF_DIR="/root/awg-ms/configs"                  #"/etc/VPN/configs/${AWG_IF}"
 CLIENT_DIR="${AWG_CONF_DIR}/clients"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf

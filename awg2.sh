@@ -379,13 +379,13 @@ INSTALL_LOG="/var/log/awg2-install.log"
 
 # ── AmneziaWG ─────────────────────────────────────────────
 AWG_DIR="/etc/amnezia/amneziawg"
-AWG_IF="${AWG_IFACE:-awg3vds}"
+AWG_IF="${AWG_IFACE:-awg31}"
 SERVER_CONF="$AWG_DIR/${AWG_IF}.conf"
-AWG_CONF_DIR="/etc/VPN/${AWG_IF}"
+AWG_CONF_DIR="/root/awg-ms/configs"                  #"/etc/VPN/configs/${AWG_IF}"
 CLIENT_DIR="${AWG_CONF_DIR}/clients"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
 AUTOSTART_DROPIN="/etc/systemd/system/awg31-quick@${AWG_IF}.service.d"
 MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
-SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
+SYSCTL_FORWARD_FILE="/etc/sysctl.d/97-amneziawg.conf"  #99-awg2.conf
 
 # Компоненты собираются из исходников апстрима через git + DKMS.
 MOD_REPO="https://github.com/vados-dev/amneziawg-linux-kernel-module-vds.git"
@@ -698,6 +698,75 @@ check_os() {
 }
 check_root
 check_os
+
+# /etc/pm-compat.sh — оверлей apt → pm для dnf-систем.
+# Подключается через BASH_ENV=/etc/pm-compat.sh (см. /etc/environment).
+
+PM_REAL=${PM_REAL:-/usr/local/bin/pm}
+
+_pm() { PM_COMPAT_ACTIVE=1 "$PM_REAL" "$@"; }
+
+apt-get() {
+    # защита от рекурсии: если вызов пришёл изнутри pm — уходим в настоящий бинарник
+    if [ -n "${PM_COMPAT_ACTIVE:-}" ]; then
+        [ -x /usr/bin/apt-get ] && /usr/bin/apt-get "$@"
+        return $?
+    fi
+
+    local cmd="$1"; shift
+    local -a rest=()
+    local a
+    # apt-флаги снимаем: pm уже сам вызывает бэкенд с -y
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes|-q|-qq|-f|--allow-unauthenticated|--no-install-recommends) ;;
+            *) rest+=("$1") ;;
+        esac
+        shift
+    done
+
+    case "$cmd" in
+        update)                    _pm update ;;
+        upgrade)                   _pm upgrade ;;
+        dist-upgrade|full-upgrade) _pm full-upgrade ;;
+        install)
+            local -a good=(); local failed=0
+            for a in "${rest[@]}"; do
+                case "$a" in
+                    *.deb)
+                        printf 'pm-compat: %s — .deb на dnf-системе не поставить\n' "$a" >&2
+                        failed=1 ;;
+                    *) good+=("$a") ;;
+                esac
+            done
+            if [ ${#good[@]} -gt 0 ]; then
+                _pm install "${good[@]}" || return 1
+            fi
+            return $failed ;;
+        reinstall)   [ ${#rest[@]} -gt 0 ] && _pm reinstall "${rest[@]}" ;;
+        remove|purge)
+            if [ ${#rest[@]} -gt 0 ]; then _pm remove "${rest[@]}"; else _pm autoremove; fi ;;
+        autoremove)  _pm autoremove ;;
+        clean|autoclean) _pm clean ;;
+        search)      _pm search "${rest[@]}" ;;
+        show|policy|depends) _pm show "${rest[@]}" ;;
+        list)
+            case "${rest[0]}" in
+                --installed)  _pm list installed ;;
+                --upgradable) _pm list upgradable ;;
+                *)            _pm list all ;;
+            esac ;;
+        *)
+            # непереводимое не валим чужой скрипт: предупреждаем и пропускаем.
+            # Хочется жёсткого поведения — экспортируй PM_COMPAT_STRICT=1.
+            printf 'pm-compat: apt-get %s %s — перевода нет, пропускаю\n' "$cmd" "${rest[*]}" >&2
+            if [ -n "${PM_COMPAT_STRICT:-}" ]; then return 127; else return 0; fi ;;
+    esac
+}
+
+apt() { apt-get "$@"; }
+
+export -f apt-get apt
 
 check_dnf_updates() { ! dnf check-update -y > /dev/null 2>&1 && err "dnf обновления не проверены!" || log "dnf обновления проверены."; }
 
@@ -1546,11 +1615,18 @@ client_file() {
 
 client_name_of() { local b="${1##*/}"; echo "${b%_awg[23].conf}"; }
 
+
 client_files() {
   local f
-  for f in "$CLIENT_DIR/${1}/${1}.conf" "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
+  for f in "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
   return 0
 }
+
+#client_files() {
+#  local f
+#  for f in "$CLIENT_DIR/${1}/${1}.conf" "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
+#  return 0
+#}
 
 # Суффиксы файлов — под текущую версию протокола (после смены версии/рестора).
 client_files_sync_suffix() {
@@ -21025,5 +21101,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=8a6537d840531c0d
+_BUILD_SUM=85a727714f027c5b
 main "$@"
