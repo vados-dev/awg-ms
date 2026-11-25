@@ -550,7 +550,7 @@ WGOBF_TAG="awg-wgobf"
 WGOBF_MTU=1380
 
 # ── Telegram-бот ──────────────────────────────────────────
-BOT_CONF="/etc/VPN/configs/${AWG_IF}/awg-bot.conf"
+BOT_CONF="/etc/awg-bot.conf"
 BOT_ADMINS="/var/lib/awg-bot/admins.json"   # приглашённые админы (ведёт бот)
 BOT_DIR="/opt/awg-bot"
 BOT_UNIT="awg-bot.service"
@@ -21122,5 +21122,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=e9d603088a6233f0
+_BUILD_SUM=ecc9b53c4652cd0b
 main "$@"

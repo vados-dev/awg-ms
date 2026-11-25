@@ -179,7 +179,7 @@ WGOBF_TAG="awg-wgobf"
 WGOBF_MTU=1380
 
 # ── Telegram-бот ──────────────────────────────────────────
-BOT_CONF="/etc/VPN/configs/${AWG_IF}/awg-bot.conf"
+BOT_CONF="/etc/awg-bot.conf"
 BOT_ADMINS="/var/lib/awg-bot/admins.json"   # приглашённые админы (ведёт бот)
 BOT_DIR="/opt/awg-bot"
 BOT_UNIT="awg-bot.service"
