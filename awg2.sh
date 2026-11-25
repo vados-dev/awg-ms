@@ -672,23 +672,13 @@ warn() { printf ' \033[1;33m ⚡ WARN:\033[0;1m [%s] - %s.\033[0m\n' "$PROGRAM" 
 err()  { printf ' \033[0;31m ⚫ ERROR:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM" "$*" >&2; }
 die()  { printf ' \033[1;31m ❌ CRITICAL:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM" "$*" >&2; exit 1; }
 
-check_root() { [ "$(id -u)" -eq 0 ] || die "Запускайте от root."; }
+[ "$(id -u)" -eq 0 ] || die "Запускайте от root."
 
-OS_ID="" OS_VER="" OS_CODENAME="" OS_LABEL=""
-
-os_detect() {
-  [[ -n "$OS_ID" ]] && return 0
-  IFS='|' read -r OS_ID OS_VER OS_CODENAME < <(. /etc/os-release \
-    && printf '%s|%s|%s\n' "${ID:-}" "${VERSION_ID:-}" "${VERSION_CODENAME:-}")
-  OS_LABEL="${OS_ID^} ${OS_VER:-${OS_CODENAME:-?}}"  
-  [[ -n "$OS_CODENAME" && -n "$OS_VER" ]] && OS_LABEL+=" ($OS_CODENAME)"
-  return 0
-}
+os_type="";
 
 os_supported() {
-    os_detect
     # shellcheck disable=SC1091
-    #[[ -r /etc/os-release ]] && source "/etc/os-release"; OS_ID="$ID"; OS_VER="$VERSION_ID" || { echo "Нет /etc/os-release!"; true; }
+    [[ -r /etc/os-release ]] && source "/etc/os-release"; OS_ID="$ID"; OS_VER="$VERSION_ID" || { echo "Нет /etc/os-release!"; true; }
     version_ge() {
         local a="$1" b="$2"
         [[ "$a" == "$b" ]] && return 0
@@ -721,9 +711,6 @@ os_supported() {
 }
 readonly -f os_supported
 export -f os_supported
-
-check_root
-os_detect
 
 _postup_lines() {
     local net="$1" dev="$2"
@@ -21135,5 +21122,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=68ec2c0f033d2539
+_BUILD_SUM=e9d603088a6233f0
 main "$@"
