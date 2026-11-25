@@ -139,11 +139,18 @@ client_file() {
 
 client_name_of() { local b="${1##*/}"; echo "${b%_awg[23].conf}"; }
 
+
 client_files() {
   local f
-  for f in "$CLIENT_DIR/${1}/${1}.conf" "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
+  for f in "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
   return 0
 }
+
+#client_files() {
+#  local f
+#  for f in "$CLIENT_DIR/${1}/${1}.conf" "$CLIENT_DIR"/*_awg[23].conf; do [[ -f "$f" ]] && echo "$f"; done
+#  return 0
+#}
 
 # Суффиксы файлов — под текущую версию протокола (после смены версии/рестора).
 client_files_sync_suffix() {

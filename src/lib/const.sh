@@ -10,11 +10,11 @@ INSTALL_LOG="/var/log/awg2-install.log"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_IF="${AWG_IFACE:-awg3vds}"
 SERVER_CONF="$AWG_DIR/${AWG_IF}.conf"
-AWG_CONF_DIR="/etc/VPN/${AWG_IF}"
+AWG_CONF_DIR="/root/awg-ms/configs"                  #"/etc/VPN/configs/${AWG_IF}"
 CLIENT_DIR="${AWG_CONF_DIR}/clients"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
 AUTOSTART_DROPIN="/etc/systemd/system/awg31-quick@${AWG_IF}.service.d"
 MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
-SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
+SYSCTL_FORWARD_FILE="/etc/sysctl.d/97-amneziawg.conf"  #99-awg2.conf
 
 # Компоненты собираются из исходников апстрима через git + DKMS.
 MOD_REPO="https://github.com/vados-dev/amneziawg-linux-kernel-module-vds.git"
