@@ -1,4 +1,4 @@
-# Сервер awg0: установка компонентов, создание, запуск, ремонт,
+# Сервер ${AWG_IF}: установка компонентов, создание, запуск, ремонт,
 # перегенерация параметров и смена версии протокола.
 
 # ── Установка компонентов ─────────────────────────────────
@@ -158,7 +158,7 @@ do_install() {
   fi
 }
 
-# ── Запуск awg0 с разбором ошибки ─────────────────────────
+# ── Запуск ${AWG_IF} с разбором ошибки ─────────────────────────
 # Сообщения awg-quick короткие, но однозначные — каждому соответствует одно
 # действие. Разбор избавляет от гадания по «awg-quick up провалился».
 awg_diagnose_up() {
@@ -202,14 +202,14 @@ awg_diagnose_up() {
 
 awg_up_diag() {
   local out rc=0
-  out=$(awg-quick up "$SERVER_CONF" 2>&1) || rc=$?
+  out=$(${awg_quick} up "$SERVER_CONF" 2>&1) || rc=$?
   if (( rc != 0 )) && [[ "$out" == *"already exists"* ]] && iface_up; then
-    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
-    rc=0; out=$(awg-quick up "$SERVER_CONF" 2>&1) || rc=$?
+    ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    rc=0; out=$(${awg_quick}${awg_quick} up "$SERVER_CONF" 2>&1) || rc=$?
   fi
-  (( rc == 0 )) && { log_info "awg0 поднят"; return 0; }
-  log_err "awg-quick up rc=$rc: $(tr '\n' ';' <<< "$out")"
-  echo -e "  ${D}── awg-quick up ──${N}"
+  (( rc == 0 )) && { log_info "$AWG_IF поднят"; return 0; }
+  log_err "${awg_quick} up rc=$rc: $(tr '\n' ';' <<< "$out")"
+  echo -e "  ${D}── ${awg_quick} up ──${N}"
   sed 's/^/  │ /' <<< "$out"
   awg_diagnose_up "$out"
   return "$rc"
@@ -217,10 +217,10 @@ awg_up_diag() {
 
 setup_autostart() {
   mkdir -p "$AUTOSTART_DROPIN"
-  printf '[Service]\nExecStart=\nExecStart=/usr/bin/awg-quick up awg0\n' \
+  printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/${awg_quick} up %i\n' \
     | write_file "$AUTOSTART_DROPIN/override.conf" 644
   systemctl daemon-reload
-  systemctl enable awg-quick@awg0 &>/dev/null || warn "Не удалось включить автозапуск awg0"
+  systemctl enable ${awg_quick}@${AWG_IF} &>/dev/null || warn "Не удалось включить автозапуск $AWG_IF"
   mod_autoload
 }
 
@@ -231,8 +231,8 @@ S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT="" S_ENDPOINT_V6=0
 
 _postup_lines() {
   local net="$1" dev="$2"
-  echo "PostUp = echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $net -o $dev -j MASQUERADE; iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -I FORWARD -i awg0 -j ACCEPT; iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -I FORWARD -o awg0 -j ACCEPT"
-  echo "PostDown = iptables -t nat -D POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
+  echo "PostUp = echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $net -o $dev -j MASQUERADE; iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -I FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD -o %i -j ACCEPT"
+  echo "PostDown = iptables -t nat -D POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true"
 }
 
 # Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU,
@@ -274,7 +274,7 @@ proto31_cached() {
   return "$rc"
 }
 
-# Внешний интерфейс в правиле NAT awg0.conf — аплинк, на котором создан сервер.
+# Внешний интерфейс в правиле NAT $AWG_IF.conf — аплинк, на котором создан сервер.
 conf_uplink() {
   [[ -f "$SERVER_CONF" ]] || return 1
   sed -nE 's/^PostUp *=.*POSTROUTING -s [^ ]+ -o ([^ ]+) -j MASQUERADE.*/\1/p' "$SERVER_CONF" | head -1 | grep .
@@ -287,8 +287,8 @@ conf_uplink() {
 # нет: есть — значит NAT через него выбран сознательно (второй аплинк,
 # туннель). Восстановление бэкапа (force) переносит всегда: интерфейс с тем
 # же именем на новом VPS может быть совсем другим (приватный eth0). Поднятый
-# awg0 опускается до правки — его PostDown снимает старое правило NAT, иначе
-# оно оставалось в iptables — и поднимается снова. 0 — awg0.conf поправлен.
+# $AWG_IF опускается до правки — его PostDown снимает старое правило NAT, иначе
+# оно оставалось в iptables — и поднимается снова. 0 — $AWG_IF.conf поправлен.
 conf_uplink_sync() {  # [force]
   local old dev up=0 rc=0
   old=$(conf_uplink) || return 1
@@ -297,17 +297,17 @@ conf_uplink_sync() {  # [force]
   [[ "${1:-}" != force ]] && ip link show "$old" &>/dev/null && return 1
   if iface_up; then
     up=1
-    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   fi
   sed -i -E "/^Post(Up|Down) *=/ s#(POSTROUTING -s [^ ]+ -o )${old//./\\.}( -j MASQUERADE)#\1$dev\2#g" "$SERVER_CONF" \
     && [[ "$(conf_uplink)" == "$dev" ]] || rc=1
   (( up )) && { awg_up_diag || rc=1; }
   (( rc )) && return 1
   info "Внешний интерфейс сервера: $old → $dev (NAT в $SERVER_CONF)"
-  log_info "NAT awg0: $old → $dev"
+  log_info "NAT ${AWG_IF}: $old → $dev"
 }
 
-# Создаёт awg0.conf и первого клиента из S_* и выбранной мимикрии.
+# Создаёт ${AWG_IF}.conf и первого клиента из S_* и выбранной мимикрии.
 server_write() {
   local net="$S_NET" base srv_priv cli_priv psk dev
   base="${net%.*}"
@@ -346,7 +346,7 @@ server_write() {
 
 # Поднять созданный сервер, открыть порт, включить автозапуск.
 server_start_new() {
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   awg_up_diag || return 1
   ufw_open "$S_PORT/udp" AmneziaWG
   ufw_forward_accept
@@ -693,15 +693,15 @@ server_reboot() {
 # ── Перезапуск и ремонт ───────────────────────────────────
 do_restart() {
   server_exists || { err "Сервер не создан"; return 1; }
-  info "Перезапуск awg0..."
-  server_restart && ok "awg0 перезапущен"
+  info "Перезапуск $AWG_IF..."
+  server_restart && ok "$AWG_IF перезапущен"
 }
 
 REPAIR_ISSUES=0 REPAIR_FIXED=0
 _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
-# Файрвол: при включённом UFW порты awg0 и обфускатора открыты (UFW могли
+# Файрвол: при включённом UFW порты ${AWG_IF} и обфускатора открыты (UFW могли
 # включить уже после установки, или на русской локали Тулза его не видела),
 # политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
 # ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
@@ -746,7 +746,7 @@ do_repair() {
   fi
   mod_stale && _issue "В памяти прежняя сборка модуля — Сервер → Модуль ядра → перезагрузить модуль"
   if [[ -n "$(kernel_gap)" ]]; then
-    _issue "Ядро $(kernel_gap_line) без модуля AWG — после перезагрузки awg0 не поднимется"
+    _issue "Ядро $(kernel_gap_line) без модуля AWG — после перезагрузки $AWG_IF не поднимется"
     mod_rebuild_all && _fixed "Модуль собран под все ядра"
   fi
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
@@ -770,27 +770,27 @@ do_repair() {
   else _issue "IP forwarding выключен"; ip_forward_enable && _fixed "IP forwarding включён"; fi
 
   if ! iface_up; then
-    _issue "awg0 не поднят"
-    awg_up_diag && _fixed "awg0 поднят"
+    _issue "$AWG_IF не поднят"
+    awg_up_diag && _fixed "$AWG_IF поднят"
   else
     conf_n=$(grep -c '^\[Peer\]' "$SERVER_CONF" || true)
     live_n=$(awg show "$AWG_IF" peers 2>/dev/null | wc -l)
     if [[ "$conf_n" != "$live_n" ]]; then
       _issue "Пиров в конфиге $conf_n, в ядре $live_n"
-      server_restart && _fixed "awg0 перезапущен"
-    else ok "awg0 работает, пиров: $live_n"; fi
+      server_restart && _fixed "$AWG_IF перезапущен"
+    else ok "$AWG_IF работает, пиров: $live_n"; fi
   fi
   dev=$(uplink_iface || true); net=$(server_net || true)
   old=$(conf_uplink || true)
   if [[ -n "$dev" && -n "$old" && "$old" != "$dev" ]]; then
     if ip link show "$old" &>/dev/null; then
-      info "NAT в awg0.conf — на $old (маршрут по умолчанию — через $dev): оставляю как настроено"
+      info "NAT в ${AWG_IF}.conf — на $old (маршрут по умолчанию — через $dev): оставляю как настроено"
     else
-      _issue "NAT в awg0.conf — на $old, такого интерфейса нет; выход сервера — $dev"
+      _issue "NAT в ${AWG_IF}.conf — на $old, такого интерфейса нет; выход сервера — $dev"
       conf_uplink_sync && _fixed "NAT перенесён на $dev"
     fi
   fi
-  # NAT проверяется на интерфейсе из awg0.conf: выбранный сознательно не
+  # NAT проверяется на интерфейсе из ${AWG_IF}.conf: выбранный сознательно не
   # перебивается правилом на аплинк по умолчанию
   old=$(conf_uplink || true); [[ -n "$old" ]] && ip link show "$old" &>/dev/null && dev="$old"
   if [[ -n "$dev" && -n "$net" ]]; then
@@ -801,7 +801,7 @@ do_repair() {
   [[ "$perm" == 600 ]] || { _issue "Права $SERVER_CONF = $perm"; chmod 600 "$SERVER_CONF" && _fixed "Права 600"; }
   perm=$(stat -c %a "$AWG_DIR")
   [[ "$perm" == 700 ]] || { _issue "Права $AWG_DIR = $perm"; chmod 700 "$AWG_DIR" && _fixed "Права 700"; }
-  unit_enabled awg-quick@awg0 || { _issue "Нет автозапуска awg0"; setup_autostart && _fixed "Автозапуск включён"; }
+  unit_enabled ${awg_quick}@${AWG_IF} || { _issue "Нет автозапуска $AWG_IF"; setup_autostart && _fixed "Автозапуск включён"; }
 
   echo ""
   if (( REPAIR_ISSUES == 0 )); then success_box "Всё в порядке"
@@ -823,7 +823,7 @@ mimicry_module_warnings() {
   return 0
 }
 
-# Снимок конфигов сервера и клиентов — откат, если awg0 не поднимется.
+# Снимок конфигов сервера и клиентов — откат, если ${AWG_IF} не поднимется.
 _params_snapshot() {  # ПЕРЕМЕННАЯ
   local __d f
   mktmp __d -d || return 1
@@ -834,7 +834,7 @@ _params_snapshot() {  # ПЕРЕМЕННАЯ
 }
 
 _params_restore() {  # КАТАЛОГ_СНИМКА
-  err "awg0 не поднялся с новыми параметрами — возвращаю прежние"
+  err "${AWG_IF} не поднялся с новыми параметрами — возвращаю прежние"
   cp -a "$1/${SERVER_CONF##*/}" "$SERVER_CONF"
   rm -f "$CLIENT_DIR"/*_awg[23].conf
   cp -a "$1/clients/." "$CLIENT_DIR/"
@@ -903,7 +903,7 @@ params_check() {
 }
 
 # Новый блок — в сервер и всех клиентов (как при перегенерации: у клиентов те
-# же значения), рестарт; awg0 не поднялся — откат.
+# же значения), рестарт; ${AWG_IF} не поднялся — откат.
 params_edit_apply() {
   local snap f n=0 keys
   auto_backup params || warn "Авто-бэкап не удался"
@@ -1097,7 +1097,7 @@ do_reset_server() {
   server_exists || { info "Сервер не создан"; return 0; }
   echo ""
   hdr "Сброс сервера"
-  warn "Будут удалены awg0, $SERVER_CONF и все клиенты ($(client_files | wc -l))."
+  warn "Будут удалены ${AWG_IF}, $SERVER_CONF и все клиенты ($(client_files | wc -l))."
   info "Компоненты и бэкапы остаются; авто-бэкап будет сделан."
   read_confirm "${R}  Подтверди сброс (введи yes): ${N}" || { info "Отменено"; return 0; }
   server_reset
@@ -1108,7 +1108,7 @@ server_reset() {
   server_exists || { info "Сервер не создан"; return 0; }
   auto_backup reset || warn "Авто-бэкап не удался"
   tunnels_panic_reset quiet
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   rm -f "$SERVER_CONF" "$SERVER_CONF".bak.* "$SERVER_CONF".pre_* "$CLIENT_DIR"/*_awg[23].conf
   rm -f "$TRAFFIC_DB" "$TRAFFIC_DB.lock"
   ufw_delete_matching AmneziaWG

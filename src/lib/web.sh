@@ -92,7 +92,7 @@ web_code_install() {
 
 # ── Доступ к панели: для всех, по адресам или только через VPN ──
 # WEB_ACCESS=all|ip|vpn, WEB_ALLOW — адреса и подсети через запятую (режим ip;
-# при переключении на другой режим список хранится). Свой VPN (подсети awg0 и
+# при переключении на другой режим список хранится). Свой VPN (подсети ${AWG_IF} и
 # WG + обфускатора) пускаем в обоих ограниченных режимах: сменился адрес дома —
 # зайти можно через VPN; SSH и Telegram-бот работают всегда.
 # Два слоя. Файрвол: правило DROP новых подключений к порту панели не из
@@ -247,7 +247,7 @@ web_access_mode() {
 
 web_access_allow() { web_conf_get WEB_ALLOW | tr ',' '\n' | grep .; }
 
-# Подсети своего VPN: awg0 и WG + обфускатор
+# Подсети своего VPN: ${AWG_IF} и WG + обфускатор
 web_vpn_nets() {
   local n
   n=$(server_net 2>/dev/null) && echo "$n"
@@ -256,7 +256,7 @@ web_vpn_nets() {
   return 0
 }
 
-# Адрес панели изнутри VPN: адрес awg0 (нет AWG — wgobf0) вместо внешнего
+# Адрес панели изнутри VPN: адрес ${AWG_IF} (нет AWG — wgobf0) вместо внешнего
 # (сертификат выписан на внешний — браузер предупредит, трафик и так внутри VPN)
 web_vpn_url() {
   local a p path
@@ -321,7 +321,7 @@ web_access_set() {
   # С самого сервера (127.0.0.1, ::1) панель открывается всегда
   [[ "$me" == 127.* || "$me" == ::1 ]] && me=""
   if [[ -n "$me" && "$mode" != all ]] && ! _web_access_covers "$([[ "$mode" != ip ]] || echo "$WEB_ACCESS_LIST")" "$me"; then
-    if [[ "$mode" == vpn ]]; then err "Ты зашёл не через VPN ($me) — после этого панель для тебя закроется. Подключись к VPN и открой $(web_vpn_url || echo 'адрес awg0')"
+    if [[ "$mode" == vpn ]]; then err "Ты зашёл не через VPN ($me) — после этого панель для тебя закроется. Подключись к VPN и открой $(web_vpn_url || echo 'адрес ${AWG_IF}')"
     else err "Твой адрес $me не попадает в список — добавь его, иначе панель для тебя закроется"; fi
     return 1
   fi
@@ -334,7 +334,7 @@ web_access_set() {
   web_fw_run apply || warn "Файрвол: правило не встало — адреса проверяет сама панель"
   log_info "веб-панель: доступ $mode${WEB_ACCESS_LIST:+ ($WEB_ACCESS_LIST)}"
   ok "Доступ к веб-панели: $(web_access_label)"
-  [[ "$mode" == all ]] || info "Через VPN: $(web_vpn_url || echo 'адрес awg0, порт и путь панели')"
+  [[ "$mode" == all ]] || info "Через VPN: $(web_vpn_url || echo 'адрес ${AWG_IF}, порт и путь панели')"
 }
 
 web_access_menu() {

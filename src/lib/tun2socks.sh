@@ -70,7 +70,7 @@ t2s_up() {
   write_unit "$T2S_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — клиенты через SOCKS5 (tun2socks)
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 
 [Service]

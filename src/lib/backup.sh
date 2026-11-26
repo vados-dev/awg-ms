@@ -48,7 +48,7 @@ backup_create() {
     sleep 1
   done
   mkdir -p "$dir" && chmod 700 "$BACKUP_DIR" "$dir"
-  if [[ -f "$SERVER_CONF" ]]; then cp -a "$SERVER_CONF" "$dir/awg0.conf"; n=$((n + 1)); ok "Сервер: awg0.conf"
+  if [[ -f "$SERVER_CONF" ]]; then cp -a "$SERVER_CONF" "$dir/${AWG_IF}.conf"; n=$((n + 1)); ok "Сервер: ${AWG_IF}.conf"
   else warn "Серверного конфига нет"; fi
   while IFS= read -r f; do cp -a "$f" "$dir/"; n=$((n + 1)); done < <(client_files)
   (( n > 1 )) && ok "Клиентов: $((n - 1))"
@@ -108,42 +108,42 @@ _restore_list() {  # → строки «путь» (новые сверху)
     -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
 }
 
-# Каталог с awg0.conf из любого бэкапа: каталог полного бэкапа, его архив,
-# авто-бэкап (пути от корня) или архив бота прежних версий (awg0.conf + clients/).
+# Каталог с ${AWG_IF}.conf из любого бэкапа: каталог полного бэкапа, его архив,
+# авто-бэкап (пути от корня) или архив бота прежних версий (${AWG_IF}.conf + clients/).
 RESTORE_SRC=""
 _restore_prepare() {
   local src="$1" tmp d
   RESTORE_SRC=""
   if [[ -d "$src" ]]; then
-    [[ -f "$src/awg0.conf" ]] || { err "В бэкапе нет awg0.conf"; return 1; }
+    [[ -f "$src/${AWG_IF}.conf" ]] || { err "В бэкапе нет ${AWG_IF}.conf"; return 1; }
     RESTORE_SRC="$src"; return 0
   fi
   [[ -f "$src" ]] || { err "Нет файла $src"; return 1; }
   mktmp tmp -d || return 1
   py safe-untar "$src" "$tmp/x" || { err "Архив не распаковался"; return 1; }
-  if [[ -f "$tmp/x/awg0.conf" ]]; then d="$tmp/x"
-  elif [[ -f "$tmp/x$SERVER_CONF" ]]; then d="$tmp/x"; cp -a "$tmp/x$SERVER_CONF" "$d/awg0.conf"
-  else d=$(find "$tmp/x" -mindepth 2 -maxdepth 2 -name awg0.conf -printf '%h\n' | head -1); fi
-  [[ -n "$d" && -f "$d/awg0.conf" ]] || { err "В архиве нет awg0.conf — это не бэкап awg2"; return 1; }
-  # Клиенты у разных форматов лежат по-разному — собираем рядом с awg0.conf
+  if [[ -f "$tmp/x/${AWG_IF}.conf" ]]; then d="$tmp/x"
+  elif [[ -f "$tmp/x$SERVER_CONF" ]]; then d="$tmp/x"; cp -a "$tmp/x$SERVER_CONF" "$d/${AWG_IF}.conf"
+  else d=$(find "$tmp/x" -mindepth 2 -maxdepth 2 -name ${AWG_IF}.conf -printf '%h\n' | head -1); fi
+  [[ -n "$d" && -f "$d/${AWG_IF}.conf" ]] || { err "В архиве нет ${AWG_IF}.conf — это не бэкап awg2"; return 1; }
+  # Клиенты у разных форматов лежат по-разному — собираем рядом с ${AWG_IF}.conf
   find "$tmp/x" -name '*_awg[23].conf' ! -path "$d/*_awg[23].conf" -exec cp -a {} "$d/" \;
   RESTORE_SRC="$d"
 }
 
 _restore_awg_files() {  # каталог бэкапа
   local src="$1" f keep
-  install -D -m 600 "$src/awg0.conf" "$SERVER_CONF"
-  # Конфиги клиентов, которых нет в восстановленном awg0.conf, иначе остаются
+  install -D -m 600 "$src/${AWG_IF}.conf" "$SERVER_CONF"
+  # Конфиги клиентов, которых нет в восстановленном ${AWG_IF}.conf, иначе остаются
   # сиротами: видны в «Показать конфиг», занимают имя и попадают в архив.
-  # Конфиги пиров, которые в awg0 есть, не трогаем: бэкап мог прийти без них.
-  # awg0.conf не разобрался — не трогаем ничего: пустой список стёр бы всех.
+  # Конфиги пиров, которые в ${AWG_IF} есть, не трогаем: бэкап мог прийти без них.
+  # ${AWG_IF}.conf не разобрался — не трогаем ничего: пустой список стёр бы всех.
   if keep=$(clients_tsv | cut -f1 | tr '\n' ' '); then
     keep=" $keep "
     for f in "$CLIENT_DIR"/*_awg[23].conf; do
       [[ -f "$f" && "$keep" != *" $(client_name_of "$f") "* ]] && rm -f "$f"
     done
   else
-    warn "awg0.conf из бэкапа не разобран — конфиги клиентов на сервере не трогаю"
+    warn "${AWG_IF}.conf из бэкапа не разобран — конфиги клиентов на сервере не трогаю"
   fi
   while IFS= read -r -d '' f; do
     rm -f "$CLIENT_DIR/$(client_name_of "$f")"_awg[23].conf
@@ -226,7 +226,7 @@ _restore_tunnels() {  # каталог бэкапа
   rudirect_on && { _rudirect_emit && "$RUDIRECT_SCRIPT" apply; } &>/dev/null
   rm -f "$XRAY_STATE"
   [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
-  for n in $(exits_nodes); do systemctl enable --now "awg-quick@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
+  for n in $(exits_nodes); do systemctl enable --now "${awg_quick}@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
   (( $(cascade_count) )) && { _cascade_persist; systemctl restart awg-cascade.service &>/dev/null; }
   ok "Настройки туннелей восстановлены; маршрутизация клиентов выключена"
 }
@@ -289,7 +289,7 @@ do_restore() {
   (( c )) || return 0
   src="${list[$((c - 1))]}"
   _restore_prepare "$src" || return 1
-  bad=$(py meta-check "$RESTORE_SRC/awg0.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
+  bad=$(py meta-check "$RESTORE_SRC/${AWG_IF}.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
   [[ -n "$bad" ]] && warn "В бэкапе у клиентов повреждены метки: $bad — срок или лимит: клиент будет заблокирован до исправления"
   read_confirm "${R}  Текущий сервер будет заменён. Продолжить? (введи yes): ${N}" || return 0
   [[ -d "$RESTORE_SRC/wgobf/etc" ]] && ask_yes "  В бэкапе есть WG + обфускатор — восстановить? [Y/n]: " y && opts+=(wgobf)
@@ -302,10 +302,10 @@ do_restore() {
 backup_restore() {
   local src="$1" label="${1##*/}" port f bad
   shift
-  command -v awg-quick &>/dev/null || { err "Нет awg-quick — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
+  command -v ${awg_quick} &>/dev/null || { err "Нет ${awg_quick} — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
   _restore_prepare "$src" || return 1
   src="$RESTORE_SRC"
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   [[ -f "$SERVER_CONF" ]] && cp -a "$SERVER_CONF" "$SERVER_CONF.pre_restore.$(date +%s)"
   _restore_awg_files "$src"
   _restore_hooks "$SERVER_CONF" || return 1
@@ -331,7 +331,7 @@ backup_restore() {
   [[ -n "$port" ]] && ufw_allow "$port/udp" AmneziaWG
   expire_install
   web_vpn_changed
-  if awg_up_diag; then ok "awg0 поднят"; else err "awg0 не поднялся — конфиг: $SERVER_CONF"; return 1; fi
+  if awg_up_diag; then ok "${AWG_IF} поднят"; else err "${AWG_IF} не поднялся — конфиг: $SERVER_CONF"; return 1; fi
   success_box "Восстановлено из $label"
   log_info "восстановление из $label"
 }

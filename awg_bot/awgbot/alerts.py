@@ -3,7 +3,7 @@
 Раз в CHECK_INTERVAL бот смотрит сводку awg2 и сам сервер и пишет
 владельцам и админам, когда что-то случилось:
 
-  iface   awg0 упал (две проверки подряд) и снова поднялся — с временем простоя;
+  iface   ${AWG_IF} упал (две проверки подряд) и снова поднялся — с временем простоя;
   warp    WARP упал (health-check увёл клиентов напрямую — сразу; туннель не
           поднялся после перезагрузки — две проверки подряд) или не отвечает
           (поднят, а Cloudflare молчит: без health-check это проверяет бот сам,
@@ -64,7 +64,7 @@ SEND_MAX = 49 * 1024 * 1024                     # документ бота — 
 KERNEL_FIX_WAIT = 3 * 3600                      # автосборка модуля молчит — сообщить о ядре без модуля
 
 # id, подпись кнопки (полстроки в боте), полное название
-KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал или не отвечает и снова работает"),
+KINDS = [("iface", "awg_if упал", "awg_if упал и поднялся"), ("warp", "WARP упал", "WARP упал или не отвечает и снова работает"),
          ("xray", "Xray не идёт", "Xray: через выход трафик не идёт и снова работает"),
          ("exits", "Exit-ноды", "Exit-нода не отвечает и снова работает: общий выход переключается сам"),
          ("reboot", "Перезагрузка", "Сервер перезагрузился"),
@@ -258,28 +258,28 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
     if boot:
         if st.get("boot") and st["boot"] != boot and enabled("reboot"):
             s = d.get("server") or {}
-            awg = ("🟢 awg0 работает" if s.get("up") else "🔴 awg0 не поднялся") if s.get("exists") else ""
+            awg = ("🟢 awg_if работает" if s.get("up") else "🔴 awg_if не поднялся") if s.get("exists") else ""
             await notify(bot, f"🔄 <b>{host}</b> перезагрузился — работает {ui.fmt_dur(_uptime())}"
                               + (f"\n{awg}" if awg else ""),
                          None if not s.get("exists") or s.get("up") else ui.kb(("🛠 Починить", "srv:repair")))
         st["boot"] = boot
 
-    # awg0: две проверки подряд — перезапуск из меню или бота не тревога
+    # awg_if: две проверки подряд — перезапуск из меню или бота не тревога
     s = d.get("server") or {}
     if s.get("exists") and not s.get("up"):
         st["down"] = _as_int(st.get("down")) + 1
         if st["down"] == 1:
             st["down_since"] = now
         if st["down"] == IFACE_STRIKES and enabled("iface"):
-            await notify(bot, f"🔴 <b>{host}: awg0 не работает</b> — клиенты без связи.\n"
+            await notify(bot, f"🔴 <b>{host}: awg_if не работает</b> — клиенты без связи.\n"
                               "Сервер → 🛠 Починить.", ui.kb(("🛠 Починить", "srv:repair")))
             st["down_sent"] = True
     else:
-        # «Снова работает» — только если awg0 и правда поднят: сервер могли
+        # «Снова работает» — только если awg_if и правда поднят: сервер могли
         # удалить (сброс) — это не восстановление
         if st.get("down_sent") and s.get("exists") and s.get("up"):
             gone = ui.fmt_dur(now - _as_int(st.get("down_since"), now))
-            await notify(bot, f"🟢 <b>{host}: awg0 снова работает</b>\nПростой: около {gone}")
+            await notify(bot, f"🟢 <b>{host}: awg_if снова работает</b>\nПростой: около {gone}")
         for k in ("down", "down_since", "down_sent"):
             st.pop(k, None)
 

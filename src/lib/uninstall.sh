@@ -81,8 +81,8 @@ do_uninstall() {
   local del_bot=n del_wgobf=n del_web=n del_self=n del_src=n opts src=() d
   hdr "Удаление AWG Toolza"
   warn "Будет удалено:"
-  echo -e "  ${R}—${N} сервер awg0, его клиенты и автозапуск"
-  echo -e "  ${R}—${N} модуль ядра (DKMS) и утилиты awg / awg-quick"
+  echo -e "  ${R}—${N} сервер ${AWG_IF}, его клиенты и автозапуск"
+  echo -e "  ${R}—${N} модуль ядра (DKMS) и утилиты awg / ${awg_quick}"
   echo -e "  ${R}—${N} туннели: WARP, Xray, tun2socks, exit-ноды, каскад, шифрованный DNS"
   echo -e "  ${R}—${N} таймер сроков клиентов, правила UFW с меткой AmneziaWG"
   bot_installed && echo -e "  ${R}—${N} Telegram-бот ${D}(спрошу отдельно)${N}"
@@ -130,9 +130,9 @@ uninstall_all() {
   fi
 
   server_exists && do_backup
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   expire_remove
-  systemctl disable awg-quick@awg0 &>/dev/null || true
+  systemctl disable ${awg_quick}@${AWG_IF} &>/dev/null || true
   rm -rf "$AUTOSTART_DROPIN"
   # NAT-персистентность очень старых версий
   remove_unit awg-nat.service

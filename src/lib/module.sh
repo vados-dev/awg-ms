@@ -80,7 +80,7 @@ mod_stale() {
 }
 
 # Ядра, в которые сервер может загрузиться (работающее и новее), без
-# собранного модуля — после перезагрузки в такое ядро awg0 не поднимется.
+# собранного модуля — после перезагрузки в такое ядро ${AWG_IF} не поднимется.
 # Так бывает, когда apt поставил новое ядро, а DKMS не смог собрать под него
 # модуль (Ubuntu 7.0.0-38) или заголовков к нему нет. Строки «ядро» или
 # «ядро нет-заголовков»; пусто — всё в порядке.
@@ -356,7 +356,7 @@ _mod_src_patch() {  # каталог src тега или исходник в DKM
 }
 
 # Сборка под все ядра с заголовками. Ядро, поставленное раньше регистрации
-# модуля в DKMS, автосборку не получит — после перезагрузки в него awg0 не
+# модуля в DKMS, автосборку не получит — после перезагрузки в него ${AWG_IF} не
 # поднялся бы. Провал под работающим ядром — ошибка, под остальными —
 # предупреждение в журнале шага.
 _mod_dkms_install_all() {
@@ -444,7 +444,7 @@ tools_install_tag() {
   if command -v awg &>/dev/null; then
     bdir="$MOD_BACKUP_DIR/tools-$(tools_tag)-$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$bdir" && cp -a "$(command -v awg)" "$bdir/"
-    command -v awg-quick &>/dev/null && cp -a "$(command -v awg-quick)" "$bdir/"
+    command -v ${awg_quick} &>/dev/null && cp -a "$(command -v ${awg_quick})" "$bdir/"
   fi
   run_step "Сборка amneziawg-tools $tag" _tools_build_install "$tmp/tools/src" || return 1
   hash -r
@@ -486,14 +486,14 @@ _ssh_via_awg() {
 
 mod_reload() {
   local units ifaces cmd rc out
-  units=$(systemctl list-units --type=service --state=active --no-legend --plain 'awg-quick@*' 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+  units=$(systemctl list-units --type=service --state=active --no-legend --plain "${awg_quick}@*" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
   ifaces=$(awg_ifaces | tr '\n' ' ')
   echo -e "  ${D}юниты: ${units:-нет}; интерфейсы: ${ifaces:-нет}${N}"
   warn "Туннели лягут на несколько секунд, клиенты переподключатся сами"
   (( AUTO_MODE )) || ask_yes "  Перезагрузить модуль сейчас? [Y/n]: " y || { info "Отменено"; return 1; }
 
   cmd="for u in $units; do systemctl stop \"\$u\"; done
-for i in $ifaces; do ip link show \"\$i\" >/dev/null 2>&1 && { awg-quick down \"\$i\" 2>/dev/null || ip link del \"\$i\"; }; done
+for i in $ifaces; do ip link show \"\$i\" >/dev/null 2>&1 && { ${awg_quick} down \"\$i\" 2>/dev/null || ip link del \"\$i\"; }; done
 rmmod $MOD_NAME || { for u in $units; do systemctl start \"\$u\"; done; exit 3; }
 modprobe $MOD_NAME || exit 4
 for u in $units; do systemctl start \"\$u\"; done
@@ -566,7 +566,7 @@ mod_rebuild_all() {
   done < <(kernel_gap)
   run_step "Сборка DKMS под все ядра" _mod_dkms_install_all || return 1
   if [[ -n "$(kernel_gap)" ]]; then
-    warn "Модуль не собран под: $(kernel_gap_line) — после перезагрузки в это ядро awg0 не поднимется"
+    warn "Модуль не собран под: $(kernel_gap_line) — после перезагрузки в это ядро ${AWG_IF} не поднимется"
     info "Журнал сборки: $MOD_LOG и /var/lib/dkms/$MOD_NAME/$MOD_DKMS_VER/build/make.log"
     return 1
   fi

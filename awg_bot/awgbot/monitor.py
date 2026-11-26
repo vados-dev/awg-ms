@@ -91,7 +91,7 @@ async def _wgobf_watched(notes: dict[str, str], now: int) -> list[dict] | None:
 
 
 async def _server_exists() -> bool:
-    """Есть ли awg0.conf; при недоступном API — считаем, что нет (не чистим)."""
+    """Есть ли ${AWG_IF}.conf; при недоступном API — считаем, что нет (не чистим)."""
     info = await api.data("server", "info")
     return isinstance(info, dict) and bool(info.get("exists"))
 

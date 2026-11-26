@@ -28,6 +28,7 @@ KERNEL_VERSION="$(uname -r)"
 MOD_BRANCH="${mod_branch}"
 LOCAL_BUILD=0
 NONINTERACTIVE=0
+awg_quick="awg31-quick"
 
 # Common functions
 cmd()  { printf '  [\033[1;33m✨\033[0m]\033[1m %s \033[0m\n' "$*" >&2; "$@"; }
@@ -37,6 +38,10 @@ err()  { printf ' \033[0;31m ⚫ ERROR:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM"
 die()  { printf ' \033[1;31m ❌ CRITICAL:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM" "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Запускайте от root."
+
+#-> Переопределение бинарника awg (да любого другого).
+awg="${AWG_IF:-awg31}"
+awg() { [ -f "$(which $awg)" ] >&2 || die "$awg not found"; $awg "$@"; }
 
 os_type="";
 

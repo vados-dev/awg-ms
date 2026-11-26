@@ -186,7 +186,7 @@ _warp_autostart_install() {
   write_unit awg-warp.service <<EOF
 [Unit]
 Description=AWG Toolza — WARP для клиентов AWG
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 ConditionPathExists=$WARP_STATE
 ConditionPathExists=$WARP_CONF
@@ -273,7 +273,7 @@ _usque_write() {
   write_unit awg-usque.service <<EOF
 [Unit]
 Description=AWG Toolza — WARP через usque (MASQUE)
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 ConditionPathExists=$USQUE_CONF
 

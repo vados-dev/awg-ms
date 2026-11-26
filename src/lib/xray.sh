@@ -434,7 +434,7 @@ _xray_write_units() {  # режим
   write_unit "$XRAY_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — Xray
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 ConditionPathExists=$XRAY_STATE
 
@@ -474,7 +474,7 @@ EOF
   write_unit "$XRAY_ROUTING_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов в Xray
-After=$after awg-quick@awg0.service
+After=$after ${awg_quick}@${AWG_IF}.service
 PartOf=$XRAY_UNIT
 
 [Service]

@@ -121,11 +121,11 @@ _tunfail_emit() {
   emit_script "$TUNFAIL_SCRIPT" 'tunfail_guard_run' WARP_PEERS XRAY_PEERS EXITS_PEERS TUNFAIL_NAMES \
     "${RT_FUNCS[@]}" _tunfail_table tunfail_label _tunfail_log _tunfail_rule_tables _tunfail_is_exit_table \
     _tunfail_other_live _tunfail_hold tunfail_guard_run || return 1
-  # Один юнит: при загрузке (сразу за awg0 — раньше туннелей) и от таймера
+  # Один юнит: при загрузке (сразу за $AWG_IF — раньше туннелей) и от таймера
   write_unit "$TUNFAIL_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — если туннель упал: клиенты туннелей в режиме «блокировать» не уходят напрямую
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 
 [Service]

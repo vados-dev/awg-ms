@@ -2,7 +2,7 @@
 # через сервер-вход — любой сервер, где UDP-порт проброшен сюда (каскад Тулзы,
 # свой iptables, nginx stream). В конфиге такого клиента Endpoint — адрес
 # входа; ключи, лимиты, скорость, сроки и выходы — как у всех, сервер разницы
-# не видит. Хранение — py entry: список в шапке awg0.conf, вход клиента —
+# не видит. Хранение — py entry: список в шапке ${AWG_IF}.conf, вход клиента —
 # метка его пира, поэтому всё попадает в любой бэкап вместе с клиентами.
 
 entry_direct() { echo "$(endpoint_host):$(server_port)"; }
@@ -61,7 +61,7 @@ _entry_apply() {
 # ── Итоги проверок ────────────────────────────────────────
 # «имя<TAB>адрес<TAB>ok|fail|unknown<TAB>время» в $STATE_DIR/entry-check:
 # итог относится к адресу — новый адрес входа проверяется заново. Не в
-# awg0.conf: после переезда на другой сервер вход проверяется там.
+# ${AWG_IF}.conf: после переезда на другой сервер вход проверяется там.
 _entry_check_file() { echo "$STATE_DIR/entry-check"; }
 
 _entry_check_save() {  # имя адрес статус
@@ -248,7 +248,7 @@ _entry_ipv6_self() {  # адрес порт
   # Сокеты AWG в ядре: есть строки, а IPv6 среди них нет — AWG IPv6 не слушает
   ls=$(ss -lunH "sport = :$p" 2>/dev/null || true)
   if [[ -n "$ls" ]] && ! grep -qE '\[::\]|\*:' <<< "$ls"; then
-    ENTRY_PROBE_WHY="AWG не слушает порт $p по IPv6 — перезапусти awg0"; return 1
+    ENTRY_PROBE_WHY="AWG не слушает порт $p по IPv6 — перезапусти ${AWG_IF}"; return 1
   fi
   if ufw_active; then
     grep -qiE '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*no' "$UFW_DEFAULTS" 2>/dev/null \

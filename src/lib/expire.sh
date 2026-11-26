@@ -35,7 +35,7 @@ _expire_esc() { local s="${1//&/&amp;}"; s="${s//</&lt;}"; printf '%s' "${s//>/&
 
 _expire_sync() {
   local stripped
-  stripped=$(awg-quick strip "$AWG_IF" 2>/dev/null) \
+  stripped=$(${awg_quick} strip "$AWG_IF" 2>/dev/null) \
     && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped") 2>>"$EXPIRE_LOG"
 }
 
@@ -176,7 +176,7 @@ expire_install() {
   write_unit awg2-expire.service <<EOF
 [Unit]
 Description=AWG Toolza — сроки и трафик клиентов
-After=awg-quick@awg0.service network-online.target
+After=${awg_quick}@${AWG_IF}.service network-online.target
 
 [Service]
 Type=oneshot
@@ -251,7 +251,7 @@ expire_fmt() {  # unix-время → «31.12.2026 23:59 (через 3д 4ч)»
 _expire_apply() {
   local stripped
   iface_up || return 0
-  stripped=$(awg-quick strip "$AWG_IF" 2>/dev/null) && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped")
+  stripped=$(${awg_quick} strip "$AWG_IF" 2>/dev/null) && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped")
 }
 
 # Строки трафика для меню: «имя|лимит|период|по лимиту|за месяц|сегодня|причина».

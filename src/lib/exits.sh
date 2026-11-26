@@ -408,7 +408,7 @@ _exits_write_unit() {
   write_unit "$EXITS_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов через exit-ноды
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 
 [Service]
@@ -530,12 +530,12 @@ exits_node_add() {
   py exit-conf-fix "$tmp" && grep -qiE '^\s*Table\s*=\s*off' "$tmp" \
     || { err "Не удалось подготовить конфиг — ноду не ставлю"; return 1; }
   install -m 600 "$tmp" "$f"
-  systemctl enable --now "awg-quick@awg-exit-$name" &>/dev/null || true
+  systemctl enable --now "${awg_quick}@awg-exit-$name" &>/dev/null || true
   for i in $(seq 1 10); do ip link show "awg-exit-$name" &>/dev/null && break; sleep 0.5; done
   if ! ip link show "awg-exit-$name" &>/dev/null; then
     err "Нода не поднялась:"
-    journalctl -u "awg-quick@awg-exit-$name" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
-    systemctl disable --now "awg-quick@awg-exit-$name" &>/dev/null || true
+    journalctl -u "${awg_quick}@awg-exit-$name" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
+    systemctl disable --now "${awg_quick}@awg-exit-$name" &>/dev/null || true
     rm -f "$f"
     return 1
   fi
@@ -594,7 +594,7 @@ exits_node_del() {  # имя
   local n="$1" f
   [[ -f "$EXITS_DIR/awg-exit-$n.conf" ]] || { err "Ноды $n нет"; return 1; }
   exits_is_up && exits_routing_stop
-  systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true
+  systemctl disable --now "${awg_quick}@awg-exit-$n" &>/dev/null || true
   rm -f "$EXITS_DIR/awg-exit-$n.conf" "$EXITS_HEALTH_DIR/$n"
   # Клиенты этой ноды переходят на общий выход
   for f in "$EXITS_PEERS" "$EXITS_PEERS.wgobf"; do [[ -f "$f" ]] && sed -i "s/|$n\$//" "$f"; done

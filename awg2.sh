@@ -664,6 +664,7 @@ KERNEL_VERSION="$(uname -r)"
 MOD_BRANCH="${mod_branch}"
 LOCAL_BUILD=0
 NONINTERACTIVE=0
+awg_quick="awg31-quick"
 
 # Common functions
 cmd()  { printf '  [\033[1;33m✨\033[0m]\033[1m %s \033[0m\n' "$*" >&2; "$@"; }
@@ -673,6 +674,10 @@ err()  { printf ' \033[0;31m ⚫ ERROR:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM"
 die()  { printf ' \033[1;31m ❌ CRITICAL:\033[0;1m [%s] - %s!\033[0m\n' "$PROGRAM" "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Запускайте от root."
+
+#-> Переопределение бинарника awg (да любого другого).
+awg="${AWG_IF:-awg31}"
+awg() { [ -f "$(which $awg)" ] >&2 || die "$awg not found"; $awg "$@"; }
 
 os_type="";
 
@@ -1803,7 +1808,7 @@ mod_stale() {
 }
 
 # Ядра, в которые сервер может загрузиться (работающее и новее), без
-# собранного модуля — после перезагрузки в такое ядро awg0 не поднимется.
+# собранного модуля — после перезагрузки в такое ядро ${AWG_IF} не поднимется.
 # Так бывает, когда apt поставил новое ядро, а DKMS не смог собрать под него
 # модуль (Ubuntu 7.0.0-38) или заголовков к нему нет. Строки «ядро» или
 # «ядро нет-заголовков»; пусто — всё в порядке.
@@ -2079,7 +2084,7 @@ _mod_src_patch() {  # каталог src тега или исходник в DKM
 }
 
 # Сборка под все ядра с заголовками. Ядро, поставленное раньше регистрации
-# модуля в DKMS, автосборку не получит — после перезагрузки в него awg0 не
+# модуля в DKMS, автосборку не получит — после перезагрузки в него ${AWG_IF} не
 # поднялся бы. Провал под работающим ядром — ошибка, под остальными —
 # предупреждение в журнале шага.
 _mod_dkms_install_all() {
@@ -2167,7 +2172,7 @@ tools_install_tag() {
   if command -v awg &>/dev/null; then
     bdir="$MOD_BACKUP_DIR/tools-$(tools_tag)-$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$bdir" && cp -a "$(command -v awg)" "$bdir/"
-    command -v awg-quick &>/dev/null && cp -a "$(command -v awg-quick)" "$bdir/"
+    command -v ${awg_quick} &>/dev/null && cp -a "$(command -v ${awg_quick})" "$bdir/"
   fi
   run_step "Сборка amneziawg-tools $tag" _tools_build_install "$tmp/tools/src" || return 1
   hash -r
@@ -2209,14 +2214,14 @@ _ssh_via_awg() {
 
 mod_reload() {
   local units ifaces cmd rc out
-  units=$(systemctl list-units --type=service --state=active --no-legend --plain 'awg-quick@*' 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+  units=$(systemctl list-units --type=service --state=active --no-legend --plain "${awg_quick}@*" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
   ifaces=$(awg_ifaces | tr '\n' ' ')
   echo -e "  ${D}юниты: ${units:-нет}; интерфейсы: ${ifaces:-нет}${N}"
   warn "Туннели лягут на несколько секунд, клиенты переподключатся сами"
   (( AUTO_MODE )) || ask_yes "  Перезагрузить модуль сейчас? [Y/n]: " y || { info "Отменено"; return 1; }
 
   cmd="for u in $units; do systemctl stop \"\$u\"; done
-for i in $ifaces; do ip link show \"\$i\" >/dev/null 2>&1 && { awg-quick down \"\$i\" 2>/dev/null || ip link del \"\$i\"; }; done
+for i in $ifaces; do ip link show \"\$i\" >/dev/null 2>&1 && { ${awg_quick} down \"\$i\" 2>/dev/null || ip link del \"\$i\"; }; done
 rmmod $MOD_NAME || { for u in $units; do systemctl start \"\$u\"; done; exit 3; }
 modprobe $MOD_NAME || exit 4
 for u in $units; do systemctl start \"\$u\"; done
@@ -2289,7 +2294,7 @@ mod_rebuild_all() {
   done < <(kernel_gap)
   run_step "Сборка DKMS под все ядра" _mod_dkms_install_all || return 1
   if [[ -n "$(kernel_gap)" ]]; then
-    warn "Модуль не собран под: $(kernel_gap_line) — после перезагрузки в это ядро awg0 не поднимется"
+    warn "Модуль не собран под: $(kernel_gap_line) — после перезагрузки в это ядро ${AWG_IF} не поднимется"
     info "Журнал сборки: $MOD_LOG и /var/lib/dkms/$MOD_NAME/$MOD_DKMS_VER/build/make.log"
     return 1
   fi
@@ -2876,7 +2881,7 @@ mimicry_from_spec() {
 mimicry_tag() { (( ${#I_LINES[@]} )) && echo "$MIMICRY" || echo none; }
 
 # ═════ server ═════
-# Сервер awg0: установка компонентов, создание, запуск, ремонт,
+# Сервер ${AWG_IF}: установка компонентов, создание, запуск, ремонт,
 # перегенерация параметров и смена версии протокола.
 
 # ── Установка компонентов ─────────────────────────────────
@@ -3036,7 +3041,7 @@ do_install() {
   fi
 }
 
-# ── Запуск awg0 с разбором ошибки ─────────────────────────
+# ── Запуск ${AWG_IF} с разбором ошибки ─────────────────────────
 # Сообщения awg-quick короткие, но однозначные — каждому соответствует одно
 # действие. Разбор избавляет от гадания по «awg-quick up провалился».
 awg_diagnose_up() {
@@ -3080,14 +3085,14 @@ awg_diagnose_up() {
 
 awg_up_diag() {
   local out rc=0
-  out=$(awg-quick up "$SERVER_CONF" 2>&1) || rc=$?
+  out=$(${awg_quick} up "$SERVER_CONF" 2>&1) || rc=$?
   if (( rc != 0 )) && [[ "$out" == *"already exists"* ]] && iface_up; then
-    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
-    rc=0; out=$(awg-quick up "$SERVER_CONF" 2>&1) || rc=$?
+    ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    rc=0; out=$(${awg_quick}${awg_quick} up "$SERVER_CONF" 2>&1) || rc=$?
   fi
-  (( rc == 0 )) && { log_info "awg0 поднят"; return 0; }
-  log_err "awg-quick up rc=$rc: $(tr '\n' ';' <<< "$out")"
-  echo -e "  ${D}── awg-quick up ──${N}"
+  (( rc == 0 )) && { log_info "$AWG_IF поднят"; return 0; }
+  log_err "${awg_quick} up rc=$rc: $(tr '\n' ';' <<< "$out")"
+  echo -e "  ${D}── ${awg_quick} up ──${N}"
   sed 's/^/  │ /' <<< "$out"
   awg_diagnose_up "$out"
   return "$rc"
@@ -3095,10 +3100,10 @@ awg_up_diag() {
 
 setup_autostart() {
   mkdir -p "$AUTOSTART_DROPIN"
-  printf '[Service]\nExecStart=\nExecStart=/usr/bin/awg-quick up awg0\n' \
+  printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/${awg_quick} up %i\n' \
     | write_file "$AUTOSTART_DROPIN/override.conf" 644
   systemctl daemon-reload
-  systemctl enable awg-quick@awg0 &>/dev/null || warn "Не удалось включить автозапуск awg0"
+  systemctl enable ${awg_quick}@${AWG_IF} &>/dev/null || warn "Не удалось включить автозапуск $AWG_IF"
   mod_autoload
 }
 
@@ -3109,8 +3114,8 @@ S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT="" S_ENDPOINT_V6=0
 
 _postup_lines() {
   local net="$1" dev="$2"
-  echo "PostUp = echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $net -o $dev -j MASQUERADE; iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -I FORWARD -i awg0 -j ACCEPT; iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -I FORWARD -o awg0 -j ACCEPT"
-  echo "PostDown = iptables -t nat -D POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
+  echo "PostUp = echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $net -o $dev -j MASQUERADE; iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -I FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD -o %i -j ACCEPT"
+  echo "PostDown = iptables -t nat -D POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true"
 }
 
 # Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU,
@@ -3152,7 +3157,7 @@ proto31_cached() {
   return "$rc"
 }
 
-# Внешний интерфейс в правиле NAT awg0.conf — аплинк, на котором создан сервер.
+# Внешний интерфейс в правиле NAT $AWG_IF.conf — аплинк, на котором создан сервер.
 conf_uplink() {
   [[ -f "$SERVER_CONF" ]] || return 1
   sed -nE 's/^PostUp *=.*POSTROUTING -s [^ ]+ -o ([^ ]+) -j MASQUERADE.*/\1/p' "$SERVER_CONF" | head -1 | grep .
@@ -3165,8 +3170,8 @@ conf_uplink() {
 # нет: есть — значит NAT через него выбран сознательно (второй аплинк,
 # туннель). Восстановление бэкапа (force) переносит всегда: интерфейс с тем
 # же именем на новом VPS может быть совсем другим (приватный eth0). Поднятый
-# awg0 опускается до правки — его PostDown снимает старое правило NAT, иначе
-# оно оставалось в iptables — и поднимается снова. 0 — awg0.conf поправлен.
+# $AWG_IF опускается до правки — его PostDown снимает старое правило NAT, иначе
+# оно оставалось в iptables — и поднимается снова. 0 — $AWG_IF.conf поправлен.
 conf_uplink_sync() {  # [force]
   local old dev up=0 rc=0
   old=$(conf_uplink) || return 1
@@ -3175,17 +3180,17 @@ conf_uplink_sync() {  # [force]
   [[ "${1:-}" != force ]] && ip link show "$old" &>/dev/null && return 1
   if iface_up; then
     up=1
-    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   fi
   sed -i -E "/^Post(Up|Down) *=/ s#(POSTROUTING -s [^ ]+ -o )${old//./\\.}( -j MASQUERADE)#\1$dev\2#g" "$SERVER_CONF" \
     && [[ "$(conf_uplink)" == "$dev" ]] || rc=1
   (( up )) && { awg_up_diag || rc=1; }
   (( rc )) && return 1
   info "Внешний интерфейс сервера: $old → $dev (NAT в $SERVER_CONF)"
-  log_info "NAT awg0: $old → $dev"
+  log_info "NAT ${AWG_IF}: $old → $dev"
 }
 
-# Создаёт awg0.conf и первого клиента из S_* и выбранной мимикрии.
+# Создаёт ${AWG_IF}.conf и первого клиента из S_* и выбранной мимикрии.
 server_write() {
   local net="$S_NET" base srv_priv cli_priv psk dev
   base="${net%.*}"
@@ -3224,7 +3229,7 @@ server_write() {
 
 # Поднять созданный сервер, открыть порт, включить автозапуск.
 server_start_new() {
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   awg_up_diag || return 1
   ufw_open "$S_PORT/udp" AmneziaWG
   ufw_forward_accept
@@ -3571,15 +3576,15 @@ server_reboot() {
 # ── Перезапуск и ремонт ───────────────────────────────────
 do_restart() {
   server_exists || { err "Сервер не создан"; return 1; }
-  info "Перезапуск awg0..."
-  server_restart && ok "awg0 перезапущен"
+  info "Перезапуск $AWG_IF..."
+  server_restart && ok "$AWG_IF перезапущен"
 }
 
 REPAIR_ISSUES=0 REPAIR_FIXED=0
 _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
-# Файрвол: при включённом UFW порты awg0 и обфускатора открыты (UFW могли
+# Файрвол: при включённом UFW порты ${AWG_IF} и обфускатора открыты (UFW могли
 # включить уже после установки, или на русской локали Тулза его не видела),
 # политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
 # ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
@@ -3624,7 +3629,7 @@ do_repair() {
   fi
   mod_stale && _issue "В памяти прежняя сборка модуля — Сервер → Модуль ядра → перезагрузить модуль"
   if [[ -n "$(kernel_gap)" ]]; then
-    _issue "Ядро $(kernel_gap_line) без модуля AWG — после перезагрузки awg0 не поднимется"
+    _issue "Ядро $(kernel_gap_line) без модуля AWG — после перезагрузки $AWG_IF не поднимется"
     mod_rebuild_all && _fixed "Модуль собран под все ядра"
   fi
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
@@ -3648,27 +3653,27 @@ do_repair() {
   else _issue "IP forwarding выключен"; ip_forward_enable && _fixed "IP forwarding включён"; fi
 
   if ! iface_up; then
-    _issue "awg0 не поднят"
-    awg_up_diag && _fixed "awg0 поднят"
+    _issue "$AWG_IF не поднят"
+    awg_up_diag && _fixed "$AWG_IF поднят"
   else
     conf_n=$(grep -c '^\[Peer\]' "$SERVER_CONF" || true)
     live_n=$(awg show "$AWG_IF" peers 2>/dev/null | wc -l)
     if [[ "$conf_n" != "$live_n" ]]; then
       _issue "Пиров в конфиге $conf_n, в ядре $live_n"
-      server_restart && _fixed "awg0 перезапущен"
-    else ok "awg0 работает, пиров: $live_n"; fi
+      server_restart && _fixed "$AWG_IF перезапущен"
+    else ok "$AWG_IF работает, пиров: $live_n"; fi
   fi
   dev=$(uplink_iface || true); net=$(server_net || true)
   old=$(conf_uplink || true)
   if [[ -n "$dev" && -n "$old" && "$old" != "$dev" ]]; then
     if ip link show "$old" &>/dev/null; then
-      info "NAT в awg0.conf — на $old (маршрут по умолчанию — через $dev): оставляю как настроено"
+      info "NAT в ${AWG_IF}.conf — на $old (маршрут по умолчанию — через $dev): оставляю как настроено"
     else
-      _issue "NAT в awg0.conf — на $old, такого интерфейса нет; выход сервера — $dev"
+      _issue "NAT в ${AWG_IF}.conf — на $old, такого интерфейса нет; выход сервера — $dev"
       conf_uplink_sync && _fixed "NAT перенесён на $dev"
     fi
   fi
-  # NAT проверяется на интерфейсе из awg0.conf: выбранный сознательно не
+  # NAT проверяется на интерфейсе из ${AWG_IF}.conf: выбранный сознательно не
   # перебивается правилом на аплинк по умолчанию
   old=$(conf_uplink || true); [[ -n "$old" ]] && ip link show "$old" &>/dev/null && dev="$old"
   if [[ -n "$dev" && -n "$net" ]]; then
@@ -3679,7 +3684,7 @@ do_repair() {
   [[ "$perm" == 600 ]] || { _issue "Права $SERVER_CONF = $perm"; chmod 600 "$SERVER_CONF" && _fixed "Права 600"; }
   perm=$(stat -c %a "$AWG_DIR")
   [[ "$perm" == 700 ]] || { _issue "Права $AWG_DIR = $perm"; chmod 700 "$AWG_DIR" && _fixed "Права 700"; }
-  unit_enabled awg-quick@awg0 || { _issue "Нет автозапуска awg0"; setup_autostart && _fixed "Автозапуск включён"; }
+  unit_enabled ${awg_quick}@${AWG_IF} || { _issue "Нет автозапуска $AWG_IF"; setup_autostart && _fixed "Автозапуск включён"; }
 
   echo ""
   if (( REPAIR_ISSUES == 0 )); then success_box "Всё в порядке"
@@ -3701,7 +3706,7 @@ mimicry_module_warnings() {
   return 0
 }
 
-# Снимок конфигов сервера и клиентов — откат, если awg0 не поднимется.
+# Снимок конфигов сервера и клиентов — откат, если ${AWG_IF} не поднимется.
 _params_snapshot() {  # ПЕРЕМЕННАЯ
   local __d f
   mktmp __d -d || return 1
@@ -3712,7 +3717,7 @@ _params_snapshot() {  # ПЕРЕМЕННАЯ
 }
 
 _params_restore() {  # КАТАЛОГ_СНИМКА
-  err "awg0 не поднялся с новыми параметрами — возвращаю прежние"
+  err "${AWG_IF} не поднялся с новыми параметрами — возвращаю прежние"
   cp -a "$1/${SERVER_CONF##*/}" "$SERVER_CONF"
   rm -f "$CLIENT_DIR"/*_awg[23].conf
   cp -a "$1/clients/." "$CLIENT_DIR/"
@@ -3781,7 +3786,7 @@ params_check() {
 }
 
 # Новый блок — в сервер и всех клиентов (как при перегенерации: у клиентов те
-# же значения), рестарт; awg0 не поднялся — откат.
+# же значения), рестарт; ${AWG_IF} не поднялся — откат.
 params_edit_apply() {
   local snap f n=0 keys
   auto_backup params || warn "Авто-бэкап не удался"
@@ -3975,7 +3980,7 @@ do_reset_server() {
   server_exists || { info "Сервер не создан"; return 0; }
   echo ""
   hdr "Сброс сервера"
-  warn "Будут удалены awg0, $SERVER_CONF и все клиенты ($(client_files | wc -l))."
+  warn "Будут удалены ${AWG_IF}, $SERVER_CONF и все клиенты ($(client_files | wc -l))."
   info "Компоненты и бэкапы остаются; авто-бэкап будет сделан."
   read_confirm "${R}  Подтверди сброс (введи yes): ${N}" || { info "Отменено"; return 0; }
   server_reset
@@ -3986,7 +3991,7 @@ server_reset() {
   server_exists || { info "Сервер не создан"; return 0; }
   auto_backup reset || warn "Авто-бэкап не удался"
   tunnels_panic_reset quiet
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   rm -f "$SERVER_CONF" "$SERVER_CONF".bak.* "$SERVER_CONF".pre_* "$CLIENT_DIR"/*_awg[23].conf
   rm -f "$TRAFFIC_DB" "$TRAFFIC_DB.lock"
   ufw_delete_matching AmneziaWG
@@ -4024,7 +4029,7 @@ share_config() {  # файл [qr]
   echo -e "${Y}  ──────────────${N}"
 }
 
-# Добавляет клиента в awg0.conf и в работающий интерфейс, пишет его конфиг.
+# Добавляет клиента в ${AWG_IF}.conf и в работающий интерфейс, пишет его конфиг.
 # Мимикрия берётся из I_LINES/MIMICRY. $5 — срок действия (unix-время), пусто — бессрочно.
 client_add() {
   local name="$1" addr="$2" dns="$3" mtu="$4" expire="${5:-}" priv pub psk size ent=""
@@ -4127,7 +4132,7 @@ client_reissue() {  # имя
     awg set "$AWG_IF" peer "$old" remove 2>/dev/null
     awg set "$AWG_IF" peer "$pub" preshared-key <(printf '%s\n' "$psk") \
       allowed-ips "$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {print $3; exit}')" \
-      || warn "Ядро не приняло новый ключ — перезапусти awg0"
+      || warn "Ядро не приняло новый ключ — перезапусти $AWG_IF"
   fi
   [[ -f "$TRAFFIC_DB" ]] && { py traffic-rekey "$TRAFFIC_DB" "$old" "$pub" || warn "Счётчики трафика начнутся заново"; }
   rm -f "$EXPIRE_STATE_DIR/warn1h_${old//[^A-Za-z0-9]/_}"
@@ -4151,7 +4156,7 @@ _client_write_mimicry() {  # имя — записать текущие I_LINES
   f=$(client_file "$name")
   cp -a "$f" "$f.bak.$(date +%s)"
   i_lines_block | py i-replace "$f" || return 1
-  peer_meta_set "$name" mimicry "$(mimicry_tag)" || warn "Метку в awg0.conf обновить не удалось"
+  peer_meta_set "$name" mimicry "$(mimicry_tag)" || warn "Метку в ${AWG_IF}.conf обновить не удалось"
   ok "Мимикрия $name: $(mimicry_tag), пакетов: ${#I_LINES[@]}"
   warn "Клиенту нужен новый конфиг"
 }
@@ -4588,7 +4593,7 @@ do_clients_menu() {
 # через сервер-вход — любой сервер, где UDP-порт проброшен сюда (каскад Тулзы,
 # свой iptables, nginx stream). В конфиге такого клиента Endpoint — адрес
 # входа; ключи, лимиты, скорость, сроки и выходы — как у всех, сервер разницы
-# не видит. Хранение — py entry: список в шапке awg0.conf, вход клиента —
+# не видит. Хранение — py entry: список в шапке ${AWG_IF}.conf, вход клиента —
 # метка его пира, поэтому всё попадает в любой бэкап вместе с клиентами.
 
 entry_direct() { echo "$(endpoint_host):$(server_port)"; }
@@ -4647,7 +4652,7 @@ _entry_apply() {
 # ── Итоги проверок ────────────────────────────────────────
 # «имя<TAB>адрес<TAB>ok|fail|unknown<TAB>время» в $STATE_DIR/entry-check:
 # итог относится к адресу — новый адрес входа проверяется заново. Не в
-# awg0.conf: после переезда на другой сервер вход проверяется там.
+# ${AWG_IF}.conf: после переезда на другой сервер вход проверяется там.
 _entry_check_file() { echo "$STATE_DIR/entry-check"; }
 
 _entry_check_save() {  # имя адрес статус
@@ -4834,7 +4839,7 @@ _entry_ipv6_self() {  # адрес порт
   # Сокеты AWG в ядре: есть строки, а IPv6 среди них нет — AWG IPv6 не слушает
   ls=$(ss -lunH "sport = :$p" 2>/dev/null || true)
   if [[ -n "$ls" ]] && ! grep -qE '\[::\]|\*:' <<< "$ls"; then
-    ENTRY_PROBE_WHY="AWG не слушает порт $p по IPv6 — перезапусти awg0"; return 1
+    ENTRY_PROBE_WHY="AWG не слушает порт $p по IPv6 — перезапусти ${AWG_IF}"; return 1
   fi
   if ufw_active; then
     grep -qiE '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*no' "$UFW_DEFAULTS" 2>/dev/null \
@@ -5036,7 +5041,7 @@ _expire_esc() { local s="${1//&/&amp;}"; s="${s//</&lt;}"; printf '%s' "${s//>/&
 
 _expire_sync() {
   local stripped
-  stripped=$(awg-quick strip "$AWG_IF" 2>/dev/null) \
+  stripped=$(${awg_quick} strip "$AWG_IF" 2>/dev/null) \
     && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped") 2>>"$EXPIRE_LOG"
 }
 
@@ -5177,7 +5182,7 @@ expire_install() {
   write_unit awg2-expire.service <<EOF
 [Unit]
 Description=AWG Toolza — сроки и трафик клиентов
-After=awg-quick@awg0.service network-online.target
+After=${awg_quick}@${AWG_IF}.service network-online.target
 
 [Service]
 Type=oneshot
@@ -5252,7 +5257,7 @@ expire_fmt() {  # unix-время → «31.12.2026 23:59 (через 3д 4ч)»
 _expire_apply() {
   local stripped
   iface_up || return 0
-  stripped=$(awg-quick strip "$AWG_IF" 2>/dev/null) && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped")
+  stripped=$(${awg_quick} strip "$AWG_IF" 2>/dev/null) && awg syncconf "$AWG_IF" <(printf '%s\n' "$stripped")
 }
 
 # Строки трафика для меню: «имя|лимит|период|по лимиту|за месяц|сегодня|причина».
@@ -5365,12 +5370,12 @@ do_expire_menu() {
 # ═════ speed ═════
 # Скорость клиентов — одна цифра (Мбит/с) на оба направления.
 #
-# Скачивание (сервер → клиент): HTB на выходе awg0, у каждого клиента своя
+# Скачивание (сервер → клиент): HTB на выходе ${AWG_IF}, у каждого клиента своя
 # полоса по его адресу в VPN, внутри — fq_codel. Отдача (клиент → сервер):
-# Linux выравнивает только исходящую очередь, поэтому вход awg0 по адресам
+# Linux выравнивает только исходящую очередь, поэтому вход ${AWG_IF} по адресам
 # ограниченных клиентов перенаправляется в ifb-интерфейс и режется там тем же
-# HTB. Нет модуля ifb — отдача режется полисером на входе awg0 (грубее).
-# Весь трафик клиента проходит через awg0, поэтому скорость действует при
+# HTB. Нет модуля ifb — отдача режется полисером на входе ${AWG_IF} (грубее).
+# Весь трафик клиента проходит через ${AWG_IF}, поэтому скорость действует при
 # любом маршруте: напрямую, WARP, Xray, exit-ноды.
 #
 # Метки клиента в конфиге сервера:
@@ -5378,16 +5383,16 @@ do_expire_menu() {
 #   # limit_slow=N   исчерпал лимит трафика — не блокировать, а замедлять до N;
 #   # slowed_by=traffic  сейчас замедлен (ставит и снимает таймер лимитов).
 # Таймер сроков (каждые 15 с) сверяет план с тем, что стоит в tc, и ставит
-# заново после перезапуска awg0 или перезагрузки — хуков в конфиге сервера
-# не нужно. Клиенты без ограничений идут через awg0 как раньше; пока
-# ограничений нет ни у кого, tc на awg0 не трогается вовсе.
+# заново после перезапуска ${AWG_IF} или перезагрузки — хуков в конфиге сервера
+# не нужно. Клиенты без ограничений идут через ${AWG_IF} как раньше; пока
+# ограничений нет ни у кого, tc на ${AWG_IF} не трогается вовсе.
 
 SPEED_IFB="${AWG_IF}-ifb"
 SPEED_H="a2"             # свой handle корня: чужую очередь (поставленную руками) не трогаем
 SPEED_MAX=10000          # Мбит/с
 SPEED_ERR=""
 
-# Корень awg0: ours — наша HTB; free — очередь по умолчанию (handle 0:);
+# Корень ${AWG_IF}: ours — наша HTB; free — очередь по умолчанию (handle 0:);
 # busy — чужая, её не трогаем.
 _speed_root() {
   local q
@@ -5462,7 +5467,7 @@ _speed_undo() {
 _speed_build() {
   local plan="$1" own="$EXPIRE_STATE_DIR/speed.own" bat errf rc=1 leaf mode modes=(police down)
   mkdir -p "$EXPIRE_STATE_DIR"
-  # Вход awg0 занят не нами (своя очередь ingress, поставленная руками) — не трогаем
+  # Вход ${AWG_IF} занят не нами (своя очередь ingress, поставленная руками) — не трогаем
   if [[ ! -f "$own" ]] && tc qdisc show dev "$AWG_IF" ingress 2>/dev/null | grep -q .; then
     SPEED_ERR="на $AWG_IF уже стоит своя очередь ingress (tc) — не трогаю"
     return 1
@@ -5497,7 +5502,7 @@ _speed_build() {
   return "$rc"
 }
 
-# Привести tc к плану. 0 — стоит как надо, или ограничений нет, или awg0 не поднят (таймер
+# Привести tc к плану. 0 — стоит как надо, или ограничений нет, или ${AWG_IF} не поднят (таймер
 # поставит, когда поднимется); 1 — не вышло (причина в SPEED_ERR).
 speed_apply() {
   local plan st="$EXPIRE_STATE_DIR/speed" root
@@ -5809,7 +5814,7 @@ rt_rules_file() {  # файл таблица
   return 0
 }
 
-# NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
+# NAT и FORWARD между ${AWG_IF} и туннелем. Правила помечены «awg2-tun-<dev>».
 rt_fw_up() {  # устройство [nonat]
   local dev="$1" net wnet tag="awg2-tun-$1"
   net=$(server_net) || return 1
@@ -5835,7 +5840,7 @@ rt_fw_up() {  # устройство [nonat]
   # он сам («всё, что не в wgobf0»), здесь — только MSS на обратном пути
   ipt_add -t mangle FORWARD -i "$dev" -o "$WGOBF_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   # Обратная проверка пути для адреса клиента ведёт в таблицу туннеля, а не
-  # на awg0 — строгий rp_filter такие пакеты молча дропает.
+  # на ${AWG_IF} — строгий rp_filter такие пакеты молча дропает.
   rp_filter_loose "$dev" "$AWG_IF" "$WGOBF_IF"
 }
 
@@ -6252,7 +6257,7 @@ _warp_autostart_install() {
   write_unit awg-warp.service <<EOF
 [Unit]
 Description=AWG Toolza — WARP для клиентов AWG
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 ConditionPathExists=$WARP_STATE
 ConditionPathExists=$WARP_CONF
@@ -6339,7 +6344,7 @@ _usque_write() {
   write_unit awg-usque.service <<EOF
 [Unit]
 Description=AWG Toolza — WARP через usque (MASQUE)
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 ConditionPathExists=$USQUE_CONF
 
@@ -6748,12 +6753,12 @@ do_warp_menu() {
 
 # ═════ dns ═════
 # Шифрованный DNS: dnscrypt-proxy на 127.0.2.1:53 (systemd-сокет пакета
-# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с awg0 и уходят
+# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с ${AWG_IF} и уходят
 # наружу по DoH. DNS в конфигах клиентов не меняется — перехват прозрачный.
 #
 # DoT (853) режется в mangle PREROUTING, а не в FORWARD: PostUp сервера
-# вставляет «FORWARD -i awg0 -j ACCEPT» первым правилом при каждом подъёме
-# awg0, и DROP ниже него никогда не срабатывал бы.
+# вставляет «FORWARD -i ${AWG_IF} -j ACCEPT» первым правилом при каждом подъёме
+# ${AWG_IF}, и DROP ниже него никогда не срабатывал бы.
 
 DNS_TAG="awg2-dns"
 DNS_UNIT="dnscrypt-proxy.service"
@@ -6830,7 +6835,7 @@ dns_rules_ok() {
     --to-destination "$DNS_PROXY_ADDR:$DNS_PROXY_PORT" -m comment --comment "$DNS_TAG" 2>/dev/null
 }
 
-# Точка входа awg-dns-persist.service: ждёт awg0 и ставит правила.
+# Точка входа awg-dns-persist.service: ждёт ${AWG_IF} и ставит правила.
 dns_persist_run() {
   local i
   for i in $(seq 1 30); do ip link show "$AWG_IF" &>/dev/null && break; sleep 2; done
@@ -6864,8 +6869,8 @@ _dns_emit_helpers() {
   write_unit awg-dns-persist.service <<EOF
 [Unit]
 Description=AWG Toolza — перехват DNS клиентов в dnscrypt-proxy
-After=network-online.target awg-quick@awg0.service $DNS_UNIT
-Wants=network-online.target
+After=network-online.target ${awg_quick}@${AWG_IF}.service $DNS_UNIT
+Wants=network-online.targetOA
 
 [Service]
 Type=oneshot
@@ -7880,7 +7885,7 @@ _xray_write_units() {  # режим
   write_unit "$XRAY_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — Xray
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 ConditionPathExists=$XRAY_STATE
 
@@ -7920,7 +7925,7 @@ EOF
   write_unit "$XRAY_ROUTING_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов в Xray
-After=$after awg-quick@awg0.service
+After=$after ${awg_quick}@${AWG_IF}.service
 PartOf=$XRAY_UNIT
 
 [Service]
@@ -8212,7 +8217,7 @@ t2s_up() {
   write_unit "$T2S_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — клиенты через SOCKS5 (tun2socks)
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 
 [Service]
@@ -8697,7 +8702,7 @@ _exits_write_unit() {
   write_unit "$EXITS_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов через exit-ноды
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 
 [Service]
@@ -8819,12 +8824,12 @@ exits_node_add() {
   py exit-conf-fix "$tmp" && grep -qiE '^\s*Table\s*=\s*off' "$tmp" \
     || { err "Не удалось подготовить конфиг — ноду не ставлю"; return 1; }
   install -m 600 "$tmp" "$f"
-  systemctl enable --now "awg-quick@awg-exit-$name" &>/dev/null || true
+  systemctl enable --now "${awg_quick}@awg-exit-$name" &>/dev/null || true
   for i in $(seq 1 10); do ip link show "awg-exit-$name" &>/dev/null && break; sleep 0.5; done
   if ! ip link show "awg-exit-$name" &>/dev/null; then
     err "Нода не поднялась:"
-    journalctl -u "awg-quick@awg-exit-$name" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
-    systemctl disable --now "awg-quick@awg-exit-$name" &>/dev/null || true
+    journalctl -u "${awg_quick}@awg-exit-$name" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
+    systemctl disable --now "${awg_quick}@awg-exit-$name" &>/dev/null || true
     rm -f "$f"
     return 1
   fi
@@ -8883,7 +8888,7 @@ exits_node_del() {  # имя
   local n="$1" f
   [[ -f "$EXITS_DIR/awg-exit-$n.conf" ]] || { err "Ноды $n нет"; return 1; }
   exits_is_up && exits_routing_stop
-  systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true
+  systemctl disable --now "${awg_quick}@awg-exit-$n" &>/dev/null || true
   rm -f "$EXITS_DIR/awg-exit-$n.conf" "$EXITS_HEALTH_DIR/$n"
   # Клиенты этой ноды переходят на общий выход
   for f in "$EXITS_PEERS" "$EXITS_PEERS.wgobf"; do [[ -f "$f" ]] && sed -i "s/|$n\$//" "$f"; done
@@ -9118,7 +9123,7 @@ do_exits_menu() {
 # (WireGuard не умеет слушать только lo), открыт лишь порт обфускатора.
 #
 # С AWG не пересекается: свой интерфейс и /24, туннели тулзы маршрутизируют
-# только подсеть awg0, правила iptables и UFW помечены «awg-wgobf», клиенты
+# только подсеть ${AWG_IF}, правила iptables и UFW помечены «awg-wgobf», клиенты
 # лежат в /root/wgobf/<имя>/ и под маску *_awg[23].conf не попадают.
 #
 # state (KEY=VAL): PORT WG_PORT KEY MASKING ALLOW_CLEAN NET MTU DNS ENDPOINT SERVER_PUB
@@ -9542,7 +9547,7 @@ _wgobf_route_label() {  # маршрут → «через …»
 _wgobf_route_why() {  # маршрут
   local sub="${1#*:}"
   [[ "$1" == *:* ]] || sub=""
-  # Туннели включаются только при сервере AWG (их маршруты — от awg0): без него
+  # Туннели включаются только при сервере AWG (их маршруты — от ${AWG_IF}): без него
   # выход приняли бы, а включить туннель было бы нельзя
   if [[ "${1%%:*}" =~ ^(warp|xray|exits)$ ]] && ! server_exists; then
     echo "Туннели работают только вместе с сервером AWG — сначала создай его (Сервер → Создать сервер)"; return 1
@@ -10406,7 +10411,7 @@ backup_create() {
     sleep 1
   done
   mkdir -p "$dir" && chmod 700 "$BACKUP_DIR" "$dir"
-  if [[ -f "$SERVER_CONF" ]]; then cp -a "$SERVER_CONF" "$dir/awg0.conf"; n=$((n + 1)); ok "Сервер: awg0.conf"
+  if [[ -f "$SERVER_CONF" ]]; then cp -a "$SERVER_CONF" "$dir/${AWG_IF}.conf"; n=$((n + 1)); ok "Сервер: ${AWG_IF}.conf"
   else warn "Серверного конфига нет"; fi
   while IFS= read -r f; do cp -a "$f" "$dir/"; n=$((n + 1)); done < <(client_files)
   (( n > 1 )) && ok "Клиентов: $((n - 1))"
@@ -10466,42 +10471,42 @@ _restore_list() {  # → строки «путь» (новые сверху)
     -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
 }
 
-# Каталог с awg0.conf из любого бэкапа: каталог полного бэкапа, его архив,
-# авто-бэкап (пути от корня) или архив бота прежних версий (awg0.conf + clients/).
+# Каталог с ${AWG_IF}.conf из любого бэкапа: каталог полного бэкапа, его архив,
+# авто-бэкап (пути от корня) или архив бота прежних версий (${AWG_IF}.conf + clients/).
 RESTORE_SRC=""
 _restore_prepare() {
   local src="$1" tmp d
   RESTORE_SRC=""
   if [[ -d "$src" ]]; then
-    [[ -f "$src/awg0.conf" ]] || { err "В бэкапе нет awg0.conf"; return 1; }
+    [[ -f "$src/${AWG_IF}.conf" ]] || { err "В бэкапе нет ${AWG_IF}.conf"; return 1; }
     RESTORE_SRC="$src"; return 0
   fi
   [[ -f "$src" ]] || { err "Нет файла $src"; return 1; }
   mktmp tmp -d || return 1
   py safe-untar "$src" "$tmp/x" || { err "Архив не распаковался"; return 1; }
-  if [[ -f "$tmp/x/awg0.conf" ]]; then d="$tmp/x"
-  elif [[ -f "$tmp/x$SERVER_CONF" ]]; then d="$tmp/x"; cp -a "$tmp/x$SERVER_CONF" "$d/awg0.conf"
-  else d=$(find "$tmp/x" -mindepth 2 -maxdepth 2 -name awg0.conf -printf '%h\n' | head -1); fi
-  [[ -n "$d" && -f "$d/awg0.conf" ]] || { err "В архиве нет awg0.conf — это не бэкап awg2"; return 1; }
-  # Клиенты у разных форматов лежат по-разному — собираем рядом с awg0.conf
+  if [[ -f "$tmp/x/${AWG_IF}.conf" ]]; then d="$tmp/x"
+  elif [[ -f "$tmp/x$SERVER_CONF" ]]; then d="$tmp/x"; cp -a "$tmp/x$SERVER_CONF" "$d/${AWG_IF}.conf"
+  else d=$(find "$tmp/x" -mindepth 2 -maxdepth 2 -name ${AWG_IF}.conf -printf '%h\n' | head -1); fi
+  [[ -n "$d" && -f "$d/${AWG_IF}.conf" ]] || { err "В архиве нет ${AWG_IF}.conf — это не бэкап awg2"; return 1; }
+  # Клиенты у разных форматов лежат по-разному — собираем рядом с ${AWG_IF}.conf
   find "$tmp/x" -name '*_awg[23].conf' ! -path "$d/*_awg[23].conf" -exec cp -a {} "$d/" \;
   RESTORE_SRC="$d"
 }
 
 _restore_awg_files() {  # каталог бэкапа
   local src="$1" f keep
-  install -D -m 600 "$src/awg0.conf" "$SERVER_CONF"
-  # Конфиги клиентов, которых нет в восстановленном awg0.conf, иначе остаются
+  install -D -m 600 "$src/${AWG_IF}.conf" "$SERVER_CONF"
+  # Конфиги клиентов, которых нет в восстановленном ${AWG_IF}.conf, иначе остаются
   # сиротами: видны в «Показать конфиг», занимают имя и попадают в архив.
-  # Конфиги пиров, которые в awg0 есть, не трогаем: бэкап мог прийти без них.
-  # awg0.conf не разобрался — не трогаем ничего: пустой список стёр бы всех.
+  # Конфиги пиров, которые в ${AWG_IF} есть, не трогаем: бэкап мог прийти без них.
+  # ${AWG_IF}.conf не разобрался — не трогаем ничего: пустой список стёр бы всех.
   if keep=$(clients_tsv | cut -f1 | tr '\n' ' '); then
     keep=" $keep "
     for f in "$CLIENT_DIR"/*_awg[23].conf; do
       [[ -f "$f" && "$keep" != *" $(client_name_of "$f") "* ]] && rm -f "$f"
     done
   else
-    warn "awg0.conf из бэкапа не разобран — конфиги клиентов на сервере не трогаю"
+    warn "${AWG_IF}.conf из бэкапа не разобран — конфиги клиентов на сервере не трогаю"
   fi
   while IFS= read -r -d '' f; do
     rm -f "$CLIENT_DIR/$(client_name_of "$f")"_awg[23].conf
@@ -10584,7 +10589,7 @@ _restore_tunnels() {  # каталог бэкапа
   rudirect_on && { _rudirect_emit && "$RUDIRECT_SCRIPT" apply; } &>/dev/null
   rm -f "$XRAY_STATE"
   [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
-  for n in $(exits_nodes); do systemctl enable --now "awg-quick@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
+  for n in $(exits_nodes); do systemctl enable --now "${awg_quick}@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
   (( $(cascade_count) )) && { _cascade_persist; systemctl restart awg-cascade.service &>/dev/null; }
   ok "Настройки туннелей восстановлены; маршрутизация клиентов выключена"
 }
@@ -10647,7 +10652,7 @@ do_restore() {
   (( c )) || return 0
   src="${list[$((c - 1))]}"
   _restore_prepare "$src" || return 1
-  bad=$(py meta-check "$RESTORE_SRC/awg0.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
+  bad=$(py meta-check "$RESTORE_SRC/${AWG_IF}.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
   [[ -n "$bad" ]] && warn "В бэкапе у клиентов повреждены метки: $bad — срок или лимит: клиент будет заблокирован до исправления"
   read_confirm "${R}  Текущий сервер будет заменён. Продолжить? (введи yes): ${N}" || return 0
   [[ -d "$RESTORE_SRC/wgobf/etc" ]] && ask_yes "  В бэкапе есть WG + обфускатор — восстановить? [Y/n]: " y && opts+=(wgobf)
@@ -10660,10 +10665,10 @@ do_restore() {
 backup_restore() {
   local src="$1" label="${1##*/}" port f bad
   shift
-  command -v awg-quick &>/dev/null || { err "Нет awg-quick — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
+  command -v ${awg_quick} &>/dev/null || { err "Нет ${awg_quick} — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
   _restore_prepare "$src" || return 1
   src="$RESTORE_SRC"
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   [[ -f "$SERVER_CONF" ]] && cp -a "$SERVER_CONF" "$SERVER_CONF.pre_restore.$(date +%s)"
   _restore_awg_files "$src"
   _restore_hooks "$SERVER_CONF" || return 1
@@ -10689,7 +10694,7 @@ backup_restore() {
   [[ -n "$port" ]] && ufw_allow "$port/udp" AmneziaWG
   expire_install
   web_vpn_changed
-  if awg_up_diag; then ok "awg0 поднят"; else err "awg0 не поднялся — конфиг: $SERVER_CONF"; return 1; fi
+  if awg_up_diag; then ok "${AWG_IF} поднят"; else err "${AWG_IF} не поднялся — конфиг: $SERVER_CONF"; return 1; fi
   success_box "Восстановлено из $label"
   log_info "восстановление из $label"
 }
@@ -10697,12 +10702,12 @@ backup_restore() {
 # ═════ amnezia ═════
 # Перенос сервера из Amnezia (Docker): приложение AmneziaVPN ставит AWG в
 # контейнер amnezia-awg2 (AWG 2.0/3.1) или amnezia-awg (старый). Из него
-# берутся ключ сервера, порт, параметры, подсеть и пиры с PSK — awg0 Тулзы
+# берутся ключ сервера, порт, параметры, подсеть и пиры с PSK — ${AWG_IF} Тулзы
 # поднимается ровно таким же, и конфиги клиентов работают без перевыдачи.
 #
 # Контейнер не удаляется, а останавливается: «Вернуть Amnezia» запускает его
 # снова. Всё, что пришло из контейнера, — недоверенные данные: разбор и
-# проверка — в helper (amnezia-scan / amnezia-conf), в awg0.conf попадают
+# проверка — в helper (amnezia-scan / amnezia-conf), в ${AWG_IF}.conf попадают
 # только известные ключи с проверенными значениями.
 #
 # Приватных ключей клиентов на сервере нет — они только у самих клиентов.
@@ -10738,11 +10743,11 @@ amnezia_fetch() {  # контейнер каталог
   [[ "$c" =~ ^amnezia-awg2?$ ]] || return 1
   ( umask 077; mkdir -p "$d" ) || return 1
   chmod 700 "$d"
-  for f in awg0.conf wg0.conf; do
+  for f in ${AWG_IF}.conf wg0.conf; do
     if ( umask 077; _amnezia_cat "$c" "$f" > "$d/$f" ) && [[ -s "$d/$f" ]]; then got=1; break; fi
     rm -f "$d/$f"
   done
-  [[ -n "$got" ]] || { err "В контейнере $c нет конфига сервера ($AMNEZIA_SRC/awg0.conf)"; return 1; }
+  [[ -n "$got" ]] || { err "В контейнере $c нет конфига сервера ($AMNEZIA_SRC/${AWG_IF}.conf)"; return 1; }
   ( umask 077; _amnezia_cat "$c" clientsTable > "$d/clientsTable" ) || true
   # Наружу порт может быть проброшен другим номером — клиенты знают внешний
   ( umask 077
@@ -10754,7 +10759,7 @@ amnezia_fetch() {  # контейнер каталог
 # Версия протокола по ключам конфига — для проверки модуля до переноса.
 _amnezia_proto() {  # каталог
   local f
-  for f in "$1/awg0.conf" "$1/wg0.conf"; do
+  for f in "$1/${AWG_IF}.conf" "$1/wg0.conf"; do
     [[ -f "$f" ]] || continue
     if grep -qE '^[[:space:]]*(RandomTrailers|DisableCookies)[[:space:]]*=' "$f"; then echo 3.1
     elif grep -qE '^[[:space:]]*HeaderProtectionKey[[:space:]]*=' "$f"; then echo 3.0
@@ -10768,7 +10773,7 @@ _amnezia_proto() {  # каталог
 # есть; components — нет awg/awg-quick; proto — модуль не умеет версию.
 amnezia_blockers() {  # [версия]
   server_exists && echo server
-  { command -v awg && command -v awg-quick; } &>/dev/null || { echo components; return 0; }
+  { command -v awg && command -v ${awg_quick}; } &>/dev/null || { echo components; return 0; }
   local rc=0
   if [[ "${1:-2.0}" == 3* ]]; then
     proto_supported "$1" || rc=$?
@@ -10788,7 +10793,7 @@ _amnezia_back() {  # контейнер политика
   docker start "$1" >/dev/null 2>&1 || { err "Контейнер $1 не запустился — docker start $1"; return 1; }
 }
 
-# awg0 поднят и слушает нужный порт.
+# ${AWG_IF} поднят и слушает нужный порт.
 _amnezia_up_ok() { iface_up && [[ "$(awg show "$AWG_IF" listen-port 2>/dev/null)" == "$1" ]]; }
 
 amnezia_migrate() {
@@ -10801,7 +10806,7 @@ amnezia_migrate() {
   proto=$(_amnezia_proto "$d")
   b=$(amnezia_blockers "$proto")
   case "$b" in
-    *server*) err "Сервер Тулзы уже создан — перенос только на сервер без своего awg0 (Сервер → Сбросить сервер)"; _amnezia_state_clear; return 1 ;;
+    *server*) err "Сервер Тулзы уже создан — перенос только на сервер без своего ${AWG_IF} (Сервер → Сбросить сервер)"; _amnezia_state_clear; return 1 ;;
     *components*) err "Сначала установи компоненты: Сервер → Установить компоненты"; _amnezia_state_clear; return 1 ;;
     *proto*) err "Модуль ядра не умеет AWG $proto — обнови модуль (Сервер → Модуль ядра и утилиты)"; _amnezia_state_clear; return 1 ;;
   esac
@@ -10825,25 +10830,25 @@ amnezia_migrate() {
   fi
   mkdir -p "$AWG_DIR" && chmod 700 "$AWG_DIR"
   if ! { printf '%s\n\n' "$sum"; _postup_lines "$net" "$dev"; py amnezia-conf "$d" peers; } | write_file "$SERVER_CONF" 600; then
-    err "awg0.conf не записан"
+    err "${AWG_IF}.conf не записан"
     rm -f "$SERVER_CONF"; _amnezia_back "$c" "$restart"; _amnezia_state_clear; return 1
   fi
-  info "Поднимаю awg0: AWG $proto, порт $port, клиентов: $n"
+  info "Поднимаю ${AWG_IF}: AWG $proto, порт $port, клиентов: $n"
   # shellcheck disable=SC2034  # S_PORT читает server_start_new (UFW)
   S_PORT="$port"
   if ! server_start_new || ! _amnezia_up_ok "$port"; then
-    err "awg0 не поднялся — возвращаю Amnezia"
-    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
-    systemctl disable awg-quick@awg0 &>/dev/null || true
+    err "${AWG_IF} не поднялся — возвращаю Amnezia"
+    ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    systemctl disable ${awg_quick}@${AWG_IF} &>/dev/null || true
     rm -f "$SERVER_CONF"
     _amnezia_back "$c" "$restart" && ok "Amnezia снова работает ($c)"
     _amnezia_state_clear
     return 1
   fi
-  # Копия файлов контейнера (с ключом сервера) больше не нужна: ключ — в awg0.conf,
+  # Копия файлов контейнера (с ключом сервера) больше не нужна: ключ — в ${AWG_IF}.conf,
   # для возврата есть сам контейнер
   [[ "$d" == */amnezia/orig && -d "$d" ]] && rm -rf "$d"
-  log_info "перенос из Amnezia: $c → awg0, AWG $proto, порт $port, клиентов $n"
+  log_info "перенос из Amnezia: $c → ${AWG_IF}, AWG $proto, порт $port, клиентов $n"
   ok "Перенесено из Amnezia: клиентов $n, порт $port/udp, AWG $proto"
   info "Конфиги клиентов прежние — переподключаться не нужно"
   warn "Приложение AmneziaVPN больше не управляет этим сервером (как клиент работает как раньше)"
@@ -10860,8 +10865,8 @@ amnezia_revert() {
   if server_exists; then
     # Клиенты, созданные в Тулзе после переноса, остаются в бэкапе
     backup_create >/dev/null 2>&1 && info "Бэкап сервера Тулзы — в $BACKUP_DIR"
-    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
-    systemctl disable awg-quick@awg0 &>/dev/null || true
+    ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    systemctl disable ${awg_quick}@${AWG_IF} &>/dev/null || true
     rm -f "$SERVER_CONF"
   fi
   _amnezia_back "$c" "$restart" || return 1
@@ -10876,7 +10881,7 @@ amnezia_remove() {
   amnezia_migrated || { err "Сначала перенос: удалять можно только перенесённый контейнер"; return 1; }
   c=$(cat "$AMNEZIA_STATE_DIR/container")
   [[ "$c" =~ ^amnezia-awg2?$ ]] || { err "Состояние переноса повреждено"; return 1; }
-  iface_up || { err "awg0 не работает — контейнер не удаляю, пока Тулза не подняла сервер"; return 1; }
+  iface_up || { err "${AWG_IF} не работает — контейнер не удаляю, пока Тулза не подняла сервер"; return 1; }
   if docker inspect "$c" &>/dev/null; then
     docker rm -f "$c" >/dev/null 2>&1 || { err "Контейнер $c не удалён"; return 1; }
   fi
@@ -10911,7 +10916,7 @@ do_amnezia_menu() {
   hdr "Перенос из Amnezia (Docker)"
   if amnezia_migrated; then
     info "Перенос сделан: контейнер $(cat "$AMNEZIA_STATE_DIR/container") остановлен"
-    echo -e "  ${C}1)${N} Вернуть Amnezia ${D}— awg0 Тулзы снимается, контейнер запускается${N}"
+    echo -e "  ${C}1)${N} Вернуть Amnezia ${D}— ${AWG_IF} Тулзы снимается, контейнер запускается${N}"
     echo -e "  ${C}2)${N} Удалить контейнер Amnezia"
     echo -e "  ${W}0)${N} ← Назад"
     read_choice j "${C}  Выбор [0-2]: ${N}" 0 2 0
@@ -11802,7 +11807,7 @@ web_code_install() {
 
 # ── Доступ к панели: для всех, по адресам или только через VPN ──
 # WEB_ACCESS=all|ip|vpn, WEB_ALLOW — адреса и подсети через запятую (режим ip;
-# при переключении на другой режим список хранится). Свой VPN (подсети awg0 и
+# при переключении на другой режим список хранится). Свой VPN (подсети ${AWG_IF} и
 # WG + обфускатора) пускаем в обоих ограниченных режимах: сменился адрес дома —
 # зайти можно через VPN; SSH и Telegram-бот работают всегда.
 # Два слоя. Файрвол: правило DROP новых подключений к порту панели не из
@@ -11957,7 +11962,7 @@ web_access_mode() {
 
 web_access_allow() { web_conf_get WEB_ALLOW | tr ',' '\n' | grep .; }
 
-# Подсети своего VPN: awg0 и WG + обфускатор
+# Подсети своего VPN: ${AWG_IF} и WG + обфускатор
 web_vpn_nets() {
   local n
   n=$(server_net 2>/dev/null) && echo "$n"
@@ -11966,7 +11971,7 @@ web_vpn_nets() {
   return 0
 }
 
-# Адрес панели изнутри VPN: адрес awg0 (нет AWG — wgobf0) вместо внешнего
+# Адрес панели изнутри VPN: адрес ${AWG_IF} (нет AWG — wgobf0) вместо внешнего
 # (сертификат выписан на внешний — браузер предупредит, трафик и так внутри VPN)
 web_vpn_url() {
   local a p path
@@ -12031,7 +12036,7 @@ web_access_set() {
   # С самого сервера (127.0.0.1, ::1) панель открывается всегда
   [[ "$me" == 127.* || "$me" == ::1 ]] && me=""
   if [[ -n "$me" && "$mode" != all ]] && ! _web_access_covers "$([[ "$mode" != ip ]] || echo "$WEB_ACCESS_LIST")" "$me"; then
-    if [[ "$mode" == vpn ]]; then err "Ты зашёл не через VPN ($me) — после этого панель для тебя закроется. Подключись к VPN и открой $(web_vpn_url || echo 'адрес awg0')"
+    if [[ "$mode" == vpn ]]; then err "Ты зашёл не через VPN ($me) — после этого панель для тебя закроется. Подключись к VPN и открой $(web_vpn_url || echo 'адрес ${AWG_IF}')"
     else err "Твой адрес $me не попадает в список — добавь его, иначе панель для тебя закроется"; fi
     return 1
   fi
@@ -12044,7 +12049,7 @@ web_access_set() {
   web_fw_run apply || warn "Файрвол: правило не встало — адреса проверяет сама панель"
   log_info "веб-панель: доступ $mode${WEB_ACCESS_LIST:+ ($WEB_ACCESS_LIST)}"
   ok "Доступ к веб-панели: $(web_access_label)"
-  [[ "$mode" == all ]] || info "Через VPN: $(web_vpn_url || echo 'адрес awg0, порт и путь панели')"
+  [[ "$mode" == all ]] || info "Через VPN: $(web_vpn_url || echo 'адрес ${AWG_IF}, порт и путь панели')"
 }
 
 web_access_menu() {
@@ -12950,7 +12955,7 @@ antiscan_remove() {
 #
 # Как устроено: наборы ipset hash:net и DROP в mangle PREROUTING — раньше
 # FORWARD, где PostUp сервера ставит свой ACCEPT первым (см. dns.sh). Ловит
-# всех, чей трафик сервер пересылает: awg0, обфускатор, контейнеры Amnezia,
+# всех, чей трафик сервер пересылает: ${AWG_IF}, обфускатор, контейнеры Amnezia,
 # клиентов, идущих через WARP, Xray или каскад. Пакеты к адресам самого
 # сервера не трогаются (addrtype LOCAL) — сервер в сети VK остаётся
 # доступным; свой трафик сервера (OUTPUT) — тоже.
@@ -13278,7 +13283,7 @@ vkblock_remove() {
 # банки видят российский адрес, а выход не тратится на них.
 #
 # Как устроено: набор ipset сетей РФ плюс свои адреса «всегда напрямую»,
-# минус «всегда через туннель» (записи nomatch). Пакеты клиентов (awg0,
+# минус «всегда через туннель» (записи nomatch). Пакеты клиентов (${AWG_IF},
 # wgobf0) к этим сетям помечаются в mangle PREROUTING, а правило ip rule
 # с приоритетом 90 — раньше правил туннелей (100-249) — отправляет помеченные
 # в main: туда же, куда идут клиенты без туннеля. Свой трафик сервера и
@@ -13444,7 +13449,7 @@ _rud_rules_down() {
   return 0
 }
 
-# Правила на месте: набор, метки для awg0 и wgobf0, правило маршрутизации
+# Правила на месте: набор, метки для ${AWG_IF} и wgobf0, правило маршрутизации
 # и не строгий rp_filter на аплинке
 rudirect_rules_ok() {
   local dev
@@ -13941,11 +13946,11 @@ _tunfail_emit() {
   emit_script "$TUNFAIL_SCRIPT" 'tunfail_guard_run' WARP_PEERS XRAY_PEERS EXITS_PEERS TUNFAIL_NAMES \
     "${RT_FUNCS[@]}" _tunfail_table tunfail_label _tunfail_log _tunfail_rule_tables _tunfail_is_exit_table \
     _tunfail_other_live _tunfail_hold tunfail_guard_run || return 1
-  # Один юнит: при загрузке (сразу за awg0 — раньше туннелей) и от таймера
+  # Один юнит: при загрузке (сразу за $AWG_IF — раньше туннелей) и от таймера
   write_unit "$TUNFAIL_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — если туннель упал: клиенты туннелей в режиме «блокировать» не уходят напрямую
-After=network-online.target awg-quick@awg0.service
+After=network-online.target ${awg_quick}@${AWG_IF}.service
 Wants=network-online.target
 
 [Service]
@@ -14146,8 +14151,8 @@ do_uninstall() {
   local del_bot=n del_wgobf=n del_web=n del_self=n del_src=n opts src=() d
   hdr "Удаление AWG Toolza"
   warn "Будет удалено:"
-  echo -e "  ${R}—${N} сервер awg0, его клиенты и автозапуск"
-  echo -e "  ${R}—${N} модуль ядра (DKMS) и утилиты awg / awg-quick"
+  echo -e "  ${R}—${N} сервер ${AWG_IF}, его клиенты и автозапуск"
+  echo -e "  ${R}—${N} модуль ядра (DKMS) и утилиты awg / ${awg_quick}"
   echo -e "  ${R}—${N} туннели: WARP, Xray, tun2socks, exit-ноды, каскад, шифрованный DNS"
   echo -e "  ${R}—${N} таймер сроков клиентов, правила UFW с меткой AmneziaWG"
   bot_installed && echo -e "  ${R}—${N} Telegram-бот ${D}(спрошу отдельно)${N}"
@@ -14195,9 +14200,9 @@ uninstall_all() {
   fi
 
   server_exists && do_backup
-  awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+  ${awg_quick} down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   expire_remove
-  systemctl disable awg-quick@awg0 &>/dev/null || true
+  systemctl disable ${awg_quick}@${AWG_IF} &>/dev/null || true
   rm -rf "$AUTOSTART_DROPIN"
   # NAT-персистентность очень старых версий
   remove_unit awg-nat.service
@@ -14407,7 +14412,7 @@ do_status() {
   if server_exists; then
     n=$(clients_tsv | wc -l)
     echo -e "  Сервер    : AWG $(server_proto), $(profile_label "$(server_profile)"), порт $(server_port), клиентов $n"
-    if iface_up; then echo -e "  awg0      : ${G}● поднят${N}"; else echo -e "  awg0      : ${R}○ не поднят${N}"; fi
+    if iface_up; then echo -e "  ${AWG_IF}      : ${G}● поднят${N}"; else echo -e "  ${AWG_IF}      : ${R}○ не поднят${N}"; fi
   else
     echo -e "  Сервер    : ${D}не создан${N}"
   fi
@@ -14484,7 +14489,7 @@ diag_route() {  # клиент адрес
     else
       rudirect_on && ipset test "$RUDIRECT_SET" "$ip" &>/dev/null && mark="${RUDIRECT_MARK%%/*}"
       if ! ip link show "$AWG_IF" &>/dev/null; then
-        kind=none note="awg0 не поднят — проверить маршрут нельзя"
+        kind=none note="$AWG_IF не поднят — проверить маршрут нельзя"
       elif ! out=$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" ${mark:+mark "$mark"} 2>&1); then
         if [[ "$(cat "$DIAG_FWD" 2>/dev/null)" == 0 ]]; then
           kind=none note="пересылка пакетов на сервере выключена (ip_forward) — «Сервер → Починить»"
@@ -14577,7 +14582,7 @@ do_server_menu() {
     ep=$(endpoint_domain)
     echo -e "  ${C}1)${N} Установить компоненты"
     echo -e "  ${C}2)${N} Создать сервер"
-    echo -e "  ${C}3)${N} Перезапустить awg0"
+    echo -e "  ${C}3)${N} Перезапустить ${AWG_IF}"
     echo -e "  ${C}4)${N} Протокол и параметры AWG"
     echo -e "  ${C}5)${N} Модуль ядра и утилиты"
     echo -e "  ${C}6)${N} Проверить и починить"
@@ -14946,7 +14951,7 @@ _api_clients() {
 }
 
 # clients del a,b,c — как «Удалить → Несколько по именам» в меню: копия
-# awg0.conf рядом, затем по одному. data — список удалённых.
+# ${AWG_IF}.conf рядом, затем по одному. data — список удалённых.
 _api_clients_del() {
   local n pub names=() gone=() parts=()
   [[ -n "${1:-}" ]] || { _api_usage "clients del ИМЯ,ИМЯ..."; return; }
@@ -15105,7 +15110,7 @@ _api_traffic() {
       py traffic-daily "$SERVER_CONF" "$TRAFFIC_DB" "$tr" "$name" "$days" > "$API_DATA" ;;
     now)
       # Счётчики прямо сейчас — панель считает по ним живую скорость:
-      # клиенты awg0 и отдельно клиенты WG + обфускатора (wgobf0)
+      # клиенты ${AWG_IF} и отдельно клиенты WG + обфускатора (wgobf0)
       server_exists || { err "Сервер не создан"; return 1; }
       mktmp tr || return 1
       mktmp wtr || return 1
@@ -15796,7 +15801,7 @@ _api_log() {
     module) file="$MOD_LOG" ;;           expire) file="$EXPIRE_LOG" ;;
     cascade) file="$CASCADE_LOG" ;;      warp-health) file="$WARP_HEALTH_LOG" ;;
     dns-health) file="$DNS_HEALTH_LOG" ;; usque) file="$USQUE_LOG" ;;
-    awg) unit="awg-quick@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
+    awg) unit="${awg_quick}@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
     xray) unit="$XRAY_UNIT $XRAY_ROUTING_UNIT" ;; xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
@@ -21122,5 +21127,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=a4959d8fc8285762
+_BUILD_SUM=7ddfcd72ce52fca3
 main "$@"

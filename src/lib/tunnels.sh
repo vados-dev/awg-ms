@@ -197,7 +197,7 @@ rt_rules_file() {  # файл таблица
   return 0
 }
 
-# NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
+# NAT и FORWARD между ${AWG_IF} и туннелем. Правила помечены «awg2-tun-<dev>».
 rt_fw_up() {  # устройство [nonat]
   local dev="$1" net wnet tag="awg2-tun-$1"
   net=$(server_net) || return 1
@@ -223,7 +223,7 @@ rt_fw_up() {  # устройство [nonat]
   # он сам («всё, что не в wgobf0»), здесь — только MSS на обратном пути
   ipt_add -t mangle FORWARD -i "$dev" -o "$WGOBF_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   # Обратная проверка пути для адреса клиента ведёт в таблицу туннеля, а не
-  # на awg0 — строгий rp_filter такие пакеты молча дропает.
+  # на ${AWG_IF} — строгий rp_filter такие пакеты молча дропает.
   rp_filter_loose "$dev" "$AWG_IF" "$WGOBF_IF"
 }
 

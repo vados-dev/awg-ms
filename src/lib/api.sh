@@ -274,7 +274,7 @@ _api_clients() {
 }
 
 # clients del a,b,c — как «Удалить → Несколько по именам» в меню: копия
-# awg0.conf рядом, затем по одному. data — список удалённых.
+# ${AWG_IF}.conf рядом, затем по одному. data — список удалённых.
 _api_clients_del() {
   local n pub names=() gone=() parts=()
   [[ -n "${1:-}" ]] || { _api_usage "clients del ИМЯ,ИМЯ..."; return; }
@@ -433,7 +433,7 @@ _api_traffic() {
       py traffic-daily "$SERVER_CONF" "$TRAFFIC_DB" "$tr" "$name" "$days" > "$API_DATA" ;;
     now)
       # Счётчики прямо сейчас — панель считает по ним живую скорость:
-      # клиенты awg0 и отдельно клиенты WG + обфускатора (wgobf0)
+      # клиенты ${AWG_IF} и отдельно клиенты WG + обфускатора (wgobf0)
       server_exists || { err "Сервер не создан"; return 1; }
       mktmp tr || return 1
       mktmp wtr || return 1
@@ -1124,7 +1124,7 @@ _api_log() {
     module) file="$MOD_LOG" ;;           expire) file="$EXPIRE_LOG" ;;
     cascade) file="$CASCADE_LOG" ;;      warp-health) file="$WARP_HEALTH_LOG" ;;
     dns-health) file="$DNS_HEALTH_LOG" ;; usque) file="$USQUE_LOG" ;;
-    awg) unit="awg-quick@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
+    awg) unit="${awg_quick}@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
     xray) unit="$XRAY_UNIT $XRAY_ROUTING_UNIT" ;; xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;

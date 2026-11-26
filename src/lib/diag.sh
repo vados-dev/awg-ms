@@ -133,7 +133,7 @@ do_status() {
   if server_exists; then
     n=$(clients_tsv | wc -l)
     echo -e "  Сервер    : AWG $(server_proto), $(profile_label "$(server_profile)"), порт $(server_port), клиентов $n"
-    if iface_up; then echo -e "  awg0      : ${G}● поднят${N}"; else echo -e "  awg0      : ${R}○ не поднят${N}"; fi
+    if iface_up; then echo -e "  ${AWG_IF}      : ${G}● поднят${N}"; else echo -e "  ${AWG_IF}      : ${R}○ не поднят${N}"; fi
   else
     echo -e "  Сервер    : ${D}не создан${N}"
   fi
@@ -210,7 +210,7 @@ diag_route() {  # клиент адрес
     else
       rudirect_on && ipset test "$RUDIRECT_SET" "$ip" &>/dev/null && mark="${RUDIRECT_MARK%%/*}"
       if ! ip link show "$AWG_IF" &>/dev/null; then
-        kind=none note="awg0 не поднят — проверить маршрут нельзя"
+        kind=none note="$AWG_IF не поднят — проверить маршрут нельзя"
       elif ! out=$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" ${mark:+mark "$mark"} 2>&1); then
         if [[ "$(cat "$DIAG_FWD" 2>/dev/null)" == 0 ]]; then
           kind=none note="пересылка пакетов на сервере выключена (ip_forward) — «Сервер → Починить»"

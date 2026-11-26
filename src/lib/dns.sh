@@ -1,10 +1,10 @@
 # Шифрованный DNS: dnscrypt-proxy на 127.0.2.1:53 (systemd-сокет пакета
-# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с awg0 и уходят
+# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с ${AWG_IF} и уходят
 # наружу по DoH. DNS в конфигах клиентов не меняется — перехват прозрачный.
 #
 # DoT (853) режется в mangle PREROUTING, а не в FORWARD: PostUp сервера
-# вставляет «FORWARD -i awg0 -j ACCEPT» первым правилом при каждом подъёме
-# awg0, и DROP ниже него никогда не срабатывал бы.
+# вставляет «FORWARD -i ${AWG_IF} -j ACCEPT» первым правилом при каждом подъёме
+# ${AWG_IF}, и DROP ниже него никогда не срабатывал бы.
 
 DNS_TAG="awg2-dns"
 DNS_UNIT="dnscrypt-proxy.service"
@@ -81,7 +81,7 @@ dns_rules_ok() {
     --to-destination "$DNS_PROXY_ADDR:$DNS_PROXY_PORT" -m comment --comment "$DNS_TAG" 2>/dev/null
 }
 
-# Точка входа awg-dns-persist.service: ждёт awg0 и ставит правила.
+# Точка входа awg-dns-persist.service: ждёт ${AWG_IF} и ставит правила.
 dns_persist_run() {
   local i
   for i in $(seq 1 30); do ip link show "$AWG_IF" &>/dev/null && break; sleep 2; done
@@ -115,8 +115,8 @@ _dns_emit_helpers() {
   write_unit awg-dns-persist.service <<EOF
 [Unit]
 Description=AWG Toolza — перехват DNS клиентов в dnscrypt-proxy
-After=network-online.target awg-quick@awg0.service $DNS_UNIT
-Wants=network-online.target
+After=network-online.target ${awg_quick}@${AWG_IF}.service $DNS_UNIT
+Wants=network-online.targetOA
 
 [Service]
 Type=oneshot

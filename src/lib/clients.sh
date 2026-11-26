@@ -20,7 +20,7 @@ share_config() {  # файл [qr]
   echo -e "${Y}  ──────────────${N}"
 }
 
-# Добавляет клиента в awg0.conf и в работающий интерфейс, пишет его конфиг.
+# Добавляет клиента в ${AWG_IF}.conf и в работающий интерфейс, пишет его конфиг.
 # Мимикрия берётся из I_LINES/MIMICRY. $5 — срок действия (unix-время), пусто — бессрочно.
 client_add() {
   local name="$1" addr="$2" dns="$3" mtu="$4" expire="${5:-}" priv pub psk size ent=""
@@ -123,7 +123,7 @@ client_reissue() {  # имя
     awg set "$AWG_IF" peer "$old" remove 2>/dev/null
     awg set "$AWG_IF" peer "$pub" preshared-key <(printf '%s\n' "$psk") \
       allowed-ips "$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {print $3; exit}')" \
-      || warn "Ядро не приняло новый ключ — перезапусти awg0"
+      || warn "Ядро не приняло новый ключ — перезапусти $AWG_IF"
   fi
   [[ -f "$TRAFFIC_DB" ]] && { py traffic-rekey "$TRAFFIC_DB" "$old" "$pub" || warn "Счётчики трафика начнутся заново"; }
   rm -f "$EXPIRE_STATE_DIR/warn1h_${old//[^A-Za-z0-9]/_}"
@@ -147,7 +147,7 @@ _client_write_mimicry() {  # имя — записать текущие I_LINES
   f=$(client_file "$name")
   cp -a "$f" "$f.bak.$(date +%s)"
   i_lines_block | py i-replace "$f" || return 1
-  peer_meta_set "$name" mimicry "$(mimicry_tag)" || warn "Метку в awg0.conf обновить не удалось"
+  peer_meta_set "$name" mimicry "$(mimicry_tag)" || warn "Метку в ${AWG_IF}.conf обновить не удалось"
   ok "Мимикрия $name: $(mimicry_tag), пакетов: ${#I_LINES[@]}"
   warn "Клиенту нужен новый конфиг"
 }
