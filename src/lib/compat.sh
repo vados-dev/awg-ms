@@ -41,7 +41,7 @@ die()  { printf ' \033[1;31m ❌ CRITICAL:\033[0;1m [%s] - %s!\033[0m\n' "$PROGR
 
 #-> Переопределение бинарника awg (да любого другого).
 awg="${AWG_IF:-awg31}"
-awg() { [ -f "$(which $awg)" ] >&2 || die "$awg not found"; $awg "$@"; }
+#awg() { [ -f "$(which $awg)" ] >&2 || die "$awg not found"; $awg "$@"; }
 
 os_type="";
 
